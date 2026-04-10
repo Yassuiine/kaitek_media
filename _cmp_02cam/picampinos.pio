@@ -1,0 +1,67 @@
+.program picampinos
+
+; pin8=vsync, pin9=href, pin10=pclk, pin0-pin7=D[2:9]
+start0:
+    out     x, 32       ; X <= TX_FIFO(32bit) : X must be zero 
+    out     y, 32       ; Y <= TX_FIFO(32bit) : num of trans
+
+start1:
+    wait 0  pin 8       ; wait until VSYNC=0
+    wait 1  pin 8       ; wait until VSYNC=1 (start of frame)
+
+loop0:
+    mov     x, y        ; x = y (y: number of total pixel (in words: 32bit) in an image)
+    wait 0  pin 9       ; wait until HREF=0 (start of line)
+
+loop1:
+    wait 1  pin 9       ; wait until HREF=1 (start of line)
+    
+    ; Read 8-bit data (high byte: high-order part of RGB565)
+    wait 1  pin 10      ; wait until PCLK = 1 (start of pixel)
+    in      pins, 8     ; get camera RGB high byte (R[4:0], G[5:3]) -> ISR
+    wait 0  pin 10      ; wait until PCLK = 0
+
+    ; Read 8-bit data (low byte: low-order part of RGB565)
+    wait 1  pin 10      ; wait until PCLK = 1 (start of next pixel byte)
+    in      pins, 8     ; get camera RGB low byte (G[2:0], B[4:0]) -> ISR
+    wait 0  pin 10      ; wait until PCLK = 0
+
+    ; Combine the high byte and low byte into a complete 16-bit RGB565 data (with bit-reversal if needed)
+    push                ; RX_FIFO <= ISR (push the 16-bit RGB565 data into RX_FIFO)
+
+    jmp     x--, loop1  ; Decrement x (total pixels), and loop until all pixels in the row are read
+
+    wait 0  pin 9       ; wait until HREF=0 (end of line)
+
+    jmp     loop0       ; Continue to next line (next row of pixels)
+
+    ; End of frame - jump back to waiting for next VSYNC signal
+    jmp     start1      ; jump to start1 to wait for the next frame (VSYNC high)
+
+% c-sdk {
+static inline void picampinos_program_init( PIO pio, uint32_t sm, uint32_t offset, uint32_t in_base ,uint32_t in_pin_num )
+{
+    pio_sm_config c = picampinos_program_get_default_config(offset);
+
+    sm_config_set_set_pins(&c, in_base, in_pin_num);
+    sm_config_set_in_pins(&c, in_base);
+ 
+    sm_config_set_in_shift(&c, false, false, 32); // auto push : false
+    sm_config_set_out_shift(&c, false, true, 32); // auto pull : true
+
+    uint32_t pin_offset;
+    for (pin_offset = 0; pin_offset < in_pin_num; pin_offset++)
+    {
+        pio_gpio_init(pio, in_base + pin_offset);
+    }
+
+    pio_sm_set_consecutive_pindirs(pio, sm, in_base, in_pin_num, false);
+
+    sm_config_set_clkdiv(&c, 1);
+
+    pio_sm_init(pio, sm, offset, &c);
+
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+
