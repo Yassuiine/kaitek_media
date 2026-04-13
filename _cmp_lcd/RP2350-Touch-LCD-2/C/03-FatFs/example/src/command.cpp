@@ -20,46 +20,13 @@
 #include "my_rtc.h"
 #include "sd_card.h"
 #include "tests.h"
-#include "cam.h"
-#include "ov5640.h"
 //
 #include "diskio.h" /* Declarations of disk functions */
 //
 #include "command.h"
-#include "DEV_Config.h"
-#include "LCD_2in.h"
-#include "GUI_Paint.h"
 
 static char *saveptr;  // For strtok_r
 static volatile bool die;
-static char cmd_buffer[256];
-static size_t cmd_ix;
-static bool cam_snap_pending;
-static absolute_time_t cam_snap_deadline;
-static char cam_snap_path[256];
-static FIL cam_snap_file;
-static bool cam_snap_file_open;
-static uint32_t cam_snap_write_offset;
-static UINT cam_snap_total_written;
-static absolute_time_t cam_snap_next_step_time;
-static bool last_input_was_cr;
-static bool lcd_initialized = false;
-static uint8_t lcd_backlight = 0;
-static UBYTE lcd_scan_dir = VERTICAL;
-static UWORD *lcd_image = NULL;
-static size_t lcd_image_bytes = 0;
-
-
-enum cam_snap_state_t {
-    CAM_SNAP_IDLE = 0,
-    CAM_SNAP_WAIT_FRAME,
-    CAM_SNAP_OPEN_FILE,
-    CAM_SNAP_WRITE_FILE,
-    CAM_SNAP_CLOSE_FILE,
-};
-
-static cam_snap_state_t cam_snap_state;
-static const UINT cam_snap_chunk_size = 512;
 
 bool logger_enabled;
 const uint32_t period = 1000;
@@ -176,30 +143,6 @@ static char const *fs_type_string(int fs_type) {
             return "Unknown";
     }
 }
-static const char *sd_if_string(sd_if_t type) {
-    switch (type) {
-        case SD_IF_SPI:
-            return "SPI";
-        case SD_IF_SDIO:
-            return "SDIO";
-        default:
-            return "NONE";
-    }
-}
-static const char *sd_card_type_string(card_type_t type) {
-    switch (type) {
-        case SDCARD_NONE:
-            return "None";
-        case SDCARD_V1:
-            return "SDv1";
-        case SDCARD_V2:
-            return "SDv2";
-        case SDCARD_V2HC:
-            return "SDv2HC";
-        default:
-            return "Unknown";
-    }
-}
 static void run_info(const size_t argc, const char *argv[]) {
     const char *arg = chk_dflt_log_drv(argc, argv);
     if (!arg)
@@ -214,9 +157,6 @@ static void run_info(const size_t argc, const char *argv[]) {
         printf("SD card initialization failed\n");
         return;
     }
-    printf("Drive %s interface=%s card_type=%s status=0x%02x sectors=%lu\n",
-           arg, sd_if_string(sd_card_p->type), sd_card_type_string(sd_card_p->state.card_type),
-           sd_card_p->state.m_Status, (unsigned long)sd_card_p->state.sectors);
     // Card IDendtification register. 128 buts wide.
     cidDmp(sd_card_p, printf);
     // Card-Specific Data register. 128 bits wide.
@@ -295,12 +235,9 @@ static void run_format(const size_t argc, const char *argv[]) {
     }
     int ds = sd_card_p->init(sd_card_p);
     if (STA_NODISK & ds || STA_NOINIT & ds) {
-        printf("SD card initialization failed, status=0x%02x\n", ds);
+        printf("SD card initialization failed\n");
         return;
     }
-    printf("Drive %s interface=%s card_type=%s status=0x%02x sectors=%lu\n",
-           arg, sd_if_string(sd_card_p->type), sd_card_type_string(sd_card_p->state.card_type),
-           sd_card_p->state.m_Status, (unsigned long)sd_card_p->state.sectors);
     
     /* I haven't been able to find a way to obtain the layout produced
     by the SD Association's "SD Memory Card Formatter"
@@ -336,8 +273,7 @@ static void run_format(const size_t argc, const char *argv[]) {
         0        /* Cluster size (byte) */
     };
     /* Format the drive */
-    printf("Formatting %s (this may take a while)...\n", arg);
-    FRESULT fr = f_mkfs(arg, &opt, 0, 32 * 1024);  // 32 KB: ~32x fewer disk_write calls vs FF_MAX_SS*2
+    FRESULT fr = f_mkfs(arg, &opt, 0, FF_MAX_SS * 2);
     if (FR_OK != fr) printf("f_mkfs error: %s (%d)\n", FRESULT_str(fr), fr);
 
     /* This only works if the drive is mounted: */
@@ -356,25 +292,10 @@ static void run_mount(const size_t argc, const char *argv[]) {
         printf("Unknown logical drive id: \"%s\"\n", arg);
         return;
     }
-    int ds = sd_card_p->init(sd_card_p);
-    if (STA_NODISK & ds || STA_NOINIT & ds) {
-        printf("SD card initialization failed, status=0x%02x\n", ds);
-        return;
-    }
-    printf("Drive %s interface=%s card_type=%s status=0x%02x sectors=%lu\n",
-           arg, sd_if_string(sd_card_p->type), sd_card_type_string(sd_card_p->state.card_type),
-           sd_card_p->state.m_Status, (unsigned long)sd_card_p->state.sectors);
-    fflush(stdout);
-    stdio_flush();
-    printf("f_mount: begin\n");
-    fflush(stdout);
-    stdio_flush();
     FATFS *fs_p = &sd_card_p->state.fatfs;
     FRESULT fr = f_mount(fs_p, arg, 1);
-    printf("f_mount: returned %s (%d)\n", FRESULT_str(fr), fr);
-    fflush(stdout);
-    stdio_flush();
     if (FR_OK != fr) {
+        printf("f_mount error: %s (%d)\n", FRESULT_str(fr), fr);
         return;
     }
     sd_card_p->state.mounted = true;
@@ -707,583 +628,6 @@ static void run_test(const size_t argc, const char *argv[]) {
 
 static void run_help(const size_t argc, const char *argv[]);
 
-static void print_prompt(void) {
-    printf("Kaitek> ");
-    stdio_flush();
-}
-
-static bool ensure_cam_buffer_allocated() {
-    if (cam_ptr) return true;
-
-    cam_ptr = (uint8_t *)malloc(cam_ful_size * 2);
-    if (!cam_ptr) {
-        printf("malloc failed for frame buffer (%lu bytes)\n",
-               (unsigned long)(cam_ful_size * 2));
-        return false;
-    }
-    memset(cam_ptr, 0, cam_ful_size * 2);
-    return true;
-}
-
-static bool save_cam_buffer_to_file(const char *path) {
-    FIL fil;
-    FRESULT fr = f_open(&fil, path, FA_WRITE | FA_CREATE_ALWAYS);
-    if (FR_OK != fr) {
-        printf("f_open error: %s (%d)\n", FRESULT_str(fr), fr);
-        return false;
-    }
-
-    UINT bw = 0;
-    fr = f_write(&fil, cam_ptr, cam_ful_size * 2, &bw);
-    if (FR_OK != fr) {
-        printf("f_write error: %s (%d)\n", FRESULT_str(fr), fr);
-    } else {
-        printf("Wrote %u bytes to %s\n", bw, path);
-    }
-
-    FRESULT close_fr = f_close(&fil);
-    if (FR_OK != close_fr) {
-        printf("f_close error: %s (%d)\n", FRESULT_str(close_fr), close_fr);
-    }
-
-    return FR_OK == fr && FR_OK == close_fr;
-}
-
-static bool wait_for_cam_frame_with_timeout(uint32_t timeout_ms) {
-    if (cam_wait_for_frame(timeout_ms)) {
-        return true;
-    }
-
-    free_cam();
-    printf("Camera capture timed out after %lu ms\n", (unsigned long)timeout_ms);
-    return false;
-}
-
-static void finish_cam_snap(void) {
-    if (cam_snap_file_open) {
-        FRESULT close_fr = f_close(&cam_snap_file);
-        if (FR_OK != close_fr) {
-            printf("f_close error: %s (%d)\n", FRESULT_str(close_fr), close_fr);
-        }
-        cam_snap_file_open = false;
-    }
-
-    free_cam();
-    buffer_ready = false;
-
-    cam_snap_pending = false;
-    cam_snap_state = CAM_SNAP_IDLE;
-    cam_snap_path[0] = '\0';
-    cam_snap_write_offset = 0;
-    cam_snap_total_written = 0;
-}
-
-//added
-static void run_cam_rreg(const size_t argc, const char *argv[]) {
-    if (!expect_argc(argc, argv, 1)) return;
-
-    uint16_t reg = (uint16_t)strtol(argv[0], NULL, 16);
-    uint8_t val = OV5640_RD_Reg(i2c1, 0x3C, reg);
-    printf("reg 0x%04X = 0x%02X (%u)\n", reg, val, val);
-}
-
-
-//added
-static void run_cam_xclk(const size_t argc, const char *argv[]){
-    if(argc == 1){
-        set_pwm_freq_kHz((size_t)atoi(argv[0]), PIN_PWM);
-    }
-    else{
-        set_pwm_freq_kHz(24000, PIN_PWM);
-    }
-}
-
-//added
-static void init_i2c(){
-    i2c_inst_t * i2c = i2c1;
-    // Initialize I2C port at 100 kHz
-    i2c_init(i2c, 100 * 1000);
-
-    // Initialize I2C pins
-    gpio_set_function(I2C1_SDA, GPIO_FUNC_I2C);
-    gpio_set_function(I2C1_SCL, GPIO_FUNC_I2C);
-    gpio_pull_up(I2C1_SDA);
-    gpio_pull_up(I2C1_SCL);
-}
-
-//added
-static void run_cam_i2c_init(const size_t argc, const char *argv[]){
-    if(!expect_argc(argc,argv,0)) return;
-    
-    init_i2c();
-}
-
-//added
-static void run_cam_id(const size_t argc, const char *argv[]){
-    if (!expect_argc(argc, argv, 0)) return;
-    uint16_t reg;
-    reg=OV5640_RD_Reg(i2c1,0x3C,0X300A);
-	reg<<=8;
-	reg|=OV5640_RD_Reg(i2c1,0x3C,0X300B);
-    printf("ID: %d \r\n",reg);
-}
-
-//added
-static void run_cam_defaults(const size_t argc, const char *argv[]){
-    if (!expect_argc(argc, argv, 0)) return;
-    // Match the original Waveshare 02-CAM flow:
-    // sccb_init() does the I2C setup, applies the default table with embedded
-    // delays, and then programs size, image options, PLL and colorspace.
-    sccb_init(I2C1_SDA, I2C1_SCL);
-    printf("Camera default sensor init applied\n");
-}
-
-//added
-static void run_cam_size(const size_t argc, const char *argv[]) {
-    if (!expect_argc(argc, argv, 2)) return;
-
-    uint32_t w = (uint32_t)atoi(argv[0]);
-    uint32_t h = (uint32_t)atoi(argv[1]);
-
-    // stop pipeline and free old buffer
-    free_cam();
-    free(cam_ptr);
-    cam_ptr = NULL;
-
-    // update globals — cam.c will use these from now on
-    cam_width    = w;
-    cam_height   = h;
-    cam_ful_size = w * h;
-
-    // tell sensor new output size
-    OV5640_WR_Reg_2(i2c1, 0x3C, X_OUTPUT_SIZE_H, w, h);
-
-    // reallocate buffer
-    cam_ptr = (uint8_t *)malloc(cam_ful_size * 2);
-    if (!cam_ptr) {
-        printf("malloc failed for %lu x %lu\n", w, h);
-        return;
-    }
-
-    printf("Size set to %lu x %lu\n", w, h);
-    printf("Run cam_dma then cam_start to restart capture\n");
-}
-
-//added
-static void run_cam_flip(const size_t argc, const char* argv[]){
-    if(!expect_argc(argc,argv,1)) return;
-    uint16_t flip = (uint16_t) atoi(argv[0]);
-    OV5640_WR_Reg(i2c1, 0x3C, TIMING_TC_REG20, flip);
-    printf("Flip set to %u\n", flip);
-}
-
-//added
-static void run_cam_mirror(const size_t argc, const char *argv[]){
-    if(!expect_argc(argc,argv,1)) return;
-    uint16_t mirror = (uint16_t) atoi(argv[0]);
-    OV5640_WR_Reg(i2c1, 0x3C, TIMING_TC_REG21, mirror);
-    printf("Mirror set to %u\n", mirror);
-}
-
-//added
-static void run_cam_pll(const size_t argc, const char *argv[]) {
-    if (!expect_argc(argc, argv, 1)) return;
-
-    uint8_t multiplier = (uint8_t)atoi(argv[0]);
-    OV5640_WR_Reg(i2c1, 0x3C, SC_PLL_CONTRL_2, multiplier);
-    printf("PLL multiplier set to %u\n", multiplier);
-}
-
-//added
-static void run_cam_format(const size_t argc, const char *argv[]) {
-    if (!expect_argc(argc, argv, 1)) return;
-
-    if (strcmp(argv[0], "rgb565") == 0) {
-        OV5640_WR_Reg(i2c1, 0x3C, FORMAT_CTRL,  0x01);
-        OV5640_WR_Reg(i2c1, 0x3C, FORMAT_CTRL00, 0x61);
-        printf("Format set to RGB565\n");
-    } else if (strcmp(argv[0], "yuv422") == 0) {
-        OV5640_WR_Reg(i2c1, 0x3C, FORMAT_CTRL,  0x00);
-        OV5640_WR_Reg(i2c1, 0x3C, FORMAT_CTRL00, 0x00);
-        printf("Format set to YUV422\n");
-    } else {
-        printf("Unknown format: %s (use rgb565 or yuv422)\n", argv[0]);
-    }
-}
-
-//added
-static void run_cam_alloc(const size_t argc, const char *argv[]){
-    if(!expect_argc(argc,argv,0)) return;
-    if(cam_ptr) free(cam_ptr);
-    cam_ptr = (uint8_t *)malloc(cam_ful_size * 2);
-}
-
-//added
-static void run_cam_dma(const size_t argc, const char *argv[]){
-    if(!expect_argc(argc,argv,0)) return;
-    cam_set_use_irq(true);
-    config_cam_buffer();
-}
-
-//added
-static void run_cam_start(const size_t argc, const char *argv[]){
-    if(!expect_argc(argc,argv,0)) return;
-    cam_set_continuous(true);
-    cam_set_use_irq(true);
-    start_cam();
-}
-
-//added
-static void run_cam_wreg(const size_t argc, const char *argv[]){
-    if(!expect_argc(argc,argv,2)) return;
-    uint16_t reg = (uint16_t)strtol(argv[0], NULL, 16);
-    uint8_t val = (uint8_t)strtol(argv[1], NULL, 16);
-    OV5640_WR_Reg(i2c1,0x3C,reg,val);
-    printf("reg 0x%04X = 0x%02X (%u)\n", reg, val, val);
-}
-
-//added
-static void run_cam_stop(const size_t argc, const char *argv[]){
-    if(!expect_argc(argc,argv,0)) return ;
-    free_cam();
-}
-
-//added
-static void run_cam_capture(const size_t argc, const char *argv[]) {
-    if (!expect_argc(argc, argv, 1)) return;
-
-    // wait for a fresh complete frame
-    buffer_ready = false;
-    printf("Waiting for frame...\n");
-    if (!wait_for_cam_frame_with_timeout(2000)) return;
-    buffer_ready = false;  // clear before we use the buffer
-
-    save_cam_buffer_to_file(argv[0]);
-}
-
-//added
-static void run_cam_snap(const size_t argc, const char *argv[]) {
-    if (!expect_argc(argc, argv, 1)) return;
-    if (!ensure_cam_buffer_allocated()) return;
-    if (cam_snap_pending) {
-        printf("A camera snapshot is already in progress\n");
-        return;
-    }
-
-    strlcpy(cam_snap_path, argv[0], sizeof(cam_snap_path));
-
-    printf("Capturing frame...\n");
-    fflush(stdout);
-    stdio_flush();
-
-    cam_set_continuous(false);
-    cam_set_use_irq(false);
-    buffer_ready = false;
-    config_cam_buffer();
-    printf("cam_snap: before start_cam\n");
-    fflush(stdout);
-    stdio_flush();
-    start_cam();
-    printf("cam_snap: after start_cam\n");
-    fflush(stdout);
-    stdio_flush();
-
-    cam_snap_deadline = make_timeout_time_ms(2000);
-    cam_snap_next_step_time = get_absolute_time();
-    cam_snap_pending = true;
-    cam_snap_state = CAM_SNAP_WAIT_FRAME;
-    cam_snap_write_offset = 0;
-    cam_snap_total_written = 0;
-    printf("cam_snap: armed\n");
-}
-
-static void run_lcd_init(const size_t argc, const char *argv[]) {
-    if (argc > 1) {
-        printf("Usage: lcd_init [vertical|horizontal]\n");
-        return;
-    }
-
-    if (argc == 1) {
-        if (strcmp(argv[0], "vertical") == 0) {
-            lcd_scan_dir = VERTICAL;
-        } else if (strcmp(argv[0], "horizontal") == 0) {
-            lcd_scan_dir = HORIZONTAL;
-        } else {
-            printf("Invalid argument: %s (use vertical or horizontal)\n", argv[0]);
-            return;
-        }
-    }
-
-    DEV_GPIO_Mode(LCD_RST_PIN, 1);
-    DEV_GPIO_Mode(LCD_DC_PIN, 1);
-    DEV_GPIO_Mode(LCD_CS_PIN, 1);
-
-    DEV_Digital_Write(LCD_CS_PIN, 1);
-    DEV_Digital_Write(LCD_DC_PIN, 0);
-
-    spi_init(SPI_PORT, 40 * 1000 * 1000);
-    gpio_set_function(LCD_CLK_PIN, GPIO_FUNC_SPI);
-    gpio_set_function(LCD_MOSI_PIN, GPIO_FUNC_SPI);
-
-    DEV_PWM_Init();
-    DEV_SET_PWM(0);
-    LCD_2IN_Init(lcd_scan_dir);
-
-    if (lcd_image) {
-        free(lcd_image);
-        lcd_image = NULL;
-        lcd_image_bytes = 0;
-    }
-
-    lcd_image_bytes = LCD_2IN.WIDTH * LCD_2IN.HEIGHT * 2;
-    lcd_image = (UWORD *)malloc(lcd_image_bytes);
-    if (!lcd_image) {
-        printf("Failed to allocate LCD framebuffer\n");
-        lcd_initialized = false;
-        lcd_backlight = 0;
-        return;
-    }
-
-    Paint_NewImage((UBYTE *)lcd_image, LCD_2IN.WIDTH, LCD_2IN.HEIGHT, 0, WHITE);
-    Paint_SetScale(65);
-    Paint_Clear(WHITE);
-    LCD_2IN_Display(lcd_image);
-
-    lcd_backlight = 0;
-    lcd_initialized = true;
-    printf("LCD initialized (%s)\n", lcd_scan_dir == VERTICAL ? "vertical" : "horizontal");
-}
-
-static void run_lcd_bl(const size_t argc, const char *argv[]){
-    if(!expect_argc(argc,argv,1)) return;
-    if(!lcd_initialized){
-        printf("LCD not initialized. Run lcd_init first.\n");
-        return;
-    }
-    char *end = NULL;
-    long value = strtol(argv[0], &end, 10);
-    if (end == argv[0] || *end != '\0') {
-        printf("Invalid brightness: %s (use 0-100)\n", argv[0]);
-        return;
-    }
-    if (value < 0 || value > 100) {
-        printf("Brightness out of range: %ld (use 0-100)\n", value);
-        return;
-    }
-
-    DEV_SET_PWM((UWORD)value);
-    lcd_backlight  = (uint8_t)value;
-
-    printf("LCD backlight set to %u%%\n", (uint8_t)value);
-}
-
-static void run_lcd_clear(const size_t argc , const char *argv[]){
-    if(!expect_argc(argc,argv,1)) return;
-    if(!lcd_initialized){
-        printf("LCD not initialized. Run lcd_init first.\n");
-        return;
-    }
-    char *end = NULL;
-    long value = strtoul(argv[0], &end, 16);
-    if (end == argv[0] || *end != '\0') {
-        printf("Invalid color: %s (use hex RGB565, e.g. ffff for white)\n", argv[0]);
-        return;
-    }
-
-    if(value < 0 || value > 0xFFFF){
-        printf("Color out of range: %ld (use hex RGB565, e.g. ffff for white)\n", value);
-        return;
-    }
-
-    LCD_2IN_Clear((UWORD)value);
-    printf("LCD cleared with color 0x%04X\n", (uint16_t)value);
-}
-
-static void run_lcd_pixel(const size_t argc, const char *argv[]){
-    if(!expect_argc(argc,argv,3)) return;
-    if(!lcd_initialized){
-        printf("LCD not initialized. Run lcd_init first.\n");
-        return;
-    }
-    char *end = NULL;
-    long x = strtol(argv[0], &end, 10);
-    if (end == argv[0] || *end != '\0') {
-        printf("Invalid x coordinate: %s (use decimal, e.g. 10)\n", argv[0]);
-        return;
-    }
-    long y = strtol(argv[1], &end, 10);
-    if (end == argv[1] || *end != '\0') {
-        printf("Invalid y coordinate: %s (use decimal, e.g. 10)\n", argv[1]);
-        return;
-    }
-    unsigned long color = strtoul(argv[2], &end, 16);
-    if (end == argv[2] || *end != '\0') {
-        printf("Invalid color: %s (use hex RGB565, e.g. ffff for white)\n", argv[2]);
-        return;
-    }
-    int lcd_width = (lcd_scan_dir == VERTICAL) ? LCD_2IN_WIDTH : LCD_2IN_HEIGHT;
-    int lcd_height = (lcd_scan_dir == VERTICAL) ? LCD_2IN_HEIGHT : LCD_2IN_WIDTH;
-    if(x < 0 || x >= lcd_width || y < 0 || y >= lcd_height){
-        printf("Coordinates out of range: (%lu, %lu) (LCD size is %dx%d)\n", x, y, lcd_width, lcd_height);
-        return;
-    }
-    if(color > 0xFFFF){
-        printf("Color out of range: %lu (use hex RGB565, e.g. ffff for white)\n", color);
-        return;
-    }
-
-    LCD_2IN_DisplayPoint((UWORD)x, (UWORD)y, (UWORD)color);
-    printf("Drew pixel at (%ld, %ld) with color 0x%04X\n", x, y, (uint16_t)color);
-}
-
-static void run_lcd_fillrect(const size_t argc, const char *argv[]){
-    if(!expect_argc(argc,argv,5)) return;
-    if(!lcd_initialized){
-        printf("LCD not initialized. Run lcd_init first.\n");
-        return;
-    }
-    char *end = NULL;
-    long x = strtol(argv[0], &end, 10);
-    if (end == argv[0] || *end != '\0') {
-        printf("Invalid x coordinate: %s (use decimal, e.g. 10)\n", argv[0]);
-        return;
-    }
-    long y = strtol(argv[1], &end, 10);
-    if (end == argv[1] || *end != '\0') {
-        printf("Invalid y coordinate: %s (use decimal, e.g. 10)\n", argv[1]);
-        return;
-    }
-    long w = strtol(argv[2], &end, 10);
-    if (end == argv[2] || *end != '\0') {
-        printf("Invalid width: %s (use decimal, e.g. 50)\n", argv[2]);
-        return;
-    }
-    long h = strtol(argv[3], &end, 10);
-    if (end == argv[3] || *end != '\0') {   
-        printf("Invalid height: %s (use decimal, e.g. 50)\n", argv[3]);
-        return;
-    }
-    unsigned long color = strtoul(argv[4], &end, 16);
-    if (end == argv[4] || *end != '\0') {
-        printf("Invalid color: %s (use hex RGB565, e.g. ffff for white)\n", argv[4]);
-        return;
-    }
-    int lcd_width = (lcd_scan_dir == VERTICAL) ? LCD_2IN_WIDTH : LCD_2IN_HEIGHT;
-    int lcd_height = (lcd_scan_dir == VERTICAL) ? LCD_2IN_HEIGHT : LCD_2IN_WIDTH;
-    if(x < 0 || x >= lcd_width || x + w > lcd_width || y < 0 || y >= lcd_height || y + h > lcd_height){
-        printf("Coordinates out of range: (%ld, %ld) (LCD size is %dx%d)\n", x, y, lcd_width, lcd_height);
-
-        return;
-    }
-    if (w <= 0 || h <= 0) {
-        printf("Width and height must be > 0\n");
-        return;
-    }
-
-    if(color > 0xFFFF){
-        printf("Color out of range: %lu (use hex RGB565, e.g. ffff for white)\n", color);
-        return;
-    }
-    UWORD color_be = (color >> 8) | (color << 8);
-    UWORD line_buf[64];
-
-    for (int i = 0; i < 64; i++) {
-        line_buf[i] = color_be;
-    }
-
-    LCD_2IN_SetWindows((uint16_t)x, (uint16_t)y, (uint16_t)(x + w), (uint16_t)(y + h));
-    DEV_Digital_Write(LCD_DC_PIN, 1);
-    DEV_Digital_Write(LCD_CS_PIN, 0);
-
-    uint32_t pixels = (uint32_t)w * (uint32_t)h;
-    while (pixels > 0) {
-        uint32_t chunk = (pixels > 64) ? 64 : pixels;
-        DEV_SPI_Write_nByte((uint8_t *)line_buf, chunk * 2);
-        pixels -= chunk;
-    }
-
-    DEV_Digital_Write(LCD_CS_PIN, 1);
-
-
-    printf("Filled rectangle at (%ld, %ld), size %ldx%ld, color 0x%04X\n",
-       x, y, w, h, (uint16_t)color);
-
-}
-
-static void run_lcd_set_orientation(const size_t argc, const char *argv[]) {
-    if (!expect_argc(argc, argv, 1)) return;
-    if (!lcd_initialized) {
-        printf("LCD not initialized. Run lcd_init first.\n");
-        return;
-    }
-
-    UBYTE new_scan_dir;
-    if (strcmp(argv[0], "vertical") == 0) {
-        new_scan_dir = VERTICAL;
-    } else if (strcmp(argv[0], "horizontal") == 0) {
-        new_scan_dir = HORIZONTAL;
-    } else {
-        printf("Invalid argument: %s (use vertical or horizontal)\n", argv[0]);
-        return;
-    }
-
-    if (new_scan_dir == lcd_scan_dir) {
-        printf("LCD orientation already set to %s\n",
-               lcd_scan_dir == VERTICAL ? "vertical" : "horizontal");
-        return;
-    }
-
-    LCD_2IN_SetAttributes(new_scan_dir);
-    lcd_scan_dir = new_scan_dir;
-
-    printf("LCD orientation set to %s\n",
-           lcd_scan_dir == VERTICAL ? "vertical" : "horizontal");
-}
-
-static void run_lcd_cam_show(const size_t argc, const char *argv[]) {
-    if (!expect_argc(argc, argv, 0)) return;
-
-    if (!lcd_initialized) {
-        printf("LCD not initialized. Run lcd_init first.\n");
-        return;
-    }
-
-    if (!cam_ptr) {
-        printf("Camera buffer not allocated/captured yet.\n");
-        return;
-    }
-
-    if (lcd_scan_dir != VERTICAL) {
-        printf("lcd_cam_show currently supports vertical LCD orientation only.\n");
-        return;
-    }
-
-    if (cam_width != 240 || cam_height != 320) {
-        printf("lcd_cam_show requires camera size 240x320.\n");
-        return;
-    }
-    if (!lcd_image) {
-        printf("LCD framebuffer not allocated. Run lcd_init first.\n");
-        return;
-    }
-
-
-    Paint_DrawImage(cam_ptr, 0, 0, LCD_2IN.WIDTH, LCD_2IN.HEIGHT);
-    LCD_2IN_Display(lcd_image);
-
-    printf("Displayed camera buffer on LCD\n");
-}
-
-
-static void run_lcd_status(const size_t argc, const char *argv[]){
-    if(!expect_argc(argc, argv, 0)) return;
-    printf("LCD initialized: %s. ", lcd_initialized ? "yes" : "no");
-    printf("Orientation: %s. ", lcd_scan_dir == VERTICAL ? "vertical" : "horizontal");
-    printf("Backlight brightness: %u%%.\n", lcd_backlight);
-    printf("Size: %dx%d.\n", (lcd_scan_dir == VERTICAL) ? LCD_2IN_WIDTH : LCD_2IN_HEIGHT,
-           (lcd_scan_dir == VERTICAL) ? LCD_2IN_HEIGHT : LCD_2IN_WIDTH);
-}
-
 typedef void (*p_fn_t)(const size_t argc, const char *argv[]);
 typedef struct {
     char const *const command;
@@ -1386,96 +730,6 @@ static cmd_def_t cmds[] = {
     {"mem-stats", run_mem_stats,
      "mem-stats:\n"
      " Print memory statistics"},
-    {"cam_xclk", run_cam_xclk,
-     "cam_xclk [<freq_khz>]:\n"
-     " Set camera XCLK frequency. Default 24000\n"
-     "\te.g.: cam_xclk 24000"},
-    {"cam_i2c", run_cam_i2c_init,
-     "cam_i2c:\n"
-     " Initialise I2C1 bus for camera SCCB"},
-    {"cam_id", run_cam_id,
-     "cam_id:\n"
-     " Read and print OV5640 chip ID"},
-    {"cam_defaults", run_cam_defaults,
-     "cam_defaults:\n"
-     " Apply the original OV5640 default sensor init sequence"},
-    {"cam_size", run_cam_size,
-     "cam_size <w> <h>:\n"
-     " Set camera output resolution\n"
-     "\te.g.: cam_size 240 320"},
-    {"cam_flip", run_cam_flip,
-     "cam_flip <val>:\n"
-     " Set vertical flip (0=normal, 6=flipped)\n"
-     "\te.g.: cam_flip 0"},
-    {"cam_mirror", run_cam_mirror,
-     "cam_mirror <val>:\n"
-     " Set horizontal mirror (0=normal, 6=mirrored)\n"
-     "\te.g.: cam_mirror 0"},
-    {"cam_pll", run_cam_pll,
-     "cam_pll <multiplier>:\n"
-     " Set PLL multiplier (4-127 any, 128-252 even only)\n"
-     "\te.g.: cam_pll 11"},
-    {"cam_format", run_cam_format,
-     "cam_format <rgb565|yuv422>:\n"
-     " Set camera output color format\n"
-     "\te.g.: cam_format rgb565"},
-    {"cam_alloc", run_cam_alloc,
-     "cam_alloc:\n"
-     " Allocate frame buffer in RAM"},
-    {"cam_dma", run_cam_dma,
-     "cam_dma:\n"
-     " Configure DMA channel and IRQ handler"},
-    {"cam_start", run_cam_start,
-     "cam_start:\n"
-     " Load PIO program and start capture"},
-    {"cam_rreg", run_cam_rreg,
-     "cam_rreg <reg>:\n"
-     " Read one OV5640 register (hex address)\n"
-     "\te.g.: cam_rreg 501f"},
-    {"cam_wreg", run_cam_wreg,
-     "cam_wreg <reg> <val>:\n"
-     " Write one OV5640 register (hex address and value)\n"
-     "\te.g.: cam_wreg 501f 01"},
-    {"cam_capture", run_cam_capture,
-     "cam_capture <filename>:\n"
-     " Wait for a complete frame and save to SD\n"
-     "\te.g.: cam_capture 0:/photo.bin"},
-    {"cam_snap", run_cam_snap,
-     "cam_snap <filename>:\n"
-     " Capture one frame, restore UART, and save to SD\n"
-     "\te.g.: cam_snap 0:/photo.bin"},
-    {"cam_stop", run_cam_stop,
-     "cam_stop:\n"
-     " Stop camera DMA and pipeline"},
-    {"lcd_init", run_lcd_init,
-     "lcd_init [vertical|horizontal]:\n"
-     " Initialise LCD and set scan direction (default vertical)"},
-    {"lcd_bl", run_lcd_bl,
-     "lcd_bl <0-100>:\n"
-     " Set LCD backlight brightness in percent\n"
-     "\te.g.: lcd_bl 50"},
-    {"lcd_clear", run_lcd_clear,
-     "lcd_clear <color>:\n"
-     " Clear LCD with specified color (hex RGB565, e.g. ffff for white)"},
-    {"lcd_pixel", run_lcd_pixel,
-     "lcd_pixel <x> <y> <color>:\n"
-     " Set a pixel on the LCD to the specified color (hex RGB565, e.g. ffff for white)\n"
-     "\te.g.: lcd_pixel 100 100 ffff"},
-    {"lcd_fillrect", run_lcd_fillrect,
-     "lcd_fillrect <x> <y> <w> <h> <color>:\n"
-     " Fill a rectangle on the LCD with the specified color (hex RGB565, e.g. ffff for white)\n"
-     "\te.g.: lcd_fillrect 50 50 100 100 ffff"},
-    {"lcd_set_orientation", run_lcd_set_orientation,
-     "lcd_set_orientation <vertical|horizontal>:\n"
-     " Set the scan direction of the LCD (default vertical)"},
-    {"lcd_cam_show", run_lcd_cam_show,
-     "lcd_cam_show:\n"
-     " Display the camera buffer on the LCD."},
-    {"lcd_status", run_lcd_status,
-     "lcd_status:\n"
-     " Display the current status of the LCD."},
-
-
     // // Clocks testing:
     // {"set_sys_clock_48mhz", run_set_sys_clock_48mhz,
     //  "set_sys_clock_48mhz:\n"
@@ -1563,146 +817,51 @@ static void process_cmd(size_t cmd_sz, char *cmd) {
 }
 
 void process_stdio(int cRxedChar) {
+    static char cmd[256];
+    static size_t ix;
+
     if (!(0 < cRxedChar &&  cRxedChar <= 0x7F))
         return; // Not dealing with multibyte characters
     if (!isprint(cRxedChar) && !isspace(cRxedChar) && '\r' != cRxedChar &&
         '\b' != cRxedChar && cRxedChar != 127)
         return;
-    if (cRxedChar == '\n' && last_input_was_cr) {
-        last_input_was_cr = false;
-        return;
-    }
-    if (cRxedChar == '\r' || cRxedChar == '\n') {
-        last_input_was_cr = (cRxedChar == '\r');
-        printf("%c", cRxedChar);  // echo Enter
-        stdio_flush();
+    printf("%c", cRxedChar);  // echo
+    stdio_flush();
+    if (cRxedChar == '\r') {
         /* Just to space the output from the input. */
         printf("%c", '\n');
         stdio_flush();
 
-        if (!cmd_buffer[0]) {  // Empty input
-            print_prompt();
+        if (!cmd[0]) {  // Empty input
+            printf("> ");
+            stdio_flush();
             return;
         }
 
         /* Process the input string received prior to the newline. */
-        process_cmd(sizeof cmd_buffer, cmd_buffer);
+        process_cmd(sizeof cmd, cmd);
 
         /* Reset everything for next cmd */
-        cmd_ix = 0;
-        memset(cmd_buffer, 0, sizeof cmd_buffer);
-        printf("\n");
-        print_prompt();
+        ix = 0;
+        memset(cmd, 0, sizeof cmd);
+        printf("\n> ");
+        stdio_flush();
     } else {  // Not newline
-        last_input_was_cr = false;
         if (cRxedChar == '\b' || cRxedChar == (char)127) {
             /* Backspace was pressed.  Erase the last character
              in the string - if any. */
-            if (cmd_ix > 0) {
-                cmd_ix--;
-                cmd_buffer[cmd_ix] = '\0';
-                printf("\b \b");
-                stdio_flush();
+            if (ix > 0) {
+                ix--;
+                cmd[ix] = '\0';
             }
         } else {
             /* A character was entered.  Add it to the string
              entered so far.  When a \n is entered the complete
              string will be passed to the command interpreter. */
-            if (cmd_ix < sizeof cmd_buffer - 1) {
-                cmd_buffer[cmd_ix] = cRxedChar;
-                cmd_ix++;
-                printf("%c", cRxedChar);  // echo
-                stdio_flush();
+            if (ix < sizeof cmd - 1) {
+                cmd[ix] = cRxedChar;
+                ix++;
             }
         }
-    }
-}
-
-bool command_input_in_progress(void) {
-    return cmd_ix > 0;
-}
-
-void process_background_tasks(void) {
-    if (!cam_snap_pending) {
-        return;
-    }
-
-    if (!time_reached(cam_snap_next_step_time)) {
-        return;
-    }
-
-    switch (cam_snap_state) {
-    case CAM_SNAP_WAIT_FRAME:
-        if (cam_wait_for_frame(0)) {
-            cam_snap_state = CAM_SNAP_OPEN_FILE;
-            cam_snap_next_step_time = delayed_by_ms(get_absolute_time(), 1);
-            return;
-        }
-        if (time_reached(cam_snap_deadline)) {
-            finish_cam_snap();
-            printf("\nCamera capture timed out after 2000 ms\n");
-            print_prompt();
-        }
-        return;
-
-    case CAM_SNAP_OPEN_FILE: {
-        FRESULT fr = f_open(&cam_snap_file, cam_snap_path, FA_WRITE | FA_CREATE_ALWAYS);
-        if (FR_OK != fr) {
-            printf("\nf_open error: %s (%d)\n", FRESULT_str(fr), fr);
-            finish_cam_snap();
-            print_prompt();
-            return;
-        }
-        cam_snap_file_open = true;
-        cam_snap_state = CAM_SNAP_WRITE_FILE;
-        cam_snap_next_step_time = delayed_by_ms(get_absolute_time(), 1);
-        return;
-    }
-
-    case CAM_SNAP_WRITE_FILE: {
-        uint32_t total_bytes = cam_ful_size * 2;
-        if (cam_snap_write_offset >= total_bytes) {
-            cam_snap_state = CAM_SNAP_CLOSE_FILE;
-            return;
-        }
-
-        UINT chunk = cam_snap_chunk_size;
-        uint32_t remaining = total_bytes - cam_snap_write_offset;
-        if (remaining < chunk) {
-            chunk = (UINT)remaining;
-        }
-
-        UINT bw = 0;
-        FRESULT fr = f_write(&cam_snap_file, cam_ptr + cam_snap_write_offset, chunk, &bw);
-        if (FR_OK != fr || bw != chunk) {
-            if (FR_OK != fr) {
-                printf("\nf_write error: %s (%d)\n", FRESULT_str(fr), fr);
-            } else {
-                printf("\nShort write: %u of %u bytes\n", bw, chunk);
-            }
-            finish_cam_snap();
-            print_prompt();
-            return;
-        }
-
-        cam_snap_write_offset += bw;
-        cam_snap_total_written += bw;
-        cam_snap_next_step_time = delayed_by_ms(get_absolute_time(), 1);
-        return;
-    }
-
-    case CAM_SNAP_CLOSE_FILE: {
-        char completed_path[sizeof(cam_snap_path)];
-        strlcpy(completed_path, cam_snap_path, sizeof(completed_path));
-        UINT completed_written = cam_snap_total_written;
-        finish_cam_snap();
-        printf("\nWrote %u bytes to %s\n", completed_written, completed_path);
-        print_prompt();
-        return;
-    }
-
-    case CAM_SNAP_IDLE:
-    default:
-        return;
     }
 }

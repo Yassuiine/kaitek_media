@@ -34,7 +34,7 @@ pico_sdk_init()
 # Build helper library from src/
 add_subdirectory(src)
 
-add_executable(03-FatFs
+set(APP_SOURCES
     main.cpp
     config/hw_config.c
     src/command.cpp
@@ -47,7 +47,23 @@ add_executable(03-FatFs
     tests/ff_stdio_tests_with_cwd.c
     lib/CAM/cam.c
     lib/CAM/ov5640.c
+    lib/LCD/DEV_Config.c
+    lib/LCD/LCD_2in.c
 )
+
+if (EXISTS ${CMAKE_CURRENT_LIST_DIR}/lib/Fonts/fonts.h)
+    list(APPEND APP_SOURCES
+        lib/LCD/GUI_Paint.c
+        lib/Fonts/font8.c
+        lib/Fonts/font12.c
+        lib/Fonts/font16.c
+        lib/Fonts/font20.c
+        lib/Fonts/font24.c
+    )
+endif()
+
+
+add_executable(03-FatFs ${APP_SOURCES})
 
 pico_generate_pio_header(03-FatFs
     ${CMAKE_CURRENT_LIST_DIR}/lib/CAM/picampinos.pio
@@ -80,7 +96,14 @@ target_include_directories(03-FatFs PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/include
     ${CMAKE_CURRENT_LIST_DIR}/src/include
     ${CMAKE_CURRENT_LIST_DIR}/lib/CAM
+    ${CMAKE_CURRENT_LIST_DIR}/lib/LCD
 )
+
+if (EXISTS ${CMAKE_CURRENT_LIST_DIR}/lib/Fonts/fonts.h)
+    target_include_directories(03-FatFs PRIVATE
+        ${CMAKE_CURRENT_LIST_DIR}/lib/Fonts
+    )
+endif()
 
 target_link_libraries(03-FatFs PRIVATE
     no-OS-FatFS-SD-SDIO-SPI-RPi-Pico
@@ -88,6 +111,7 @@ target_link_libraries(03-FatFs PRIVATE
     hardware_adc
     hardware_pwm
     hardware_i2c
+    hardware_vreg
 )
 
 pico_add_extra_outputs(03-FatFs)
