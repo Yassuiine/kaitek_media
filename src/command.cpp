@@ -58,6 +58,50 @@ enum cam_snap_state_t {
     CAM_SNAP_CLOSE_FILE,
 };
 
+enum lcd_load_state_t{
+    LCD_LOAD_IDLE = 0,
+    LCD_LOAD_OPEN_FILE,
+    LCD_LOAD_READ_FILE,
+    LCD_LOAD_CLOSE_FILE,
+    LCD_LOAD_DISPLAY,
+};
+
+enum lcd_cam_snap_state_t {
+    LCD_CAM_SNAP_IDLE = 0,
+    LCD_CAM_SNAP_WAIT_FRAME,
+    LCD_CAM_SNAP_DISPLAY_ROWS,
+};
+
+enum lcd_cam_stream_state_t {
+    LCD_CAM_STREAM_IDLE = 0,
+    LCD_CAM_STREAM_WAIT_FRAME,
+    LCD_CAM_STREAM_DISPLAY_ROWS,
+};
+
+static lcd_load_state_t lcd_load_state = LCD_LOAD_IDLE;
+static bool lcd_load_pending = false;
+static FIL lcd_load_file;
+static bool lcd_load_file_open = false;
+static char lcd_load_path[256];
+static char lcd_load_status_msg[128];
+static UINT lcd_load_offset = 0;
+static uint32_t lcd_load_display_row = 0;
+static absolute_time_t lcd_load_next_step_time;
+static const uint32_t lcd_display_row_chunk = 16;
+static uint8_t lcd_row_buffer[LCD_2IN_WIDTH * 2 * lcd_display_row_chunk];
+
+static lcd_cam_snap_state_t lcd_cam_snap_state = LCD_CAM_SNAP_IDLE;
+static bool lcd_cam_snap_pending = false;
+static uint32_t lcd_cam_snap_row = 0;
+static absolute_time_t lcd_cam_snap_deadline;
+static absolute_time_t lcd_cam_snap_next_step_time;
+
+static lcd_cam_stream_state_t lcd_cam_stream_state = LCD_CAM_STREAM_IDLE;
+static bool lcd_cam_stream_active = false;
+static uint32_t lcd_cam_stream_row = 0;
+static absolute_time_t lcd_cam_stream_deadline;
+static absolute_time_t lcd_cam_stream_next_step_time;
+
 static cam_snap_state_t cam_snap_state;
 static const UINT cam_snap_chunk_size = 512;
 
@@ -1240,40 +1284,257 @@ static void run_lcd_set_orientation(const size_t argc, const char *argv[]) {
            lcd_scan_dir == VERTICAL ? "vertical" : "horizontal");
 }
 
-static void run_lcd_cam_show(const size_t argc, const char *argv[]) {
+static void finish_lcd_load(void) {
+    if (lcd_load_file_open) {
+        f_close(&lcd_load_file);
+        lcd_load_file_open = false;
+    }
+    lcd_load_pending = false;
+    lcd_load_state = LCD_LOAD_IDLE;
+    lcd_load_offset = 0;
+    lcd_load_display_row = 0;
+    lcd_load_path[0] = '\0';
+    lcd_load_status_msg[0] = '\0';
+}
+
+static void fail_lcd_load(const char *msg) {
+    printf("\n%s\n", msg);
+    finish_lcd_load();
+    print_prompt();
+}
+
+static bool start_lcd_framebuffer_display(const char *status_msg) {
+    if (lcd_load_pending) {
+        printf("An LCD image operation is already in progress.\n");
+        return false;
+    }
+
+    lcd_load_pending = true;
+    lcd_load_state = LCD_LOAD_DISPLAY;
+    lcd_load_file_open = false;
+    lcd_load_offset = 0;
+    lcd_load_display_row = 0;
+    lcd_load_next_step_time = get_absolute_time();
+    lcd_load_path[0] = '\0';
+    if (status_msg) {
+        strlcpy(lcd_load_status_msg, status_msg, sizeof(lcd_load_status_msg));
+    } else {
+        lcd_load_status_msg[0] = '\0';
+    }
+    return true;
+}
+
+static void lcd_display_rows_from_framebuffer(uint32_t start_row, uint32_t row_count) {
+    LCD_2IN_SetWindows(0, (UWORD)start_row, LCD_2IN.WIDTH, (UWORD)(start_row + row_count));
+    DEV_Digital_Write(LCD_DC_PIN, 1);
+    DEV_Digital_Write(LCD_CS_PIN, 0);
+    for (uint32_t row = start_row; row < start_row + row_count; ++row) {
+        DEV_SPI_Write_nByte((UBYTE *)lcd_image + (row * LCD_2IN.WIDTH * 2), LCD_2IN.WIDTH * 2);
+    }
+    DEV_Digital_Write(LCD_CS_PIN, 1);
+}
+
+static void lcd_convert_raw_rgb565_to_panel_bytes(const uint8_t *src, uint8_t *dst, uint32_t pixel_count) {
+    for (uint32_t i = 0; i < pixel_count; ++i) {
+        dst[i * 2] = src[i * 2 + 1];
+        dst[i * 2 + 1] = src[i * 2];
+    }
+}
+
+static void lcd_display_raw_rows(uint32_t start_row, uint32_t row_count, const uint8_t *raw_rows) {
+    uint32_t pixel_count = LCD_2IN_WIDTH * row_count;
+    lcd_convert_raw_rgb565_to_panel_bytes(raw_rows, lcd_row_buffer, pixel_count);
+
+    LCD_2IN_SetWindows(0, (UWORD)start_row, LCD_2IN.WIDTH, (UWORD)(start_row + row_count));
+    DEV_Digital_Write(LCD_DC_PIN, 1);
+    DEV_Digital_Write(LCD_CS_PIN, 0);
+    DEV_SPI_Write_nByte(lcd_row_buffer, pixel_count * 2);
+    DEV_Digital_Write(LCD_CS_PIN, 1);
+}
+
+static void lcd_copy_raw_rows_to_framebuffer(uint32_t start_row, uint32_t row_count, const uint8_t *raw_rows) {
+    for (uint32_t row = 0; row < row_count; ++row) {
+        uint8_t *dst = (uint8_t *)lcd_image + ((start_row + row) * LCD_2IN_WIDTH * 2);
+        const uint8_t *src = raw_rows + (row * LCD_2IN_WIDTH * 2);
+        lcd_convert_raw_rgb565_to_panel_bytes(src, dst, LCD_2IN_WIDTH);
+    }
+}
+
+static void lcd_prepare_image_rows_from_camera(uint32_t start_row, uint32_t row_count) {
+    lcd_copy_raw_rows_to_framebuffer(start_row,
+                                     row_count,
+                                     cam_ptr + (start_row * cam_width * 2));
+}
+
+static bool ensure_lcd_camera_ready(const char *cmd_name) {
+    if (!lcd_initialized) {
+        printf("LCD not initialized. Run lcd_init first.\n");
+        return false;
+    }
+
+    if (!lcd_image) {
+        printf("LCD framebuffer not allocated. Run lcd_init first.\n");
+        return false;
+    }
+
+    if (!ensure_cam_buffer_allocated()) {
+        return false;
+    }
+
+    if (lcd_scan_dir != VERTICAL) {
+        printf("%s currently supports vertical LCD orientation only.\n", cmd_name);
+        return false;
+    }
+
+    if (cam_width != LCD_2IN_WIDTH || cam_height != LCD_2IN_HEIGHT) {
+        printf("%s requires camera size 240x320.\n", cmd_name);
+        return false;
+    }
+
+    return true;
+}
+
+static void finish_lcd_cam_snap(void) {
+    free_cam();
+    buffer_ready = false;
+    lcd_cam_snap_pending = false;
+    lcd_cam_snap_state = LCD_CAM_SNAP_IDLE;
+    lcd_cam_snap_row = 0;
+}
+
+static void finish_lcd_cam_stream(void) {
+    free_cam();
+    buffer_ready = false;
+    lcd_cam_stream_active = false;
+    lcd_cam_stream_state = LCD_CAM_STREAM_IDLE;
+    lcd_cam_stream_row = 0;
+}
+
+static void run_lcd_cam_snap(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
+    if (!ensure_lcd_camera_ready("lcd_cam_snap")) return;
+    if (cam_snap_pending || lcd_load_pending || lcd_cam_snap_pending || lcd_cam_stream_active) {
+        printf("Another camera or LCD operation is already in progress.\n");
+        return;
+    }
+
+    cam_set_continuous(false);
+    cam_set_use_irq(false);
+    buffer_ready = false;
+    config_cam_buffer();
+    start_cam();
+
+    lcd_cam_snap_pending = true;
+    lcd_cam_snap_state = LCD_CAM_SNAP_WAIT_FRAME;
+    lcd_cam_snap_row = 0;
+    lcd_cam_snap_deadline = make_timeout_time_ms(2000);
+    lcd_cam_snap_next_step_time = get_absolute_time();
+
+    printf("Capturing and displaying camera frame in background...\n");
+}
+
+static void run_lcd_load_image(const size_t argc, const char *argv[]) {
+    if (!expect_argc(argc, argv, 1)) return;
 
     if (!lcd_initialized) {
         printf("LCD not initialized. Run lcd_init first.\n");
         return;
     }
 
-    if (!cam_ptr) {
-        printf("Camera buffer not allocated/captured yet.\n");
-        return;
-    }
-
-    if (lcd_scan_dir != VERTICAL) {
-        printf("lcd_cam_show currently supports vertical LCD orientation only.\n");
-        return;
-    }
-
-    if (cam_width != 240 || cam_height != 320) {
-        printf("lcd_cam_show requires camera size 240x320.\n");
-        return;
-    }
     if (!lcd_image) {
         printf("LCD framebuffer not allocated. Run lcd_init first.\n");
         return;
     }
 
+    if (lcd_scan_dir != VERTICAL) {
+        printf("lcd_load_image currently supports vertical LCD orientation only.\n");
+        return;
+    }
 
-    Paint_DrawImage(cam_ptr, 0, 0, LCD_2IN.WIDTH, LCD_2IN.HEIGHT);
-    LCD_2IN_Display(lcd_image);
+    if (lcd_load_pending || lcd_cam_snap_pending || lcd_cam_stream_active) {
+        printf("Another LCD image or stream operation is already in progress.\n");
+        return;
+    }
 
-    printf("Displayed camera buffer on LCD\n");
+    strlcpy(lcd_load_path, argv[0], sizeof(lcd_load_path));
+    lcd_load_offset = 0;
+    lcd_load_display_row = 0;
+    lcd_load_pending = true;
+    lcd_load_file_open = false;
+    lcd_load_state = LCD_LOAD_OPEN_FILE;
+    lcd_load_next_step_time = get_absolute_time();
+
+    printf("Loading image in background...\n");
 }
 
+static void run_lcd_unload_image(const size_t argc, const char *argv[]) {
+    if (!expect_argc(argc, argv, 0)) return;
+
+    if (!lcd_initialized || !lcd_image) {
+        printf("LCD not initialized. Run lcd_init first.\n");
+        return;
+    }
+
+    if (lcd_cam_stream_active) {
+        printf("Stop lcd_cam_stream before unloading the image.\n");
+        return;
+    }
+
+    Paint_Clear(BLACK);
+    if (!start_lcd_framebuffer_display("LCD image unloaded and screen cleared to black")) {
+        return;
+    }
+
+    printf("Clearing LCD in background...\n");
+}
+
+static void run_lcd_cam_stream(const size_t argc, const char *argv[]) {
+    if (argc > 1) {
+        printf("Usage: lcd_cam_stream [stop]\n");
+        return;
+    }
+
+    if (argc == 1) {
+        if (strcmp(argv[0], "stop") != 0) {
+            printf("Unexpected argument: %s\n", argv[0]);
+            return;
+        }
+
+        if (!lcd_cam_stream_active) {
+            printf("LCD camera stream is not running.\n");
+            return;
+        }
+
+        finish_lcd_cam_stream();
+        Paint_Clear(BLACK);
+        if (!start_lcd_framebuffer_display("LCD camera stream stopped and screen cleared to black")) {
+            return;
+        }
+
+        printf("Stopping LCD camera stream...\n");
+        return;
+    }
+
+    if (!ensure_lcd_camera_ready("lcd_cam_stream")) return;
+    if (cam_snap_pending || lcd_load_pending || lcd_cam_snap_pending || lcd_cam_stream_active) {
+        printf("Another camera or LCD operation is already in progress.\n");
+        return;
+    }
+
+    cam_set_continuous(false);
+    cam_set_use_irq(false);
+    buffer_ready = false;
+    config_cam_buffer();
+    start_cam();
+
+    lcd_cam_stream_active = true;
+    lcd_cam_stream_state = LCD_CAM_STREAM_WAIT_FRAME;
+    lcd_cam_stream_row = 0;
+    lcd_cam_stream_deadline = make_timeout_time_ms(2000);
+    lcd_cam_stream_next_step_time = get_absolute_time();
+
+    printf("Starting LCD camera stream in background...\n");
+}
 
 static void run_lcd_status(const size_t argc, const char *argv[]){
     if(!expect_argc(argc, argv, 0)) return;
@@ -1468,9 +1729,18 @@ static cmd_def_t cmds[] = {
     {"lcd_set_orientation", run_lcd_set_orientation,
      "lcd_set_orientation <vertical|horizontal>:\n"
      " Set the scan direction of the LCD (default vertical)"},
-    {"lcd_cam_show", run_lcd_cam_show,
-     "lcd_cam_show:\n"
-     " Display the camera buffer on the LCD."},
+    {"lcd_cam_snap", run_lcd_cam_snap,
+     "lcd_cam_snap:\n"
+     " Capture one camera frame and display it on the LCD in background."},
+    {"lcd_load_image", run_lcd_load_image,
+     "lcd_load_image <file>:\n"
+     " Load a raw 240x320 RGB565 image from SD and display it in background."},
+    {"lcd_unload_image", run_lcd_unload_image,
+     "lcd_unload_image:\n"
+     " Clear the LCD image buffer and display black in background."},
+    {"lcd_cam_stream", run_lcd_cam_stream,
+     "lcd_cam_stream [stop]:\n"
+     " Start or stop continuous camera-to-LCD preview in background."},
     {"lcd_status", run_lcd_status,
      "lcd_status:\n"
      " Display the current status of the LCD."},
@@ -1623,86 +1893,282 @@ bool command_input_in_progress(void) {
 }
 
 void process_background_tasks(void) {
-    if (!cam_snap_pending) {
-        return;
-    }
+    if (cam_snap_pending && time_reached(cam_snap_next_step_time)) {
+        switch (cam_snap_state) {
+        case CAM_SNAP_WAIT_FRAME:
+            if (cam_wait_for_frame(0)) {
+                cam_snap_state = CAM_SNAP_OPEN_FILE;
+                cam_snap_next_step_time = delayed_by_ms(get_absolute_time(), 1);
+                return;
+            }
+            if (time_reached(cam_snap_deadline)) {
+                finish_cam_snap();
+                printf("\nCamera capture timed out after 2000 ms\n");
+                print_prompt();
+            }
+            return;
 
-    if (!time_reached(cam_snap_next_step_time)) {
-        return;
-    }
-
-    switch (cam_snap_state) {
-    case CAM_SNAP_WAIT_FRAME:
-        if (cam_wait_for_frame(0)) {
-            cam_snap_state = CAM_SNAP_OPEN_FILE;
+        case CAM_SNAP_OPEN_FILE: {
+            FRESULT fr = f_open(&cam_snap_file, cam_snap_path, FA_WRITE | FA_CREATE_ALWAYS);
+            if (FR_OK != fr) {
+                printf("\nf_open error: %s (%d)\n", FRESULT_str(fr), fr);
+                finish_cam_snap();
+                print_prompt();
+                return;
+            }
+            cam_snap_file_open = true;
+            cam_snap_state = CAM_SNAP_WRITE_FILE;
             cam_snap_next_step_time = delayed_by_ms(get_absolute_time(), 1);
             return;
         }
-        if (time_reached(cam_snap_deadline)) {
-            finish_cam_snap();
-            printf("\nCamera capture timed out after 2000 ms\n");
-            print_prompt();
-        }
-        return;
 
-    case CAM_SNAP_OPEN_FILE: {
-        FRESULT fr = f_open(&cam_snap_file, cam_snap_path, FA_WRITE | FA_CREATE_ALWAYS);
+        case CAM_SNAP_WRITE_FILE: {
+            uint32_t total_bytes = cam_ful_size * 2;
+            if (cam_snap_write_offset >= total_bytes) {
+                cam_snap_state = CAM_SNAP_CLOSE_FILE;
+                return;
+            }
+
+            UINT chunk = cam_snap_chunk_size;
+            uint32_t remaining = total_bytes - cam_snap_write_offset;
+            if (remaining < chunk) {
+                chunk = (UINT)remaining;
+            }
+
+            UINT bw = 0;
+            FRESULT fr = f_write(&cam_snap_file, cam_ptr + cam_snap_write_offset, chunk, &bw);
+            if (FR_OK != fr || bw != chunk) {
+                if (FR_OK != fr) {
+                    printf("\nf_write error: %s (%d)\n", FRESULT_str(fr), fr);
+                } else {
+                    printf("\nShort write: %u of %u bytes\n", bw, chunk);
+                }
+                finish_cam_snap();
+                print_prompt();
+                return;
+            }
+
+            cam_snap_write_offset += bw;
+            cam_snap_total_written += bw;
+            cam_snap_next_step_time = delayed_by_ms(get_absolute_time(), 1);
+            return;
+        }
+
+        case CAM_SNAP_CLOSE_FILE: {
+            char completed_path[sizeof(cam_snap_path)];
+            strlcpy(completed_path, cam_snap_path, sizeof(completed_path));
+            UINT completed_written = cam_snap_total_written;
+            finish_cam_snap();
+            printf("\nWrote %u bytes to %s\n", completed_written, completed_path);
+            print_prompt();
+            return;
+        }
+
+        case CAM_SNAP_IDLE:
+        default:
+            break;
+        }
+    }
+
+    if (lcd_cam_snap_pending && time_reached(lcd_cam_snap_next_step_time)) {
+        switch (lcd_cam_snap_state) {
+        case LCD_CAM_SNAP_WAIT_FRAME:
+            if (cam_wait_for_frame(0)) {
+                lcd_cam_snap_state = LCD_CAM_SNAP_DISPLAY_ROWS;
+                lcd_cam_snap_row = 0;
+                lcd_cam_snap_next_step_time = delayed_by_ms(get_absolute_time(), 1);
+                return;
+            }
+            if (time_reached(lcd_cam_snap_deadline)) {
+                finish_lcd_cam_snap();
+                printf("\nLCD camera snapshot timed out after 2000 ms\n");
+                print_prompt();
+            }
+            return;
+
+        case LCD_CAM_SNAP_DISPLAY_ROWS: {
+            if (lcd_cam_snap_row >= cam_height) {
+                finish_lcd_cam_snap();
+                printf("\nCaptured and displayed camera frame on LCD\n");
+                print_prompt();
+                return;
+            }
+
+            uint32_t row_count = cam_height - lcd_cam_snap_row;
+            if (row_count > lcd_display_row_chunk) {
+                row_count = lcd_display_row_chunk;
+            }
+
+            lcd_prepare_image_rows_from_camera(lcd_cam_snap_row, row_count);
+            lcd_display_rows_from_framebuffer(lcd_cam_snap_row, row_count);
+            lcd_cam_snap_row += row_count;
+            lcd_cam_snap_next_step_time = delayed_by_ms(get_absolute_time(), 1);
+            return;
+        }
+
+        case LCD_CAM_SNAP_IDLE:
+        default:
+            break;
+        }
+    }
+
+    if (lcd_cam_stream_active && time_reached(lcd_cam_stream_next_step_time)) {
+        switch (lcd_cam_stream_state) {
+        case LCD_CAM_STREAM_WAIT_FRAME:
+            if (cam_wait_for_frame(0)) {
+                lcd_cam_stream_state = LCD_CAM_STREAM_DISPLAY_ROWS;
+                lcd_cam_stream_row = 0;
+                lcd_cam_stream_next_step_time = delayed_by_ms(get_absolute_time(), 1);
+                return;
+            }
+            if (time_reached(lcd_cam_stream_deadline)) {
+                finish_lcd_cam_stream();
+                printf("\nLCD camera stream timed out after 2000 ms\n");
+                print_prompt();
+            }
+            return;
+
+        case LCD_CAM_STREAM_DISPLAY_ROWS: {
+            if (lcd_cam_stream_row >= cam_height) {
+                buffer_ready = false;
+                config_cam_buffer();
+                start_cam();
+                lcd_cam_stream_state = LCD_CAM_STREAM_WAIT_FRAME;
+                lcd_cam_stream_deadline = make_timeout_time_ms(2000);
+                lcd_cam_stream_next_step_time = delayed_by_ms(get_absolute_time(), 1);
+                return;
+            }
+
+            uint32_t row_count = cam_height - lcd_cam_stream_row;
+            if (row_count > lcd_display_row_chunk) {
+                row_count = lcd_display_row_chunk;
+            }
+
+            lcd_prepare_image_rows_from_camera(lcd_cam_stream_row, row_count);
+            lcd_display_rows_from_framebuffer(lcd_cam_stream_row, row_count);
+            lcd_cam_stream_row += row_count;
+            lcd_cam_stream_next_step_time = delayed_by_ms(get_absolute_time(), 1);
+            return;
+        }
+
+        case LCD_CAM_STREAM_IDLE:
+        default:
+            break;
+        }
+    }
+
+    if (!lcd_load_pending) {
+        return;
+    }
+
+    if (!time_reached(lcd_load_next_step_time)) {
+        return;
+    }
+
+    switch (lcd_load_state) {
+    case LCD_LOAD_OPEN_FILE: {
+        FRESULT fr = f_open(&lcd_load_file, lcd_load_path, FA_READ);
         if (FR_OK != fr) {
             printf("\nf_open error: %s (%d)\n", FRESULT_str(fr), fr);
-            finish_cam_snap();
+            finish_lcd_load();
             print_prompt();
             return;
         }
-        cam_snap_file_open = true;
-        cam_snap_state = CAM_SNAP_WRITE_FILE;
-        cam_snap_next_step_time = delayed_by_ms(get_absolute_time(), 1);
-        return;
-    }
 
-    case CAM_SNAP_WRITE_FILE: {
-        uint32_t total_bytes = cam_ful_size * 2;
-        if (cam_snap_write_offset >= total_bytes) {
-            cam_snap_state = CAM_SNAP_CLOSE_FILE;
+        lcd_load_file_open = true;
+
+        if (f_size(&lcd_load_file) != lcd_image_bytes) {
+            printf("\nImage file size mismatch: expected %u bytes\n", (unsigned)lcd_image_bytes);
+            finish_lcd_load();
+            print_prompt();
             return;
         }
 
-        UINT chunk = cam_snap_chunk_size;
-        uint32_t remaining = total_bytes - cam_snap_write_offset;
-        if (remaining < chunk) {
-            chunk = (UINT)remaining;
+        lcd_load_state = LCD_LOAD_READ_FILE;
+        lcd_load_next_step_time = delayed_by_ms(get_absolute_time(), 1);
+        return;
+    }
+
+    case LCD_LOAD_READ_FILE: {
+        if (lcd_load_display_row >= LCD_2IN.HEIGHT) {
+            lcd_load_state = LCD_LOAD_CLOSE_FILE;
+            return;
         }
 
-        UINT bw = 0;
-        FRESULT fr = f_write(&cam_snap_file, cam_ptr + cam_snap_write_offset, chunk, &bw);
-        if (FR_OK != fr || bw != chunk) {
+        uint32_t row_count = LCD_2IN.HEIGHT - lcd_load_display_row;
+        if (row_count > lcd_display_row_chunk) {
+            row_count = lcd_display_row_chunk;
+        }
+
+        UINT chunk = (UINT)(LCD_2IN.WIDTH * 2 * row_count);
+
+        UINT br = 0;
+        FRESULT fr = f_read(&lcd_load_file, lcd_row_buffer, chunk, &br);
+        if (FR_OK != fr || br != chunk) {
             if (FR_OK != fr) {
-                printf("\nf_write error: %s (%d)\n", FRESULT_str(fr), fr);
+                printf("\nf_read error: %s (%d)\n", FRESULT_str(fr), fr);
             } else {
-                printf("\nShort write: %u of %u bytes\n", bw, chunk);
+                printf("\nShort read: %u of %u bytes\n", br, chunk);
             }
-            finish_cam_snap();
+            finish_lcd_load();
             print_prompt();
             return;
         }
 
-        cam_snap_write_offset += bw;
-        cam_snap_total_written += bw;
-        cam_snap_next_step_time = delayed_by_ms(get_absolute_time(), 1);
+        lcd_copy_raw_rows_to_framebuffer(lcd_load_display_row, row_count, lcd_row_buffer);
+        lcd_display_rows_from_framebuffer(lcd_load_display_row, row_count);
+        lcd_load_display_row += row_count;
+        lcd_load_offset += br;
+        lcd_load_next_step_time = delayed_by_ms(get_absolute_time(), 1);
         return;
     }
 
-    case CAM_SNAP_CLOSE_FILE: {
-        char completed_path[sizeof(cam_snap_path)];
-        strlcpy(completed_path, cam_snap_path, sizeof(completed_path));
-        UINT completed_written = cam_snap_total_written;
-        finish_cam_snap();
-        printf("\nWrote %u bytes to %s\n", completed_written, completed_path);
+    case LCD_LOAD_CLOSE_FILE: {
+        FRESULT fr = f_close(&lcd_load_file);
+        lcd_load_file_open = false;
+        if (FR_OK != fr) {
+            printf("\nf_close error: %s (%d)\n", FRESULT_str(fr), fr);
+            finish_lcd_load();
+            print_prompt();
+            return;
+        }
+
+        if (lcd_load_status_msg[0]) {
+            printf("\n%s\n", lcd_load_status_msg);
+        } else {
+            printf("\nLoaded and displayed %s\n", lcd_load_path);
+        }
+        finish_lcd_load();
         print_prompt();
         return;
     }
 
-    case CAM_SNAP_IDLE:
+    case LCD_LOAD_DISPLAY: {
+        if (lcd_load_display_row >= LCD_2IN.HEIGHT) {
+            if (lcd_load_status_msg[0]) {
+                printf("\n%s\n", lcd_load_status_msg);
+            } else {
+                printf("\nLCD framebuffer displayed\n");
+            }
+            finish_lcd_load();
+            print_prompt();
+            return;
+        }
+
+        uint32_t row_count = LCD_2IN.HEIGHT - lcd_load_display_row;
+        if (row_count > lcd_display_row_chunk) {
+            row_count = lcd_display_row_chunk;
+        }
+
+        lcd_display_rows_from_framebuffer(lcd_load_display_row, row_count);
+        lcd_load_display_row += row_count;
+        lcd_load_next_step_time = delayed_by_ms(get_absolute_time(), 1);
+        return;
+    }
+
+    case LCD_LOAD_IDLE:
     default:
         return;
     }
 }
+
