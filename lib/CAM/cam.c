@@ -45,6 +45,10 @@ static bool cam_dma_claimed = false;
 static volatile bool cam_continuous = true;
 static bool cam_use_irq = true;
 static bool cam_sm_running = false;
+static volatile uint32_t cam_capture_fps = 0;
+static volatile uint32_t cam_capture_frames_total = 0;
+static uint32_t cam_capture_frames_window = 0;
+static uint64_t cam_capture_window_start_us = 0;
 
 // private functions and buffers
 uint8_t *cam_ptr;          // current DMA capture buffer
@@ -57,6 +61,24 @@ volatile bool buffer_ready = false;
 uint32_t cam_width    = 240;
 uint32_t cam_height   = 320;
 uint32_t cam_ful_size = 240 * 320;  // updated whenever size changes
+
+static void cam_note_captured_frame(void)
+{
+    uint64_t now_us = time_us_64();
+    if (cam_capture_window_start_us == 0) {
+        cam_capture_window_start_us = now_us;
+    }
+
+    cam_capture_frames_total++;
+    cam_capture_frames_window++;
+
+    uint64_t elapsed_us = now_us - cam_capture_window_start_us;
+    if (elapsed_us >= 1000000ULL) {
+        cam_capture_fps = (uint32_t)((cam_capture_frames_window * 1000000ULL) / elapsed_us);
+        cam_capture_frames_window = 0;
+        cam_capture_window_start_us = now_us;
+    }
+}
 
 
 /********************************************************************************
@@ -210,6 +232,7 @@ void cam_handler()
         }
 
         buffer_ready = true;
+        cam_note_captured_frame();
     }
 }
 
@@ -266,7 +289,18 @@ bool cam_wait_for_frame(uint32_t timeout_ms)
     // Non-continuous path: cam_ptr is the single capture buffer.
     cam_display_ptr = cam_ptr;
     buffer_ready = true;
+    cam_note_captured_frame();
     return true;
+}
+
+uint32_t cam_get_capture_fps(void)
+{
+    return cam_capture_fps;
+}
+
+uint32_t cam_get_capture_frames_total(void)
+{
+    return cam_capture_frames_total;
 }
 
 /********************************************************************************

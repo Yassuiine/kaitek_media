@@ -49,6 +49,10 @@ static UBYTE lcd_scan_dir = VERTICAL;
 static UWORD *lcd_image = NULL;
 static size_t lcd_image_bytes = 0;
 static const uint32_t lcd_spi_hz = 62500000;
+static uint32_t lcd_display_fps = 0;
+static uint32_t lcd_display_frames_total = 0;
+static uint32_t lcd_display_frames_window = 0;
+static uint64_t lcd_display_window_start_us = 0;
 
 
 enum cam_snap_state_t {
@@ -1330,6 +1334,23 @@ static bool start_lcd_framebuffer_display(const char *status_msg) {
     return true;
 }
 
+static void lcd_note_displayed_frame(void) {
+    uint64_t now_us = time_us_64();
+    if (lcd_display_window_start_us == 0) {
+        lcd_display_window_start_us = now_us;
+    }
+
+    lcd_display_frames_total++;
+    lcd_display_frames_window++;
+
+    uint64_t elapsed_us = now_us - lcd_display_window_start_us;
+    if (elapsed_us >= 1000000ULL) {
+        lcd_display_fps = (uint32_t)((lcd_display_frames_window * 1000000ULL) / elapsed_us);
+        lcd_display_frames_window = 0;
+        lcd_display_window_start_us = now_us;
+    }
+}
+
 static void lcd_display_rows_from_framebuffer(uint32_t start_row, uint32_t row_count) {
     LCD_2IN_SetWindows(0, (UWORD)start_row, LCD_2IN.WIDTH, (UWORD)(start_row + row_count));
     DEV_Digital_Write(LCD_DC_PIN, 1);
@@ -1398,6 +1419,7 @@ static void lcd_display_raw_rows(uint32_t start_row, uint32_t row_count, const u
     while (spi_get_hw(SPI_PORT)->sr & SPI_SSPSR_BSY_BITS) tight_loop_contents();
     spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
     DEV_Digital_Write(LCD_CS_PIN, 1);
+    lcd_note_displayed_frame();
 }
 
 static void lcd_copy_raw_rows_to_framebuffer(uint32_t start_row, uint32_t row_count, const uint8_t *raw_rows) {
@@ -1588,6 +1610,16 @@ static void run_lcd_status(const size_t argc, const char *argv[]){
     printf("Backlight brightness: %u%%.\n", lcd_backlight);
     printf("Size: %dx%d.\n", (lcd_scan_dir == VERTICAL) ? LCD_2IN_WIDTH : LCD_2IN_HEIGHT,
            (lcd_scan_dir == VERTICAL) ? LCD_2IN_HEIGHT : LCD_2IN_WIDTH);
+}
+
+static void run_lcd_fps(const size_t argc, const char *argv[]) {
+    if (!expect_argc(argc, argv, 0)) return;
+
+    printf("Capture FPS: %lu\n", (unsigned long)cam_get_capture_fps());
+    printf("Display FPS: %lu\n", (unsigned long)lcd_display_fps);
+    printf("Captured frames total: %lu\n", (unsigned long)cam_get_capture_frames_total());
+    printf("Displayed frames total: %lu\n", (unsigned long)lcd_display_frames_total);
+    printf("LCD stream active: %s\n", lcd_cam_stream_active ? "yes" : "no");
 }
 
 typedef void (*p_fn_t)(const size_t argc, const char *argv[]);
@@ -1789,6 +1821,9 @@ static cmd_def_t cmds[] = {
     {"lcd_status", run_lcd_status,
      "lcd_status:\n"
      " Display the current status of the LCD."},
+    {"lcd_fps", run_lcd_fps,
+     "lcd_fps:\n"
+     " Display rolling camera capture FPS and LCD display FPS."},
 
 
     // // Clocks testing:
