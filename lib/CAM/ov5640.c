@@ -271,7 +271,7 @@ void sccb_init(const uint32_t sda_pin, const uint32_t scl_pin)
     OV5640_WR_Reg(i2c,CAM_ADDR,SC_PLL_CONTRL_5, 0x00);
     OV5640_WR_Reg(i2c,CAM_ADDR,SC_PLL_CONTRL_0, 0x1A); 
     OV5640_WR_Reg(i2c,CAM_ADDR,SC_PLL_CONTRL_1, 0x11); 
-    OV5640_WR_Reg(i2c,CAM_ADDR,SC_PLL_CONTRL_2, 18 & 0xFF); 
+    OV5640_WR_Reg(i2c,CAM_ADDR,SC_PLL_CONTRL_2, 18 & 0xFF); //at 27MHZ and a PLL multiplier of 18, which gives a maximum of 26 FPS at QVGA. Higher PLL multipliers may be possible with a faster external clock, but 27 MHz is the default on Waveshare's 02-CAM.
     OV5640_WR_Reg(i2c,CAM_ADDR,SC_PLL_CONTRL_3, 0x01); 
     OV5640_WR_Reg(i2c,CAM_ADDR,SYSTEM_ROOT_DIVIDER, 0x16); 
     OV5640_WR_Reg(i2c,CAM_ADDR,PCLK_RATIO, 0x04); 
