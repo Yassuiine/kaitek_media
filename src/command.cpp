@@ -89,7 +89,12 @@ static UINT lcd_load_offset = 0;
 static uint32_t lcd_load_display_row = 0;
 static absolute_time_t lcd_load_next_step_time;
 static const uint32_t lcd_display_row_chunk = 16;
-static uint8_t lcd_row_buffer[LCD_2IN_WIDTH * 2 * lcd_display_row_chunk];
+static uint8_t lcd_row_buffer[LCD_2IN_WIDTH * 2 * lcd_display_row_chunk];  // still used by lcd_load
+
+// DMA channels for SPI pixel transfers (claimed on first use)
+static int spi_tx_dma_ch = -1;
+static int spi_rx_dma_ch = -1;
+static volatile uint16_t spi_rx_dummy;  // RX drain sink (prevents FIFO overflow stalling TX)
 
 static lcd_cam_snap_state_t lcd_cam_snap_state = LCD_CAM_SNAP_IDLE;
 static bool lcd_cam_snap_pending = false;
@@ -1343,13 +1348,55 @@ static void lcd_convert_raw_rgb565_to_panel_bytes(const uint8_t *src, uint8_t *d
 }
 
 static void lcd_display_raw_rows(uint32_t start_row, uint32_t row_count, const uint8_t *raw_rows) {
-    uint32_t pixel_count = LCD_2IN_WIDTH * row_count;
-    lcd_convert_raw_rgb565_to_panel_bytes(raw_rows, lcd_row_buffer, pixel_count);
+    if (start_row > 0) {
+        // The full frame was sent on start_row==0. Remaining chunk calls are no-ops.
+        return;
+    }
 
-    LCD_2IN_SetWindows(0, (UWORD)start_row, LCD_2IN.WIDTH, (UWORD)(start_row + row_count));
+    // Claim DMA channels once, on first call.
+    if (spi_tx_dma_ch < 0) {
+        spi_tx_dma_ch = (int)dma_claim_unused_channel(true);
+        spi_rx_dma_ch = (int)dma_claim_unused_channel(true);
+    }
+
+    // Set window for the whole frame and enter RAM-write mode.
+    LCD_2IN_SetWindows(0, 0, LCD_2IN.WIDTH, LCD_2IN.HEIGHT);
     DEV_Digital_Write(LCD_DC_PIN, 1);
     DEV_Digital_Write(LCD_CS_PIN, 0);
-    DEV_SPI_Write_nByte(lcd_row_buffer, pixel_count * 2);
+
+    // Switch SPI to 16-bit mode.
+    // The camera DMA stores each pixel as [LOW_BYTE, HIGH_BYTE] in memory (little-endian).
+    // In 16-bit SPI mode the hardware reads the 16-bit word (0xHIGH_LOW) and sends
+    // MSB-first → HIGH byte then LOW byte on the wire: correct RGB565, no CPU swap needed.
+    spi_set_format(SPI_PORT, 16, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+
+    // TX DMA: raw_rows → SPI TX FIFO (full frame, 16-bit words, DMA-paced)
+    dma_channel_config tx_cfg = dma_channel_get_default_config((uint)spi_tx_dma_ch);
+    channel_config_set_transfer_data_size(&tx_cfg, DMA_SIZE_16);
+    channel_config_set_dreq(&tx_cfg, spi_get_dreq(SPI_PORT, true));
+    channel_config_set_read_increment(&tx_cfg, true);
+    channel_config_set_write_increment(&tx_cfg, false);
+    dma_channel_configure((uint)spi_tx_dma_ch, &tx_cfg,
+                          &spi_get_hw(SPI_PORT)->dr, raw_rows, cam_ful_size, false);
+
+    // RX DMA: drain SPI RX FIFO → spi_rx_dummy.
+    // Without this the 4-deep RX FIFO overflows, which stalls the TX FIFO and kills throughput.
+    dma_channel_config rx_cfg = dma_channel_get_default_config((uint)spi_rx_dma_ch);
+    channel_config_set_transfer_data_size(&rx_cfg, DMA_SIZE_16);
+    channel_config_set_dreq(&rx_cfg, spi_get_dreq(SPI_PORT, false));
+    channel_config_set_read_increment(&rx_cfg, false);
+    channel_config_set_write_increment(&rx_cfg, false);
+    dma_channel_configure((uint)spi_rx_dma_ch, &rx_cfg,
+                          (void *)&spi_rx_dummy, &spi_get_hw(SPI_PORT)->dr, cam_ful_size, false);
+
+    // Fire TX and RX simultaneously, then wait for TX to drain.
+    dma_start_channel_mask((1u << (uint)spi_tx_dma_ch) | (1u << (uint)spi_rx_dma_ch));
+    dma_channel_wait_for_finish_blocking((uint)spi_tx_dma_ch);
+
+    // Wait for the SPI shift register to finish clocking out the last word,
+    // then restore 8-bit mode (for subsequent LCD commands) and release CS.
+    while (spi_get_hw(SPI_PORT)->sr & SPI_SSPSR_BSY_BITS) tight_loop_contents();
+    spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
     DEV_Digital_Write(LCD_CS_PIN, 1);
 }
 
@@ -1398,6 +1445,8 @@ static void finish_lcd_cam_snap(void) {
 }
 
 static void finish_lcd_cam_stream(void) {
+    DEV_Digital_Write(LCD_CS_PIN, 1);  // Safety: deassert CS if stopped mid-frame
+    cam_ptr1 = NULL;                   // Release the framebuffer back to LCD use
     free_cam();
     buffer_ready = false;
     lcd_cam_stream_active = false;
@@ -1516,8 +1565,9 @@ static void run_lcd_cam_stream(const size_t argc, const char *argv[]) {
         return;
     }
 
-    cam_set_continuous(false);
-    cam_set_use_irq(false);
+    cam_ptr1 = (uint8_t *)lcd_image;  // reuse the framebuffer as the 2nd capture buffer
+    cam_set_continuous(true);
+    cam_set_use_irq(true);
     buffer_ready = false;
     config_cam_buffer();
     start_cam();
@@ -2014,7 +2064,7 @@ void process_background_tasks(void) {
             if (cam_wait_for_frame(0)) {
                 lcd_cam_stream_state = LCD_CAM_STREAM_DISPLAY_ROWS;
                 lcd_cam_stream_row = 0;
-                lcd_cam_stream_next_step_time = delayed_by_ms(get_absolute_time(), 1);
+                lcd_cam_stream_next_step_time = get_absolute_time();
                 return;
             }
             if (time_reached(lcd_cam_stream_deadline)) {
@@ -2031,7 +2081,7 @@ void process_background_tasks(void) {
                 start_cam();
                 lcd_cam_stream_state = LCD_CAM_STREAM_WAIT_FRAME;
                 lcd_cam_stream_deadline = make_timeout_time_ms(2000);
-                lcd_cam_stream_next_step_time = delayed_by_ms(get_absolute_time(), 1);
+                lcd_cam_stream_next_step_time = get_absolute_time();
                 return;
             }
 
@@ -2042,9 +2092,9 @@ void process_background_tasks(void) {
 
             lcd_display_raw_rows(lcd_cam_stream_row,
                                  row_count,
-                                 cam_ptr + (lcd_cam_stream_row * cam_width * 2));
-            lcd_cam_stream_row += row_count;
-            lcd_cam_stream_next_step_time = delayed_by_ms(get_absolute_time(), 1);
+                                 cam_display_ptr + (lcd_cam_stream_row * cam_width * 2));
+            lcd_cam_stream_row = cam_height;  // DMA sent the full frame; skip the 19 remaining no-op chunks
+            lcd_cam_stream_next_step_time = get_absolute_time();
             return;
         }
 

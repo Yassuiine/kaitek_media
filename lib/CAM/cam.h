@@ -43,8 +43,9 @@
 extern "C" {
 #endif
 
-extern uint8_t *cam_ptr;  
-extern uint8_t *cam_ptr1; 
+extern uint8_t *cam_ptr;          // current DMA capture buffer
+extern uint8_t *cam_ptr1;         // alternate buffer (set before streaming for double-buffering)
+extern uint8_t *cam_display_ptr;  // most recently completed frame — safe to read
 extern volatile bool buffer_ready;
 
 #define USE_100BASE_FX (false)

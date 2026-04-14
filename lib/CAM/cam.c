@@ -44,9 +44,12 @@ static int cam_program_offset = -1;
 static bool cam_dma_claimed = false;
 static volatile bool cam_continuous = true;
 static bool cam_use_irq = true;
+static bool cam_sm_running = false;
 
 // private functions and buffers
-uint8_t *cam_ptr;  // pointer of camera buffer
+uint8_t *cam_ptr;          // current DMA capture buffer
+uint8_t *cam_ptr1 = NULL;  // alternate buffer for double-buffering (set externally)
+uint8_t *cam_display_ptr;  // most recently completed frame — safe to read at any time
 
 // flag
 volatile bool buffer_ready = false;
@@ -63,7 +66,7 @@ parameter:
 void init_cam()
 {
     // Initialize CAMERA
-    set_pwm_freq_kHz(24000, PIN_PWM);
+    set_pwm_freq_kHz(37000, PIN_PWM);
     sleep_ms(50);
     sccb_init(I2C1_SDA, I2C1_SCL); // sda,scl=(gp26,gp27). see 'sccb_if.c' and 'cam.h'
     sleep_ms(50);
@@ -75,6 +78,7 @@ void init_cam()
     } else {
         printf("ERROR: camera buffer allocation failed\n");
     }
+    cam_display_ptr = cam_ptr;  // single-buffer default: display == capture
 }
 
 /********************************************************************************
@@ -85,6 +89,12 @@ void config_cam_buffer()
 {
     if (!cam_ptr) {
         printf("ERROR: camera buffer not allocated\n");
+        return;
+    }
+
+    // In continuous mode cam_handler restarts DMA immediately after each frame.
+    // Reconfiguring while it's running would abort the in-progress capture.
+    if (cam_dma_claimed && dma_channel_is_busy(DMA_CAM_RD_CH)) {
         return;
     }
 
@@ -130,17 +140,28 @@ void start_cam()
     if (cam_program_offset < 0) {
         cam_program_offset = (int)pio_add_program(pio_cam, &picampinos_program);
     }
+
+    if (cam_sm_running) {
+        // The PIO program loops back to 'wait 1 gpio VSYNC' after every frame.
+        // Resetting the SM would throw away that natural sync and force a full
+        // VSYNC wait (up to ~33 ms) before the next capture can start.
+        // Just re-arm the DMA; the SM will catch the next VSYNC on its own.
+        return;
+    }
+
     picampinos_program_init(pio_cam, sm_cam, (uint32_t)cam_program_offset, CAM_BASE_PIN, 11); // VSYNC,HREF,PCLK,D[2:9] : total 11 pins
-    
+
     // Enable the state machine and clear the FIFO
     pio_sm_set_enabled(pio_cam, sm_cam, false);
     pio_sm_clear_fifos(pio_cam, sm_cam);
     pio_sm_restart(pio_cam, sm_cam);
     pio_sm_set_enabled(pio_cam, sm_cam, true);
-    
+
     // Setting the X and Y registers
     pio_sm_put_blocking(pio_cam, sm_cam, 0);                  // X=0 : reserved
     pio_sm_put_blocking(pio_cam, sm_cam, (cam_ful_size - 1)); // Y: total words in an image
+
+    cam_sm_running = true;
 }
 
 /********************************************************************************
@@ -175,14 +196,20 @@ void cam_handler()
 
     if (triggered_dma & (1u << DMA_CAM_RD_CH))
     {
-        buffer_ready = true;
-        // Clear interrupt flag
-        dma_hw->ints0 = 1u << DMA_CAM_RD_CH;
+        dma_hw->ints0 = 1u << DMA_CAM_RD_CH;  // clear interrupt first
 
-        if (cam_continuous) {
-            // Rearm DMA for the next frame only when continuous capture is enabled.
+        if (cam_continuous && cam_ptr1 != NULL) {
+            // Double-buffer ping-pong: the buffer DMA just wrote is now safe to
+            // display; swap it to cam_display_ptr and immediately start capturing
+            // the next frame into the other buffer so display and capture overlap.
+            uint8_t *just_completed = cam_ptr;
+            cam_ptr          = cam_ptr1;        // next capture target
+            cam_ptr1         = just_completed;  // keep symmetric for next swap
+            cam_display_ptr  = just_completed;  // expose completed frame to display
             dma_channel_set_write_addr(DMA_CAM_RD_CH, cam_ptr, true);
         }
+
+        buffer_ready = true;
     }
 }
 
@@ -201,6 +228,7 @@ void free_cam()
     pio_sm_set_enabled(pio_cam, sm_cam, false);
     pio_sm_clear_fifos(pio_cam, sm_cam);
     pio_sm_restart(pio_cam, sm_cam);
+    cam_sm_running = false;
     buffer_ready = false;
 }
 
@@ -220,6 +248,13 @@ bool cam_wait_for_frame(uint32_t timeout_ms)
         return false;
     }
 
+    // In continuous mode the IRQ sets buffer_ready and immediately restarts DMA,
+    // so the DMA-busy flag may already be true again before we get to poll it.
+    // Check the flag first to avoid falsely timing out.
+    if (buffer_ready) {
+        return true;
+    }
+
     absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
     while (dma_channel_is_busy(DMA_CAM_RD_CH)) {
         if (time_reached(deadline)) {
@@ -228,6 +263,8 @@ bool cam_wait_for_frame(uint32_t timeout_ms)
         tight_loop_contents();
     }
 
+    // Non-continuous path: cam_ptr is the single capture buffer.
+    cam_display_ptr = cam_ptr;
     buffer_ready = true;
     return true;
 }
