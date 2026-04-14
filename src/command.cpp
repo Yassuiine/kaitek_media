@@ -34,6 +34,15 @@ static char *saveptr;  // For strtok_r
 static volatile bool die;
 static char cmd_buffer[256];
 static size_t cmd_ix;
+static size_t cmd_cursor;
+static const char *PROMPT_STR = "Kaitek> ";
+static const size_t CMD_HISTORY_MAX = 32;
+static char cmd_history[32][256];
+static size_t cmd_history_count;
+static int cmd_history_nav_index = -1;  // -1 means not browsing history
+static char cmd_history_edit_backup[256];
+static size_t cmd_history_edit_backup_len;
+static bool cmd_history_backup_valid;
 static bool cam_snap_pending;
 static absolute_time_t cam_snap_deadline;
 static char cam_snap_path[256];
@@ -762,8 +771,170 @@ static void run_test(const size_t argc, const char *argv[]) {
 static void run_help(const size_t argc, const char *argv[]);
 
 static void print_prompt(void) {
-    printf("Kaitek> ");
+    printf("%s", PROMPT_STR);
     stdio_flush();
+}
+
+static void reset_command_line_state(void) {
+    cmd_ix = 0;
+    cmd_cursor = 0;
+    cmd_buffer[0] = '\0';
+    cmd_history_nav_index = -1;
+    cmd_history_backup_valid = false;
+    cmd_history_edit_backup_len = 0;
+    cmd_history_edit_backup[0] = '\0';
+}
+
+static void redraw_command_line(void) {
+    printf("\r%s%s", PROMPT_STR, cmd_buffer);
+    printf("\x1b[K");
+    size_t tail = cmd_ix - cmd_cursor;
+    if (tail > 0) {
+        printf("\x1b[%uD", (unsigned)tail);
+    }
+    stdio_flush();
+}
+
+static void add_command_to_history(const char *line) {
+    if (!line || !line[0]) return;
+
+    if (cmd_history_count > 0 &&
+        strcmp(cmd_history[cmd_history_count - 1], line) == 0) {
+        return;
+    }
+
+    if (cmd_history_count < CMD_HISTORY_MAX) {
+        strlcpy(cmd_history[cmd_history_count], line, sizeof(cmd_history[0]));
+        cmd_history_count++;
+        return;
+    }
+
+    memmove(&cmd_history[0], &cmd_history[1], sizeof(cmd_history[0]) * (CMD_HISTORY_MAX - 1));
+    strlcpy(cmd_history[CMD_HISTORY_MAX - 1], line, sizeof(cmd_history[0]));
+}
+
+static void load_current_edit_backup(void) {
+    strlcpy(cmd_history_edit_backup, cmd_buffer, sizeof(cmd_history_edit_backup));
+    cmd_history_edit_backup_len = cmd_ix;
+    cmd_history_backup_valid = true;
+}
+
+static void set_command_line_text(const char *text) {
+    if (!text) text = "";
+    strlcpy(cmd_buffer, text, sizeof(cmd_buffer));
+    cmd_ix = strlen(cmd_buffer);
+    cmd_cursor = cmd_ix;
+}
+
+static void history_nav_up(void) {
+    if (cmd_history_count == 0) return;
+
+    if (cmd_history_nav_index < 0) {
+        load_current_edit_backup();
+        cmd_history_nav_index = (int)cmd_history_count - 1;
+    } else if (cmd_history_nav_index > 0) {
+        cmd_history_nav_index--;
+    }
+
+    set_command_line_text(cmd_history[cmd_history_nav_index]);
+    redraw_command_line();
+}
+
+static void history_nav_down(void) {
+    if (cmd_history_nav_index < 0) return;
+
+    if (cmd_history_nav_index < (int)cmd_history_count - 1) {
+        cmd_history_nav_index++;
+        set_command_line_text(cmd_history[cmd_history_nav_index]);
+    } else {
+        cmd_history_nav_index = -1;
+        if (cmd_history_backup_valid) {
+            set_command_line_text(cmd_history_edit_backup);
+        } else {
+            set_command_line_text("");
+        }
+    }
+    redraw_command_line();
+}
+
+static void leave_history_navigation_mode(void) {
+    if (cmd_history_nav_index >= 0) {
+        cmd_history_nav_index = -1;
+        cmd_history_backup_valid = false;
+    }
+}
+
+static void handle_backspace(void) {
+    if (cmd_cursor == 0) return;
+    leave_history_navigation_mode();
+    memmove(&cmd_buffer[cmd_cursor - 1], &cmd_buffer[cmd_cursor], cmd_ix - cmd_cursor + 1);
+    cmd_cursor--;
+    cmd_ix--;
+    redraw_command_line();
+}
+
+static void handle_delete_at_cursor(void) {
+    if (cmd_cursor >= cmd_ix) return;
+    leave_history_navigation_mode();
+    memmove(&cmd_buffer[cmd_cursor], &cmd_buffer[cmd_cursor + 1], cmd_ix - cmd_cursor);
+    cmd_ix--;
+    redraw_command_line();
+}
+
+static void handle_insert_char(char ch) {
+    if (cmd_ix >= sizeof(cmd_buffer) - 1) return;
+    leave_history_navigation_mode();
+    memmove(&cmd_buffer[cmd_cursor + 1], &cmd_buffer[cmd_cursor], cmd_ix - cmd_cursor + 1);
+    cmd_buffer[cmd_cursor] = ch;
+    cmd_cursor++;
+    cmd_ix++;
+    redraw_command_line();
+}
+
+static void handle_kill_to_bol(void) {
+    if (cmd_cursor == 0) return;
+    leave_history_navigation_mode();
+    memmove(&cmd_buffer[0], &cmd_buffer[cmd_cursor], cmd_ix - cmd_cursor + 1);
+    cmd_ix -= cmd_cursor;
+    cmd_cursor = 0;
+    redraw_command_line();
+}
+
+static void handle_kill_to_eol(void) {
+    if (cmd_cursor >= cmd_ix) return;
+    leave_history_navigation_mode();
+    cmd_buffer[cmd_cursor] = '\0';
+    cmd_ix = cmd_cursor;
+    redraw_command_line();
+}
+
+static void handle_move_home(void) {
+    if (cmd_cursor == 0) return;
+    cmd_cursor = 0;
+    redraw_command_line();
+}
+
+static void handle_move_end(void) {
+    if (cmd_cursor == cmd_ix) return;
+    cmd_cursor = cmd_ix;
+    redraw_command_line();
+}
+
+static void insert_text_at_cursor(const char *text) {
+    if (!text || !text[0]) return;
+
+    size_t add = strlen(text);
+    if (cmd_ix + add >= sizeof(cmd_buffer)) {
+        add = (sizeof(cmd_buffer) - 1) - cmd_ix;
+    }
+    if (add == 0) return;
+
+    leave_history_navigation_mode();
+    memmove(&cmd_buffer[cmd_cursor + add], &cmd_buffer[cmd_cursor], cmd_ix - cmd_cursor + 1);
+    memcpy(&cmd_buffer[cmd_cursor], text, add);
+    cmd_ix += add;
+    cmd_cursor += add;
+    redraw_command_line();
 }
 
 static bool ensure_cam_buffer_allocated() {
@@ -1877,6 +2048,57 @@ static void run_help(const size_t argc, const char *argv[]) {
     stdio_flush();
 }
 
+static void handle_tab_completion(void) {
+    // Simple shell-like completion for command names (first token only).
+    if (cmd_cursor == 0) return;
+
+    for (size_t i = 0; i < cmd_cursor; ++i) {
+        if (isspace((unsigned char)cmd_buffer[i])) {
+            return;  // currently in argument area; no completion yet
+        }
+    }
+
+    char prefix[sizeof(cmd_buffer)];
+    memcpy(prefix, cmd_buffer, cmd_cursor);
+    prefix[cmd_cursor] = '\0';
+    size_t prefix_len = cmd_cursor;
+
+    size_t match_idx[count_of(cmds)];
+    size_t match_count = 0;
+
+    for (size_t i = 0; i < count_of(cmds); ++i) {
+        if (strncmp(cmds[i].command, prefix, prefix_len) == 0) {
+            match_idx[match_count++] = i;
+        }
+    }
+
+    if (match_count == 0) {
+        printf("\a");
+        stdio_flush();
+        return;
+    }
+
+    if (match_count == 1) {
+        const char *only = cmds[match_idx[0]].command;
+        if (cmd_cursor == cmd_ix && strlen(only) > prefix_len) {
+            insert_text_at_cursor(only + prefix_len);
+        }
+        if (cmd_cursor == cmd_ix &&
+            cmd_ix < sizeof(cmd_buffer) - 1 &&
+            (cmd_ix == 0 || cmd_buffer[cmd_ix - 1] != ' ')) {
+            insert_text_at_cursor(" ");
+        }
+        return;
+    }
+
+    printf("\n");
+    for (size_t m = 0; m < match_count; ++m) {
+        printf("%s  ", cmds[match_idx[m]].command);
+    }
+    printf("\n");
+    redraw_command_line();
+}
+
 // Break command
 static void chars_available_callback(void *ptr) {
     (void)ptr;   
@@ -1936,11 +2158,104 @@ static void process_cmd(size_t cmd_sz, char *cmd) {
 }
 
 void process_stdio(int cRxedChar) {
-    if (!(0 < cRxedChar &&  cRxedChar <= 0x7F))
+    enum esc_state_t {
+        ESC_NONE = 0,
+        ESC_SEEN,
+        ESC_CSI,
+        ESC_CSI_3,
+    };
+    static enum esc_state_t esc_state = ESC_NONE;
+
+    if (!(0 < cRxedChar && cRxedChar <= 0x7F)) {
         return; // Not dealing with multibyte characters
-    if (!isprint(cRxedChar) && !isspace(cRxedChar) && '\r' != cRxedChar &&
-        '\b' != cRxedChar && cRxedChar != 127)
+    }
+
+    if (esc_state != ESC_NONE) {
+        switch (esc_state) {
+        case ESC_SEEN:
+            if (cRxedChar == '[') {
+                esc_state = ESC_CSI;
+            } else {
+                esc_state = ESC_NONE;
+            }
+            return;
+        case ESC_CSI:
+            switch (cRxedChar) {
+            case 'A':  // Up
+                history_nav_up();
+                break;
+            case 'B':  // Down
+                history_nav_down();
+                break;
+            case 'C':  // Right
+                if (cmd_cursor < cmd_ix) {
+                    cmd_cursor++;
+                    redraw_command_line();
+                }
+                break;
+            case 'D':  // Left
+                if (cmd_cursor > 0) {
+                    cmd_cursor--;
+                    redraw_command_line();
+                }
+                break;
+            case 'H':  // Home
+                cmd_cursor = 0;
+                redraw_command_line();
+                break;
+            case 'F':  // End
+                cmd_cursor = cmd_ix;
+                redraw_command_line();
+                break;
+            case '3':  // Delete (expects '~')
+                esc_state = ESC_CSI_3;
+                return;
+            default:
+                break;
+            }
+            esc_state = ESC_NONE;
+            return;
+        case ESC_CSI_3:
+            if (cRxedChar == '~') {
+                handle_delete_at_cursor();
+            }
+            esc_state = ESC_NONE;
+            return;
+        case ESC_NONE:
+        default:
+            break;
+        }
+    }
+
+    if (cRxedChar == 27) {  // ESC
+        esc_state = ESC_SEEN;
         return;
+    }
+
+    // Linux-style readline shortcuts
+    if (cRxedChar == 1) {   // Ctrl+A: start of line
+        handle_move_home();
+        return;
+    }
+    if (cRxedChar == 5) {   // Ctrl+E: end of line
+        handle_move_end();
+        return;
+    }
+    if (cRxedChar == 11) {  // Ctrl+K: delete from cursor to end of line
+        handle_kill_to_eol();
+        return;
+    }
+    if (cRxedChar == 21) {  // Ctrl+U: delete from cursor to beginning of line
+        handle_kill_to_bol();
+        return;
+    }
+
+    if (!isprint(cRxedChar) && '\r' != cRxedChar && '\n' != cRxedChar &&
+        '\t' != cRxedChar &&
+        '\b' != cRxedChar && cRxedChar != 127) {
+        return;
+    }
+
     if (cRxedChar == '\n' && last_input_was_cr) {
         last_input_was_cr = false;
         return;
@@ -1954,39 +2269,29 @@ void process_stdio(int cRxedChar) {
         stdio_flush();
 
         if (!cmd_buffer[0]) {  // Empty input
+            reset_command_line_state();
             print_prompt();
             return;
         }
+
+        add_command_to_history(cmd_buffer);
 
         /* Process the input string received prior to the newline. */
         process_cmd(sizeof cmd_buffer, cmd_buffer);
 
         /* Reset everything for next cmd */
-        cmd_ix = 0;
+        reset_command_line_state();
         memset(cmd_buffer, 0, sizeof cmd_buffer);
         printf("\n");
         print_prompt();
     } else {  // Not newline
         last_input_was_cr = false;
-        if (cRxedChar == '\b' || cRxedChar == (char)127) {
-            /* Backspace was pressed.  Erase the last character
-             in the string - if any. */
-            if (cmd_ix > 0) {
-                cmd_ix--;
-                cmd_buffer[cmd_ix] = '\0';
-                printf("\b \b");
-                stdio_flush();
-            }
+        if (cRxedChar == '\t') {
+            handle_tab_completion();
+        } else if (cRxedChar == '\b' || cRxedChar == (char)127) {
+            handle_backspace();
         } else {
-            /* A character was entered.  Add it to the string
-             entered so far.  When a \n is entered the complete
-             string will be passed to the command interpreter. */
-            if (cmd_ix < sizeof cmd_buffer - 1) {
-                cmd_buffer[cmd_ix] = cRxedChar;
-                cmd_ix++;
-                printf("%c", cRxedChar);  // echo
-                stdio_flush();
-            }
+            handle_insert_char((char)cRxedChar);
         }
     }
 }
