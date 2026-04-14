@@ -844,12 +844,20 @@ static void run_cam_rreg(const size_t argc, const char *argv[]) {
 
 //added
 static void run_cam_xclk(const size_t argc, const char *argv[]){
-    if(argc == 1){
-        set_pwm_freq_kHz((size_t)atoi(argv[0]), PIN_PWM);
+    if (argc > 1) {
+        printf("Usage: cam_xclk [6000..27000]\n");
+        return;
     }
-    else{
-        set_pwm_freq_kHz(24000, PIN_PWM);
+
+    uint32_t requested_khz = 24000;
+    if (argc == 1) {
+        requested_khz = (uint32_t)atoi(argv[0]);
     }
+
+    uint32_t actual_khz = set_pwm_freq_kHz(requested_khz, PIN_PWM);
+    printf("XCLK requested: %lu kHz, actual: %lu kHz\n",
+           (unsigned long)requested_khz,
+           (unsigned long)actual_khz);
 }
 
 //added
@@ -1075,7 +1083,21 @@ static void run_lcd_init(const size_t argc, const char *argv[]) {
     DEV_Digital_Write(LCD_CS_PIN, 1);
     DEV_Digital_Write(LCD_DC_PIN, 0);
 
-    spi_init(SPI_PORT, lcd_spi_hz);
+    uint32_t sys_hz = clock_get_hz(clk_sys);
+    bool ok = clock_configure(
+        clk_peri,
+        0,
+        CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
+        sys_hz,
+        sys_hz
+    );
+    if (!ok) {
+        printf("Failed to align clk_peri with clk_sys\n");
+        return;
+    }
+
+    uint actual = spi_init(SPI_PORT, lcd_spi_hz);
+    printf("LCD SPI actual: %u Hz\n", actual);
     gpio_set_function(LCD_CLK_PIN, GPIO_FUNC_SPI);
     gpio_set_function(LCD_MOSI_PIN, GPIO_FUNC_SPI);
 
@@ -1369,6 +1391,7 @@ static void lcd_convert_raw_rgb565_to_panel_bytes(const uint8_t *src, uint8_t *d
 }
 
 static void lcd_display_raw_rows(uint32_t start_row, uint32_t row_count, const uint8_t *raw_rows) {
+    (void)row_count;
     if (start_row > 0) {
         // The full frame was sent on start_row==0. Remaining chunk calls are no-ops.
         return;

@@ -88,7 +88,7 @@ parameter:
 void init_cam()
 {
     // Initialize CAMERA
-    set_pwm_freq_kHz(37000, PIN_PWM);
+    set_pwm_freq_kHz(24000, PIN_PWM);
     sleep_ms(50);
     sccb_init(I2C1_SDA, I2C1_SCL); // sda,scl=(gp26,gp27). see 'sccb_if.c' and 'cam.h'
     sleep_ms(50);
@@ -321,27 +321,35 @@ dma_channel_config get_cam_config(PIO pio, uint32_t sm, uint32_t dma_chan)
 function:   Configure PWM to provide clock for the camera
 parameter:
 ********************************************************************************/
-void set_pwm_freq_kHz(uint32_t freq_khz, uint8_t gpio_num)
+uint32_t set_pwm_freq_kHz(uint32_t freq_khz, uint8_t gpio_num)
 {
-    uint32_t pwm0_slice_num;
-    uint32_t period;
-    static pwm_config pwm_slice_config;
-    uint32_t system_clk_khz = clock_get_hz(clk_sys) / 1000;
-    period = system_clk_khz / freq_khz - 1;
-    if (period < 1)
-        period = 1;
+    if (freq_khz < 6000) freq_khz = 6000;
+    if (freq_khz > 27000) freq_khz = 27000;
+
+    uint32_t system_clk_hz = clock_get_hz(clk_sys);
+    uint32_t target_hz = freq_khz * 1000u;
+
+    // Keep TOP small to maximize reachable frequency while preserving 50% duty.
+    const uint32_t top = 4u;
+    const uint32_t denom = (top + 1u) * target_hz;
+    uint32_t div16 = (uint32_t)(((uint64_t)system_clk_hz * 16u + (denom / 2u)) / denom);
+
+    // PWM divider limits in 4.4 fixed-point: [1.0, 255 + 15/16]
+    if (div16 < 16u) div16 = 16u;
+    if (div16 > 4095u) div16 = 4095u;
+
+    uint8_t div_int = (uint8_t)(div16 >> 4);
+    uint8_t div_frac = (uint8_t)(div16 & 0x0F);
 
     gpio_set_function(gpio_num, GPIO_FUNC_PWM);
-    pwm0_slice_num = pwm_gpio_to_slice_num(gpio_num);
+    uint32_t pwm0_slice_num = pwm_gpio_to_slice_num(gpio_num);
 
-    // config
-    pwm_slice_config = pwm_get_default_config();
-    pwm_config_set_wrap(&pwm_slice_config, period);
-
-    // set clk div
-    pwm_config_set_clkdiv(&pwm_slice_config, 1);
-
-    // set PWM start
+    pwm_config pwm_slice_config = pwm_get_default_config();
+    pwm_config_set_wrap(&pwm_slice_config, top);
+    pwm_config_set_clkdiv_int_frac(&pwm_slice_config, div_int, div_frac);
     pwm_init(pwm0_slice_num, &pwm_slice_config, true);
-    pwm_set_gpio_level(gpio_num, (pwm_slice_config.top * 0.50)); // duty:50%
+    pwm_set_gpio_level(gpio_num, (top + 1u) / 2u); // ~50% duty
+
+    uint32_t actual_hz = (uint32_t)(((uint64_t)system_clk_hz * 16u) / ((top + 1u) * div16));
+    return actual_hz / 1000u;
 }

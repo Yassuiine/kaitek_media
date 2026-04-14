@@ -76,7 +76,7 @@ void free_cam();
 void cam_set_continuous(bool enabled);
 void cam_set_use_irq(bool enabled);
 bool cam_wait_for_frame(uint32_t timeout_ms);
-void set_pwm_freq_kHz(uint32_t freq_khz, uint8_t gpio_num);
+uint32_t set_pwm_freq_kHz(uint32_t freq_khz, uint8_t gpio_num);
 void read_cam_data_blocking(uint8_t *buffer, size_t length);
 dma_channel_config get_cam_config(PIO pio, uint32_t sm, uint32_t dma_chan);
 void cam_handler();
