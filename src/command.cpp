@@ -48,6 +48,7 @@ static uint8_t lcd_backlight = 0;
 static UBYTE lcd_scan_dir = VERTICAL;
 static UWORD *lcd_image = NULL;
 static size_t lcd_image_bytes = 0;
+static const uint32_t lcd_spi_hz = 62500000;
 
 
 enum cam_snap_state_t {
@@ -1065,7 +1066,7 @@ static void run_lcd_init(const size_t argc, const char *argv[]) {
     DEV_Digital_Write(LCD_CS_PIN, 1);
     DEV_Digital_Write(LCD_DC_PIN, 0);
 
-    spi_init(SPI_PORT, 40 * 1000 * 1000);
+    spi_init(SPI_PORT, lcd_spi_hz);
     gpio_set_function(LCD_CLK_PIN, GPIO_FUNC_SPI);
     gpio_set_function(LCD_MOSI_PIN, GPIO_FUNC_SPI);
 
@@ -1358,12 +1359,6 @@ static void lcd_copy_raw_rows_to_framebuffer(uint32_t start_row, uint32_t row_co
         const uint8_t *src = raw_rows + (row * LCD_2IN_WIDTH * 2);
         lcd_convert_raw_rgb565_to_panel_bytes(src, dst, LCD_2IN_WIDTH);
     }
-}
-
-static void lcd_prepare_image_rows_from_camera(uint32_t start_row, uint32_t row_count) {
-    lcd_copy_raw_rows_to_framebuffer(start_row,
-                                     row_count,
-                                     cam_ptr + (start_row * cam_width * 2));
 }
 
 static bool ensure_lcd_camera_ready(const char *cmd_name) {
@@ -1999,8 +1994,9 @@ void process_background_tasks(void) {
                 row_count = lcd_display_row_chunk;
             }
 
-            lcd_prepare_image_rows_from_camera(lcd_cam_snap_row, row_count);
-            lcd_display_rows_from_framebuffer(lcd_cam_snap_row, row_count);
+            lcd_display_raw_rows(lcd_cam_snap_row,
+                                 row_count,
+                                 cam_ptr + (lcd_cam_snap_row * cam_width * 2));
             lcd_cam_snap_row += row_count;
             lcd_cam_snap_next_step_time = delayed_by_ms(get_absolute_time(), 1);
             return;
@@ -2044,8 +2040,9 @@ void process_background_tasks(void) {
                 row_count = lcd_display_row_chunk;
             }
 
-            lcd_prepare_image_rows_from_camera(lcd_cam_stream_row, row_count);
-            lcd_display_rows_from_framebuffer(lcd_cam_stream_row, row_count);
+            lcd_display_raw_rows(lcd_cam_stream_row,
+                                 row_count,
+                                 cam_ptr + (lcd_cam_stream_row * cam_width * 2));
             lcd_cam_stream_row += row_count;
             lcd_cam_stream_next_step_time = delayed_by_ms(get_absolute_time(), 1);
             return;
