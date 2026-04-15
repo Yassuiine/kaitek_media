@@ -62,6 +62,15 @@ static uint32_t lcd_display_fps = 0;
 static uint32_t lcd_display_frames_total = 0;
 static uint32_t lcd_display_frames_window = 0;
 static uint64_t lcd_display_window_start_us = 0;
+static bool nrf_spi_initialized = false;
+static uint32_t nrf_spi_actual_hz = 0;
+static const uint nrf_spi_cs_pin = I2C1_SDA;    // Shared pin plan: CAM_SDA reused as NRF CS.
+static const uint nrf_spi_sck_pin = LCD_CLK_PIN;
+static const uint nrf_spi_mosi_pin = LCD_MOSI_PIN;
+static const uint nrf_spi_miso_pin = 4;
+static const uint32_t nrf_spi_cs_setup_us = 15;
+static const uint32_t nrf_spi_cs_hold_us = 4;
+static const uint32_t nrf_spi_frame_gap_us = 200;
 
 
 enum cam_snap_state_t {
@@ -150,6 +159,63 @@ static bool expect_argc(const size_t argc, const char *argv[], const size_t expe
         return false;
     }
     return true;
+}
+
+static bool parse_u32_arg(const char *s, uint32_t *out) {
+    if (!s || !out) return false;
+    char *end = NULL;
+    unsigned long v = strtoul(s, &end, 10);
+    if (end == s || *end != '\0') return false;
+    *out = (uint32_t)v;
+    return true;
+}
+
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+static bool parse_hex_string_bytes(const char *hex, uint8_t *out, size_t out_cap, size_t *out_len) {
+    if (!hex || !out || !out_len) return false;
+    size_t n = strlen(hex);
+    if (n == 0 || (n % 2u) != 0) return false;
+    size_t bytes = n / 2u;
+    if (bytes > out_cap) return false;
+
+    for (size_t i = 0; i < bytes; ++i) {
+        int hi = hex_nibble(hex[i * 2]);
+        int lo = hex_nibble(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+
+    *out_len = bytes;
+    return true;
+}
+
+static bool parse_hex_tokens_bytes(const size_t argc, const char *argv[], uint8_t *out, size_t out_cap, size_t *out_len) {
+    if (!out || !out_len) return false;
+    if (argc == 0 || argc > out_cap) return false;
+
+    for (size_t i = 0; i < argc; ++i) {
+        char *end = NULL;
+        unsigned long v = strtoul(argv[i], &end, 16);
+        if (end == argv[i] || *end != '\0' || v > 0xFFu) {
+            return false;
+        }
+        out[i] = (uint8_t)v;
+    }
+    *out_len = argc;
+    return true;
+}
+
+static void print_hex_bytes(const uint8_t *buf, size_t len) {
+    for (size_t i = 0; i < len; ++i) {
+        printf("%02X", buf[i]);
+        if (i + 1 < len) printf(" ");
+    }
 }
 const char *chk_dflt_log_drv(const size_t argc, const char *argv[]) {
     if (argc > 1) {
@@ -1816,6 +1882,263 @@ static void run_lcd_fps(const size_t argc, const char *argv[]) {
     printf("LCD stream active: %s\n", lcd_cam_stream_active ? "yes" : "no");
 }
 
+static bool nrf_spi_prepare_bus(uint32_t requested_hz) {
+    if (requested_hz == 0) requested_hz = 1000000;
+
+    DEV_Digital_Write(LCD_CS_PIN, 1);  // Keep LCD deselected during NRF transaction tests.
+    gpio_init(nrf_spi_cs_pin);
+    gpio_set_dir(nrf_spi_cs_pin, GPIO_OUT);
+    gpio_put(nrf_spi_cs_pin, 1);
+
+    gpio_set_function(nrf_spi_sck_pin, GPIO_FUNC_SPI);
+    gpio_set_function(nrf_spi_mosi_pin, GPIO_FUNC_SPI);
+    gpio_set_function(nrf_spi_miso_pin, GPIO_FUNC_SPI);
+
+    nrf_spi_actual_hz = spi_init(SPI_PORT, requested_hz);
+    spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    nrf_spi_initialized = true;
+    return true;
+}
+
+static void nrf_spi_drain_rx_fifo(void) {
+    while (spi_is_readable(SPI_PORT)) {
+        (void)spi_get_hw(SPI_PORT)->dr;
+    }
+}
+
+static void run_nrf_spi_init(const size_t argc, const char *argv[]) {
+    uint32_t requested_hz = 1000000;
+    if (argc > 1) {
+        printf("Usage: nrf_spi_init [baud_hz]\n");
+        return;
+    }
+    if (argc == 1 && !parse_u32_arg(argv[0], &requested_hz)) {
+        printf("Invalid baud_hz: %s\n", argv[0]);
+        return;
+    }
+
+    nrf_spi_prepare_bus(requested_hz);
+    printf("NRF SPI ready: SCK=%u MOSI=%u MISO=%u CS=%u actual=%lu Hz\n",
+           nrf_spi_sck_pin, nrf_spi_mosi_pin, nrf_spi_miso_pin, nrf_spi_cs_pin,
+           (unsigned long)nrf_spi_actual_hz);
+}
+
+static void run_nrf_spi_status(const size_t argc, const char *argv[]) {
+    if (!expect_argc(argc, argv, 0)) return;
+    printf("NRF SPI initialized: %s\n", nrf_spi_initialized ? "yes" : "no");
+    printf("Pins: SCK=%u MOSI=%u MISO=%u CS=%u\n",
+           nrf_spi_sck_pin, nrf_spi_mosi_pin, nrf_spi_miso_pin, nrf_spi_cs_pin);
+    printf("Actual baud: %lu Hz\n", (unsigned long)nrf_spi_actual_hz);
+}
+
+static void run_nrf_spi_xfer(const size_t argc, const char *argv[]) {
+    if (argc < 1 || argc > 256) {
+        printf("Usage: nrf_spi_xfer <byte0_hex> [byte1_hex] ... [byte255_hex]\n");
+        return;
+    }
+    if (!nrf_spi_initialized) {
+        nrf_spi_prepare_bus(1000000);
+    }
+
+    uint8_t tx[256];
+    uint8_t rx[256];
+    size_t n = 0;
+    if (!parse_hex_tokens_bytes(argc, argv, tx, sizeof(tx), &n)) {
+        printf("Invalid byte list. Use hex bytes like: nrf_spi_xfer 9F 00 00 00\n");
+        return;
+    }
+
+    nrf_spi_drain_rx_fifo();
+    gpio_put(nrf_spi_cs_pin, 0);
+    busy_wait_us_32(nrf_spi_cs_setup_us);  // Give slave CS setup time before first SCK edge.
+    int ret = spi_write_read_blocking(SPI_PORT, tx, rx, (size_t)n);
+    busy_wait_us_32(nrf_spi_cs_hold_us);  // Hold CS a moment after last edge.
+    gpio_put(nrf_spi_cs_pin, 1);
+    busy_wait_us_32(nrf_spi_frame_gap_us);  // Small gap between frames.
+
+    if (ret < 0 || (size_t)ret != n) {
+        printf("SPI transfer failed (%d)\n", ret);
+        return;
+    }
+
+    printf("TX: ");
+    print_hex_bytes(tx, n);
+    printf("\nRX: ");
+    print_hex_bytes(rx, n);
+    printf("\n");
+}
+
+static void run_nrf_spi_sweep(const size_t argc, const char *argv[]) {
+    if (argc != 6) {
+        printf("Usage: nrf_spi_sweep <start_hz> <stop_hz> <step_hz> <loops> <tx_hex> <expect_hex>\n");
+        printf("Example: nrf_spi_sweep 1000000 32000000 1000000 200 A55A010203 5AA5AABBCC\n");
+        return;
+    }
+
+    uint32_t start_hz = 0, stop_hz = 0, step_hz = 0, loops = 0;
+    if (!parse_u32_arg(argv[0], &start_hz) ||
+        !parse_u32_arg(argv[1], &stop_hz) ||
+        !parse_u32_arg(argv[2], &step_hz) ||
+        !parse_u32_arg(argv[3], &loops)) {
+        printf("Invalid numeric argument\n");
+        return;
+    }
+
+    if (start_hz == 0 || stop_hz < start_hz || step_hz == 0 || loops == 0) {
+        printf("Invalid range/loops values\n");
+        return;
+    }
+
+    uint8_t tx[256], expect[256], rx[256];
+    size_t tx_len = 0, expect_len = 0;
+    if (!parse_hex_string_bytes(argv[4], tx, sizeof(tx), &tx_len)) {
+        printf("Invalid tx_hex string (must be even-length hex)\n");
+        return;
+    }
+    if (!parse_hex_string_bytes(argv[5], expect, sizeof(expect), &expect_len)) {
+        printf("Invalid expect_hex string (must be even-length hex)\n");
+        return;
+    }
+    if (tx_len != expect_len) {
+        printf("tx_hex and expect_hex must have same byte length\n");
+        return;
+    }
+
+    printf("Sweeping SPI speed from %lu to %lu Hz step %lu, loops=%lu, frame=%u bytes\n",
+           (unsigned long)start_hz, (unsigned long)stop_hz, (unsigned long)step_hz,
+           (unsigned long)loops, (unsigned)tx_len);
+    printf("Using CS setup/hold/gap: %lu/%lu/%lu us\n",
+           (unsigned long)nrf_spi_cs_setup_us,
+           (unsigned long)nrf_spi_cs_hold_us,
+           (unsigned long)nrf_spi_frame_gap_us);
+
+    for (uint32_t hz = start_hz; hz <= stop_hz; hz += step_hz) {
+        nrf_spi_prepare_bus(hz);
+        // One warm-up transfer after baud change so first measured frame is representative.
+        nrf_spi_drain_rx_fifo();
+        gpio_put(nrf_spi_cs_pin, 0);
+        busy_wait_us_32(nrf_spi_cs_setup_us);
+        (void)spi_write_read_blocking(SPI_PORT, tx, rx, tx_len);
+        busy_wait_us_32(nrf_spi_cs_hold_us);
+        gpio_put(nrf_spi_cs_pin, 1);
+        busy_wait_us_32(nrf_spi_frame_gap_us);
+
+        uint32_t ok = 0;
+        uint32_t fail = 0;
+        uint64_t t0 = time_us_64();
+        for (uint32_t i = 0; i < loops; ++i) {
+            nrf_spi_drain_rx_fifo();
+            gpio_put(nrf_spi_cs_pin, 0);
+            busy_wait_us_32(nrf_spi_cs_setup_us);
+            int ret = spi_write_read_blocking(SPI_PORT, tx, rx, tx_len);
+            busy_wait_us_32(nrf_spi_cs_hold_us);
+            gpio_put(nrf_spi_cs_pin, 1);
+            busy_wait_us_32(nrf_spi_frame_gap_us);
+
+            if (ret >= 0 && (size_t)ret == tx_len && memcmp(rx, expect, tx_len) == 0) {
+                ok++;
+            } else {
+                fail++;
+            }
+        }
+        uint64_t dt = time_us_64() - t0;
+        uint32_t throughput_bps = 0;
+        if (dt > 0) {
+            throughput_bps = (uint32_t)(((uint64_t)tx_len * loops * 1000000ULL) / dt);
+        }
+
+        printf("req=%lu actual=%lu ok=%lu fail=%lu throughput=%lu B/s\n",
+               (unsigned long)hz, (unsigned long)nrf_spi_actual_hz,
+               (unsigned long)ok, (unsigned long)fail, (unsigned long)throughput_bps);
+
+        if (hz > stop_hz - step_hz) break;  // avoid uint32 overflow in for-loop increment
+    }
+}
+
+static void run_nrf_spi_diag(const size_t argc, const char *argv[]) {
+    uint32_t loops = 16;
+    if (argc > 1) {
+        printf("Usage: nrf_spi_diag [loops]\n");
+        return;
+    }
+    if (argc == 1 && !parse_u32_arg(argv[0], &loops)) {
+        printf("Invalid loops value: %s\n", argv[0]);
+        return;
+    }
+    if (loops == 0) loops = 1;
+    if (loops > 1000) loops = 1000;
+
+    if (!nrf_spi_initialized) {
+        nrf_spi_prepare_bus(1000000);
+    }
+
+    static const uint8_t tx[8] = {0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18};
+    uint8_t rx[8];
+    printf("NRF SPI diag at %lu Hz, loops=%lu\n",
+           (unsigned long)nrf_spi_actual_hz, (unsigned long)loops);
+    printf("Loopback phase: keep CS high (disconnect/tri-state external MISO source for pure test)\n");
+    printf("Mode sweep (CPOL/CPHA):\n");
+
+    struct spi_mode_case {
+        spi_cpol_t cpol;
+        spi_cpha_t cpha;
+        const char *name;
+    };
+    static const struct spi_mode_case modes[] = {
+        {SPI_CPOL_0, SPI_CPHA_0, "mode0"},
+        {SPI_CPOL_0, SPI_CPHA_1, "mode1"},
+        {SPI_CPOL_1, SPI_CPHA_0, "mode2"},
+        {SPI_CPOL_1, SPI_CPHA_1, "mode3"},
+    };
+
+    gpio_put(nrf_spi_cs_pin, 1);
+    busy_wait_us_32(5);
+
+    for (size_t m = 0; m < count_of(modes); ++m) {
+        spi_set_format(SPI_PORT, 8, modes[m].cpol, modes[m].cpha, SPI_MSB_FIRST);
+        uint32_t ok = 0;
+        uint32_t fail = 0;
+
+        for (uint32_t i = 0; i < loops; ++i) {
+            memset(rx, 0, sizeof(rx));
+            nrf_spi_drain_rx_fifo();
+            int ret = spi_write_read_blocking(SPI_PORT, tx, rx, sizeof(tx));
+            if (ret == (int)sizeof(tx) && memcmp(rx, tx, sizeof(tx)) == 0) {
+                ok++;
+            } else {
+                fail++;
+                if (fail <= 2) {
+                    printf("%s fail #%lu ret=%d TX=", modes[m].name, (unsigned long)fail, ret);
+                    print_hex_bytes(tx, sizeof(tx));
+                    printf(" RX=");
+                    print_hex_bytes(rx, sizeof(rx));
+                    printf("\n");
+                }
+            }
+            busy_wait_us_32(5);
+        }
+        printf("%s summary: ok=%lu fail=%lu\n",
+               modes[m].name, (unsigned long)ok, (unsigned long)fail);
+    }
+
+    // Restore operational mode used by current NRF sample.
+    spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+
+    printf("Slave phase: pulse CS low once and print RX\n");
+    memset(rx, 0, sizeof(rx));
+    nrf_spi_drain_rx_fifo();
+    gpio_put(nrf_spi_cs_pin, 0);
+    busy_wait_us_32(nrf_spi_cs_setup_us);
+    int ret = spi_write_read_blocking(SPI_PORT, tx, rx, sizeof(tx));
+    busy_wait_us_32(nrf_spi_cs_hold_us);
+    gpio_put(nrf_spi_cs_pin, 1);
+    printf("slave ret=%d TX=", ret);
+    print_hex_bytes(tx, sizeof(tx));
+    printf(" RX=");
+    print_hex_bytes(rx, sizeof(rx));
+    printf("\n");
+}
+
 typedef void (*p_fn_t)(const size_t argc, const char *argv[]);
 typedef struct {
     char const *const command;
@@ -1918,6 +2241,25 @@ static cmd_def_t cmds[] = {
     {"mem-stats", run_mem_stats,
      "mem-stats:\n"
      " Print memory statistics"},
+    {"nrf_spi_init", run_nrf_spi_init,
+     "nrf_spi_init [baud_hz]:\n"
+     " Configure shared SPI pins for NRF validation (default 1MHz)."},
+    {"nrf_spi_status", run_nrf_spi_status,
+     "nrf_spi_status:\n"
+     " Show NRF SPI pin mapping and current baud rate."},
+    {"nrf_spi_xfer", run_nrf_spi_xfer,
+     "nrf_spi_xfer <byte_hex...>:\n"
+     " Perform one SPI transaction and print TX/RX bytes.\n"
+     "\te.g.: nrf_spi_xfer 9F 00 00 00"},
+    {"nrf_spi_sweep", run_nrf_spi_sweep,
+     "nrf_spi_sweep <start_hz> <stop_hz> <step_hz> <loops> <tx_hex> <expect_hex>:\n"
+     " Sweep SPI rates and report pass/fail against expected response.\n"
+     "\te.g.: nrf_spi_sweep 1000000 32000000 1000000 200 A55A0102 5AA5AABB"},
+    {"nrf_spi_diag", run_nrf_spi_diag,
+     "nrf_spi_diag [loops]:\n"
+     " Run SPI diagnostics.\n"
+     " Phase1 keeps CS high for pure MOSI->MISO loopback checks.\n"
+     " Phase2 pulses CS low once and prints slave RX sample."},
     {"cam_xclk", run_cam_xclk,
      "cam_xclk [<freq_khz>]:\n"
      " Set camera XCLK frequency. Default 24000\n"
