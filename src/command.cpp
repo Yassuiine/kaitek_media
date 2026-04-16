@@ -67,7 +67,7 @@ static uint32_t nrf_spi_actual_hz = 0;
 static const uint nrf_spi_cs_pin = I2C1_SDA;    // Shared pin plan: CAM_SDA reused as NRF CS.
 static const uint nrf_spi_sck_pin = LCD_CLK_PIN;
 static const uint nrf_spi_mosi_pin = LCD_MOSI_PIN;
-static const uint nrf_spi_miso_pin = 4;
+static const uint nrf_spi_miso_pin = LCD_RST_PIN;
 static const uint32_t nrf_spi_cs_setup_us = 15;
 static const uint32_t nrf_spi_cs_hold_us = 4;
 static const uint32_t nrf_spi_frame_gap_us = 200;
@@ -2011,6 +2011,10 @@ static void run_nrf_spi_sweep(const size_t argc, const char *argv[]) {
            (unsigned long)nrf_spi_cs_setup_us,
            (unsigned long)nrf_spi_cs_hold_us,
            (unsigned long)nrf_spi_frame_gap_us);
+    uint32_t restore_hz = nrf_spi_actual_hz;
+    if (restore_hz == 0) {
+        restore_hz = start_hz;
+    }
 
     for (uint32_t hz = start_hz; hz <= stop_hz; hz += step_hz) {
         nrf_spi_prepare_bus(hz);
@@ -2053,6 +2057,9 @@ static void run_nrf_spi_sweep(const size_t argc, const char *argv[]) {
 
         if (hz > stop_hz - step_hz) break;  // avoid uint32 overflow in for-loop increment
     }
+
+    nrf_spi_prepare_bus(restore_hz);
+    printf("Sweep done. Restored SPI baud to actual=%lu Hz\n", (unsigned long)nrf_spi_actual_hz);
 }
 
 static void run_nrf_spi_diag(const size_t argc, const char *argv[]) {
