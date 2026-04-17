@@ -165,7 +165,7 @@ const uint16_t sensor_default_regs[][2] = {
     {0x5305, 0x10},
     {0x5306, 0x08},//denoise
     {0x5307, 0x16},
-    {0x5308, 0x40},
+    {0x5308, 0x00},  // disable manual edge enhance (was 0x40); prevents green fringing at luminance edges
     {0x5309, 0x10},//sharpness
     {0x530a, 0x10},//sharpness
     {0x530b, 0x04},//sharpness

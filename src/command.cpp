@@ -1715,6 +1715,24 @@ static void run_cam_stop(const size_t argc, const char *argv[]){
     free_cam();
 }
 
+static void run_cam_status(const size_t argc, const char *argv[]) {
+    if (!expect_argc(argc, argv, 0)) return;
+    printf("Resolution:      %lux%lu  (%lu pixels)\n",
+           (unsigned long)cam_width, (unsigned long)cam_height, (unsigned long)cam_ful_size);
+    printf("Frame buffer:    %s  (ptr=%p)\n",
+           cam_ptr ? "allocated" : "not allocated", (void *)cam_ptr);
+    printf("Double buffer:   %s  (ptr1=%p)\n",
+           cam_ptr1 ? "active" : "inactive", (void *)cam_ptr1);
+    printf("Display ptr:     %p\n", (void *)cam_display_ptr);
+    printf("Buffer ready:    %s\n", buffer_ready ? "yes" : "no");
+    printf("Stream active:   %s\n", lcd_cam_stream_active ? "yes" : "no");
+    printf("Mirror:          %s\n", cam_mirror_enabled ? "on" : "off");
+    printf("Capture FPS:     %lu\n", (unsigned long)cam_get_capture_fps());
+    printf("Capture total:   %lu frames\n", (unsigned long)cam_get_capture_frames_total());
+    printf("Display FPS:     %lu\n", (unsigned long)lcd_display_fps);
+    printf("Display total:   %lu frames\n", (unsigned long)lcd_display_frames_total);
+}
+
 //added
 static void run_cam_capture(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
@@ -2920,6 +2938,9 @@ static cmd_def_t cmds[] = {
     {"cam_stop", run_cam_stop,
      "cam_stop:\n"
      " Stop camera DMA and pipeline"},
+    {"cam_status", run_cam_status,
+     "cam_status:\n"
+     " Print camera state: resolution, buffers, FPS, stream and mirror flags"},
     {"lcd_init", run_lcd_init,
      "lcd_init [vertical|horizontal]:\n"
      " Initialise LCD and set scan direction (default vertical)"},
