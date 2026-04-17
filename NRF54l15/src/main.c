@@ -10,6 +10,8 @@
 #include <string.h>
 
 #define BUF_SIZE 4096
+#define BUTTON_DEBOUNCE_SAMPLES 4
+#define BUTTON_RETRIGGER_GUARD_MS 350
 static const struct device *spis_dev = DEVICE_DT_GET(DT_ALIAS(spis));
 static const struct spi_config spis_config = {.operation = SPI_OP_MODE_SLAVE | SPI_WORD_SET(8)};
 
@@ -24,7 +26,9 @@ LOG_MODULE_REGISTER(spi_slave_test, LOG_LEVEL_INF);
 static uint8_t tx_buffer[BUF_SIZE];
 static uint8_t rx_buffer[BUF_SIZE];
 static uint8_t pending_button_events;
-static uint8_t last_button_state;
+static uint8_t debounced_button_state;
+static uint8_t button_change_count[4];
+static int64_t button_next_press_ok_ms[4];
 static uint32_t transfer_count;
 static uint32_t error_count;
 static uint32_t zero_frame_count;
@@ -75,13 +79,43 @@ static uint8_t read_button_state(void)
 
 static void update_button_events(void)
 {
-	uint8_t now = read_button_state();
-	uint8_t rising_press = (uint8_t)(now & ~last_button_state);
+	uint8_t raw = read_button_state();
+	uint8_t rising_press = 0;
+	int64_t now_ms = k_uptime_get();
+
+	for (uint8_t i = 0; i < 4; ++i) {
+		uint8_t bit = BIT(i);
+		bool raw_pressed = (raw & bit) != 0;
+		bool stable_pressed = (debounced_button_state & bit) != 0;
+
+		if (raw_pressed == stable_pressed) {
+			button_change_count[i] = 0;
+			continue;
+		}
+
+		if (button_change_count[i] < 0xFF) {
+			button_change_count[i]++;
+		}
+		if (button_change_count[i] < BUTTON_DEBOUNCE_SAMPLES) {
+			continue;
+		}
+
+		button_change_count[i] = 0;
+		if (raw_pressed) {
+			debounced_button_state |= bit;
+			if (now_ms >= button_next_press_ok_ms[i]) {
+				rising_press |= bit;
+				button_next_press_ok_ms[i] = now_ms + BUTTON_RETRIGGER_GUARD_MS;
+			}
+		} else {
+			debounced_button_state &= (uint8_t)~bit;
+		}
+	}
+
 	if (rising_press != 0) {
-		LOG_INF("buttons rising=0x%02X now=0x%02X prev=0x%02X", rising_press, now, last_button_state);
+		LOG_INF("buttons rising=0x%02X raw=0x%02X stable=0x%02X", rising_press, raw, debounced_button_state);
 	}
 	pending_button_events |= rising_press;
-	last_button_state = now;
 }
 
 int main(void)
@@ -126,9 +160,13 @@ int main(void)
 	LOG_INF("TX pattern[0..3]=%02X %02X %02X %02X",
 		tx_buffer[0], tx_buffer[1], tx_buffer[2], tx_buffer[3]);
 	LOG_INF("diag: BUF_SIZE=%u, SPI slave 8-bit mode, button aliases sw0..sw3 enabled", BUF_SIZE);
-	last_button_state = read_button_state();
+	debounced_button_state = read_button_state();
+	memset(button_change_count, 0, sizeof(button_change_count));
+	for (size_t i = 0; i < 4; ++i) {
+		button_next_press_ok_ms[i] = 0;
+	}
 	pending_button_events = 0;
-	LOG_INF("buttons initial=0x%02X", last_button_state);
+	LOG_INF("buttons initial=0x%02X", debounced_button_state);
 
 	while (1) {
 		memset(rx_buffer, 0x00, sizeof(rx_buffer));

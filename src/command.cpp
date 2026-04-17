@@ -71,6 +71,9 @@ static const uint nrf_spi_miso_pin = LCD_RST_PIN;
 static uint32_t nrf_spi_cs_setup_us = 15;
 static uint32_t nrf_spi_cs_hold_us = 4;
 static uint32_t nrf_spi_frame_gap_us = 200;
+static const uint32_t nrf_event_min_interval_ms = 250;
+static const uint32_t mode_b_fail_block_ms = 1200;
+static const uint32_t mode_b_retry_safe_hz = 6000000;
 static uint32_t nrf_validation_rows_per_chunk = 4;
 #define NRF_VALIDATION_ROWS_MAX 8
 static uint8_t nrf_validation_rx_chunk[LCD_2IN_WIDTH * 2 * NRF_VALIDATION_ROWS_MAX];
@@ -95,6 +98,7 @@ static uint32_t touch_event_count = 0;
 static uint32_t nrf_event_count = 0;
 static absolute_time_t touch_next_poll_time;
 static absolute_time_t nrf_event_poll_next_time;
+static absolute_time_t nrf_event_block_until;
 static const uint8_t touch_addr = 0x15;
 static const uint8_t touch_reg_chip_id = 0xA7;
 static const uint8_t touch_expected_chip_id = 0xB6;
@@ -413,6 +417,8 @@ static void cam_apply_mirror_toggle(void) {
 
 static void handle_nrf_button_event_mask(const uint8_t mask) {
     if (mask == 0) return;
+    if (!time_reached(nrf_event_block_until)) return;
+    nrf_event_block_until = delayed_by_ms(get_absolute_time(), nrf_event_min_interval_ms);
 
     // Any NRF button event owns the UI and switches to mode B.
     pipeline_force_mode_now(PIPE_MODE_B_NRF, PIPE_REQ_NRF);
@@ -510,10 +516,27 @@ static int pipeline_mode_b_transfer_frame_via_nrf_to_lcd(const uint8_t *frame) {
             return -1;
         }
         if (bytes_all_value(nrf_validation_rx_chunk, byte_count, 0xFF)) {
-            printf("\nMode-B transfer got all-0xFF chunk at row %lu (SPI link issue)\n",
-                   (unsigned long)row);
-            reset_mode_b_transfer_ctx();
-            return -1;
+            if (row == 0 && nrf_spi_actual_hz > mode_b_retry_safe_hz) {
+                uint32_t prev_hz = nrf_spi_actual_hz;
+                printf("\nMode-B row0 all-0xFF at %lu Hz, retrying at safer SPI rate...\n",
+                       (unsigned long)prev_hz);
+                nrf_spi_prepare_bus(mode_b_retry_safe_hz);
+                if (!nrf_spi_transfer_bytes(tx, nrf_validation_rx_chunk, byte_count) ||
+                    bytes_all_value(nrf_validation_rx_chunk, byte_count, 0xFF)) {
+                    nrf_spi_prepare_bus(prev_hz);
+                    printf("\nMode-B transfer got all-0xFF chunk at row %lu (SPI link issue)\n",
+                           (unsigned long)row);
+                    reset_mode_b_transfer_ctx();
+                    return -1;
+                }
+                printf("Mode-B retry recovered at %lu Hz (staying at this rate)\n",
+                       (unsigned long)nrf_spi_actual_hz);
+            } else {
+                printf("\nMode-B transfer got all-0xFF chunk at row %lu (SPI link issue)\n",
+                       (unsigned long)row);
+                reset_mode_b_transfer_ctx();
+                return -1;
+            }
         }
 
         if (!mode_b_ctx.first_transfer) {
@@ -657,6 +680,7 @@ static void nrf_poll_button_event_if_needed(void) {
     if (!nrf_spi_initialized) return;
     if (!lcd_cam_stream_active) return;
     if (pipeline_mode == PIPE_MODE_B_NRF && pipeline_validation_mode_b_enabled) return;
+    if (!time_reached(nrf_event_block_until)) return;
     if (!time_reached(nrf_event_poll_next_time)) return;
     nrf_event_poll_next_time = delayed_by_ms(get_absolute_time(), nrf_event_poll_interval_ms);
 
@@ -666,7 +690,7 @@ static void nrf_poll_button_event_if_needed(void) {
         return;
     }
 
-    if (rx[0] == 0xA5) {
+    if (rx[0] == 0xA5 && rx[1] != 0x00 && rx[1] != 0xFF) {
         handle_nrf_button_event_mask(rx[1]);
     }
 }
@@ -1627,7 +1651,7 @@ static void run_cam_size(const size_t argc, const char *argv[]) {
 
     shared_leave_cam_prog();
     printf("Size set to %lu x %lu\n", w, h);
-    printf("Run cam_dma then cam_start to restart capture\n");
+    printf("Run cam dma then cam start to restart capture, or run cam snap directly\n");
 }
 
 //added
@@ -2811,6 +2835,182 @@ static void run_nrf_timing(const size_t argc, const char *argv[]) {
     }
 }
 
+static void print_cam_group_help(void) {
+    printf("cam <subcommand> [args]\n");
+    printf("Subcommands: xclk, i2c, id, defaults, size, flip, mirror, pll, format,\n");
+    printf("             alloc, dma, start, stop, status, rreg, wreg, snap\n");
+}
+
+static void print_lcd_group_help(void) {
+    printf("lcd <subcommand> [args]\n");
+    printf("Subcommands: init, bl, clear, pixel, fillrect, orient, snap,\n");
+    printf("             load, unload, stream, status, fps\n");
+    printf("Examples: lcd stream, lcd stream -s, lcd load 0:/cam/test0.rgb565\n");
+}
+
+static void print_sm_group_help(void) {
+    printf("sm <subcommand> [args]\n");
+    printf("Subcommands: status, mode, event, validation\n");
+}
+
+static void print_nrf_group_help(void) {
+    printf("nrf <subcommand> [args]\n");
+    printf("Subcommands: init, status, xfer, sweep, diag, timing\n");
+}
+
+static const char *const cam_group_subcmds[] = {
+    "xclk", "i2c", "id", "defaults", "size", "flip", "mirror", "pll",
+    "format", "alloc", "dma", "start", "stop", "status", "rreg", "wreg",
+    "snap", "capture"
+};
+static const char *const lcd_group_subcmds[] = {
+    "init", "bl", "clear", "pixel", "fillrect", "orient", "orientation",
+    "snap", "load", "unload", "stream", "status", "fps"
+};
+static const char *const sm_group_subcmds[] = {
+    "status", "mode", "event", "validation"
+};
+static const char *const nrf_group_subcmds[] = {
+    "init", "status", "xfer", "sweep", "diag", "timing"
+};
+
+static bool get_group_subcommands(const char *group,
+                                  const char *const **subcmds_out,
+                                  size_t *count_out) {
+    if (!group || !subcmds_out || !count_out) return false;
+    if (strcmp(group, "cam") == 0) {
+        *subcmds_out = cam_group_subcmds;
+        *count_out = count_of(cam_group_subcmds);
+        return true;
+    }
+    if (strcmp(group, "lcd") == 0) {
+        *subcmds_out = lcd_group_subcmds;
+        *count_out = count_of(lcd_group_subcmds);
+        return true;
+    }
+    if (strcmp(group, "sm") == 0) {
+        *subcmds_out = sm_group_subcmds;
+        *count_out = count_of(sm_group_subcmds);
+        return true;
+    }
+    if (strcmp(group, "nrf") == 0) {
+        *subcmds_out = nrf_group_subcmds;
+        *count_out = count_of(nrf_group_subcmds);
+        return true;
+    }
+    return false;
+}
+
+static void run_cam_group(const size_t argc, const char *argv[]) {
+    if (argc == 0 || strcmp(argv[0], "help") == 0) {
+        print_cam_group_help();
+        return;
+    }
+
+    const char *sub = argv[0];
+    size_t sub_argc = argc - 1;
+    const char **sub_argv = argv + 1;
+
+    if (strcmp(sub, "xclk") == 0) run_cam_xclk(sub_argc, sub_argv);
+    else if (strcmp(sub, "i2c") == 0) run_cam_i2c_init(sub_argc, sub_argv);
+    else if (strcmp(sub, "id") == 0) run_cam_id(sub_argc, sub_argv);
+    else if (strcmp(sub, "defaults") == 0) run_cam_defaults(sub_argc, sub_argv);
+    else if (strcmp(sub, "size") == 0) run_cam_size(sub_argc, sub_argv);
+    else if (strcmp(sub, "flip") == 0) run_cam_flip(sub_argc, sub_argv);
+    else if (strcmp(sub, "mirror") == 0) run_cam_mirror(sub_argc, sub_argv);
+    else if (strcmp(sub, "pll") == 0) run_cam_pll(sub_argc, sub_argv);
+    else if (strcmp(sub, "format") == 0) run_cam_format(sub_argc, sub_argv);
+    else if (strcmp(sub, "alloc") == 0) run_cam_alloc(sub_argc, sub_argv);
+    else if (strcmp(sub, "dma") == 0) run_cam_dma(sub_argc, sub_argv);
+    else if (strcmp(sub, "start") == 0) run_cam_start(sub_argc, sub_argv);
+    else if (strcmp(sub, "stop") == 0) run_cam_stop(sub_argc, sub_argv);
+    else if (strcmp(sub, "status") == 0) run_cam_status(sub_argc, sub_argv);
+    else if (strcmp(sub, "rreg") == 0) run_cam_rreg(sub_argc, sub_argv);
+    else if (strcmp(sub, "wreg") == 0) run_cam_wreg(sub_argc, sub_argv);
+    else if (strcmp(sub, "snap") == 0) run_cam_snap(sub_argc, sub_argv);
+    else if (strcmp(sub, "capture") == 0) run_cam_snap(sub_argc, sub_argv); // alias
+    else {
+        printf("Unknown cam subcommand: %s\n", sub);
+        print_cam_group_help();
+    }
+}
+
+static void run_lcd_group(const size_t argc, const char *argv[]) {
+    if (argc == 0 || strcmp(argv[0], "help") == 0) {
+        print_lcd_group_help();
+        return;
+    }
+
+    const char *sub = argv[0];
+    size_t sub_argc = argc - 1;
+    const char **sub_argv = argv + 1;
+
+    if (strcmp(sub, "init") == 0) run_lcd_init(sub_argc, sub_argv);
+    else if (strcmp(sub, "bl") == 0) run_lcd_bl(sub_argc, sub_argv);
+    else if (strcmp(sub, "clear") == 0) run_lcd_clear(sub_argc, sub_argv);
+    else if (strcmp(sub, "pixel") == 0) run_lcd_pixel(sub_argc, sub_argv);
+    else if (strcmp(sub, "fillrect") == 0) run_lcd_fillrect(sub_argc, sub_argv);
+    else if (strcmp(sub, "orient") == 0 || strcmp(sub, "orientation") == 0) run_lcd_set_orientation(sub_argc, sub_argv);
+    else if (strcmp(sub, "snap") == 0) run_lcd_cam_snap(sub_argc, sub_argv);
+    else if (strcmp(sub, "load") == 0) run_lcd_load_image(sub_argc, sub_argv);
+    else if (strcmp(sub, "unload") == 0) run_lcd_unload_image(sub_argc, sub_argv);
+    else if (strcmp(sub, "stream") == 0) {
+        if (sub_argc >= 1 && (strcmp(sub_argv[0], "-s") == 0 || strcmp(sub_argv[0], "--stop") == 0)) {
+            const char *stop_argv[] = {"stop"};
+            run_lcd_cam_stream(1, stop_argv);
+        } else {
+            run_lcd_cam_stream(sub_argc, sub_argv);
+        }
+    } else if (strcmp(sub, "status") == 0) run_lcd_status(sub_argc, sub_argv);
+    else if (strcmp(sub, "fps") == 0) run_lcd_fps(sub_argc, sub_argv);
+    else {
+        printf("Unknown lcd subcommand: %s\n", sub);
+        print_lcd_group_help();
+    }
+}
+
+static void run_sm_group(const size_t argc, const char *argv[]) {
+    if (argc == 0 || strcmp(argv[0], "help") == 0) {
+        print_sm_group_help();
+        return;
+    }
+
+    const char *sub = argv[0];
+    size_t sub_argc = argc - 1;
+    const char **sub_argv = argv + 1;
+
+    if (strcmp(sub, "status") == 0) run_sm_status(sub_argc, sub_argv);
+    else if (strcmp(sub, "mode") == 0) run_sm_mode(sub_argc, sub_argv);
+    else if (strcmp(sub, "event") == 0) run_sm_event(sub_argc, sub_argv);
+    else if (strcmp(sub, "validation") == 0) run_sm_validation(sub_argc, sub_argv);
+    else {
+        printf("Unknown sm subcommand: %s\n", sub);
+        print_sm_group_help();
+    }
+}
+
+static void run_nrf_group(const size_t argc, const char *argv[]) {
+    if (argc == 0 || strcmp(argv[0], "help") == 0) {
+        print_nrf_group_help();
+        return;
+    }
+
+    const char *sub = argv[0];
+    size_t sub_argc = argc - 1;
+    const char **sub_argv = argv + 1;
+
+    if (strcmp(sub, "init") == 0) run_nrf_spi_init(sub_argc, sub_argv);
+    else if (strcmp(sub, "status") == 0) run_nrf_spi_status(sub_argc, sub_argv);
+    else if (strcmp(sub, "xfer") == 0) run_nrf_spi_xfer(sub_argc, sub_argv);
+    else if (strcmp(sub, "sweep") == 0) run_nrf_spi_sweep(sub_argc, sub_argv);
+    else if (strcmp(sub, "diag") == 0) run_nrf_spi_diag(sub_argc, sub_argv);
+    else if (strcmp(sub, "timing") == 0) run_nrf_timing(sub_argc, sub_argv);
+    else {
+        printf("Unknown nrf subcommand: %s\n", sub);
+        print_nrf_group_help();
+    }
+}
+
 typedef void (*p_fn_t)(const size_t argc, const char *argv[]);
 typedef struct {
     char const *const command;
@@ -2913,6 +3113,22 @@ static cmd_def_t cmds[] = {
     {"mem-stats", run_mem_stats,
      "mem-stats:\n"
      " Print memory statistics"},
+    {"cam", run_cam_group,
+     "cam <subcommand> [args]:\n"
+     " Camera command group.\n"
+     " Use \"cam help\" for subcommands."},
+    {"lcd", run_lcd_group,
+     "lcd <subcommand> [args]:\n"
+     " LCD command group.\n"
+     " Use \"lcd help\" for subcommands."},
+    {"sm", run_sm_group,
+     "sm <subcommand> [args]:\n"
+     " State-machine command group.\n"
+     " Use \"sm help\" for subcommands."},
+    {"nrf", run_nrf_group,
+     "nrf <subcommand> [args]:\n"
+     " NRF-SPI command group.\n"
+     " Use \"nrf help\" for subcommands."},
     {"sm_status", run_sm_status,
      "sm_status:\n"
      " Show state-machine status (mode, pending switch, shared pin owner)."},
@@ -2931,7 +3147,7 @@ static cmd_def_t cmds[] = {
      " Print touch init state and mirror event counters."},
     {"nrf_spi_init", run_nrf_spi_init,
      "nrf_spi_init [baud_hz]:\n"
-     " Configure shared SPI pins for NRF validation (default 1MHz)."},
+     " Configure shared SPI pins for NRF validation (default 13MHz request)."},
     {"nrf_spi_status", run_nrf_spi_status,
      "nrf_spi_status:\n"
      " Show NRF SPI pin mapping and current baud rate."},
@@ -3008,8 +3224,8 @@ static cmd_def_t cmds[] = {
      "\te.g.: cam_wreg 501f 01"},
     {"cam_capture", run_cam_capture,
      "cam_capture <filename>:\n"
-     " Wait for a complete frame and save to SD\n"
-     "\te.g.: cam_capture 0:/photo.bin"},
+     " Legacy alias of cam_snap.\n"
+     " Prefer: cam snap <filename>"},
     {"cam_snap", run_cam_snap,
      "cam_snap <filename>:\n"
      " Capture one frame, restore UART, and save to SD\n"
@@ -3090,26 +3306,114 @@ static void run_help(const size_t argc, const char *argv[]) {
 }
 
 static void handle_tab_completion(void) {
-    // Simple shell-like completion for command names (first token only).
     if (cmd_cursor == 0) return;
 
+    size_t first_space = cmd_cursor;
     for (size_t i = 0; i < cmd_cursor; ++i) {
         if (isspace((unsigned char)cmd_buffer[i])) {
-            return;  // currently in argument area; no completion yet
+            first_space = i;
+            break;
         }
     }
 
-    char prefix[sizeof(cmd_buffer)];
-    memcpy(prefix, cmd_buffer, cmd_cursor);
-    prefix[cmd_cursor] = '\0';
-    size_t prefix_len = cmd_cursor;
+    // Case 1: completing the first token (command name)
+    if (first_space == cmd_cursor) {
+        char prefix[sizeof(cmd_buffer)];
+        memcpy(prefix, cmd_buffer, cmd_cursor);
+        prefix[cmd_cursor] = '\0';
+        size_t prefix_len = cmd_cursor;
 
-    size_t match_idx[count_of(cmds)];
+        size_t match_idx[count_of(cmds)];
+        size_t match_count = 0;
+        bool has_exact = false;
+        for (size_t i = 0; i < count_of(cmds); ++i) {
+            if (strncmp(cmds[i].command, prefix, prefix_len) == 0) {
+                match_idx[match_count++] = i;
+                if (strcmp(cmds[i].command, prefix) == 0) {
+                    has_exact = true;
+                }
+            }
+        }
+
+        if (match_count == 0) {
+            printf("\a");
+            stdio_flush();
+            return;
+        }
+
+        if (match_count == 1) {
+            const char *only = cmds[match_idx[0]].command;
+            if (cmd_cursor == cmd_ix && strlen(only) > prefix_len) {
+                insert_text_at_cursor(only + prefix_len);
+            }
+            if (cmd_cursor == cmd_ix &&
+                cmd_ix < sizeof(cmd_buffer) - 1 &&
+                (cmd_ix == 0 || cmd_buffer[cmd_ix - 1] != ' ')) {
+                insert_text_at_cursor(" ");
+            }
+            return;
+        }
+
+        // If the typed token is already an exact command, prefer adding a space
+        // instead of dumping a huge list of similarly prefixed aliases.
+        if (has_exact && cmd_cursor == cmd_ix &&
+            cmd_ix < sizeof(cmd_buffer) - 1 &&
+            (cmd_ix == 0 || cmd_buffer[cmd_ix - 1] != ' ')) {
+            insert_text_at_cursor(" ");
+            return;
+        }
+
+        printf("\n");
+        for (size_t m = 0; m < match_count; ++m) {
+            printf("%s  ", cmds[match_idx[m]].command);
+        }
+        printf("\n");
+        redraw_command_line();
+        return;
+    }
+
+    // Case 2: completing only the second token for grouped commands (cam/lcd/sm/nrf)
+    char group[32];
+    size_t group_len = first_space;
+    if (group_len == 0 || group_len >= sizeof(group)) return;
+    memcpy(group, cmd_buffer, group_len);
+    group[group_len] = '\0';
+
+    const char *const *subcmds = NULL;
+    size_t subcmd_count = 0;
+    if (!get_group_subcommands(group, &subcmds, &subcmd_count)) {
+        return; // no subcommand completion for other commands
+    }
+
+    size_t sub_start = first_space;
+    while (sub_start < cmd_cursor && isspace((unsigned char)cmd_buffer[sub_start])) {
+        sub_start++;
+    }
+
+    // If cursor is already in arg3+ area, don't autocomplete.
+    for (size_t i = sub_start; i < cmd_cursor; ++i) {
+        if (isspace((unsigned char)cmd_buffer[i])) {
+            return;
+        }
+    }
+
+    char sub_prefix[sizeof(cmd_buffer)];
+    size_t sub_prefix_len = cmd_cursor - sub_start;
+    if (sub_prefix_len >= sizeof(sub_prefix)) return;
+    memcpy(sub_prefix, &cmd_buffer[sub_start], sub_prefix_len);
+    sub_prefix[sub_prefix_len] = '\0';
+
+    size_t match_idx[32];
     size_t match_count = 0;
-
-    for (size_t i = 0; i < count_of(cmds); ++i) {
-        if (strncmp(cmds[i].command, prefix, prefix_len) == 0) {
-            match_idx[match_count++] = i;
+    bool has_exact = false;
+    for (size_t i = 0; i < subcmd_count; ++i) {
+        if (strncmp(subcmds[i], sub_prefix, sub_prefix_len) == 0) {
+            if (match_count < count_of(match_idx)) {
+                match_idx[match_count++] = i;
+            }
+            if (strcmp(subcmds[i], sub_prefix) == 0) {
+                has_exact = true;
+            }
         }
     }
 
@@ -3120,9 +3424,9 @@ static void handle_tab_completion(void) {
     }
 
     if (match_count == 1) {
-        const char *only = cmds[match_idx[0]].command;
-        if (cmd_cursor == cmd_ix && strlen(only) > prefix_len) {
-            insert_text_at_cursor(only + prefix_len);
+        const char *only = subcmds[match_idx[0]];
+        if (cmd_cursor == cmd_ix && strlen(only) > sub_prefix_len) {
+            insert_text_at_cursor(only + sub_prefix_len);
         }
         if (cmd_cursor == cmd_ix &&
             cmd_ix < sizeof(cmd_buffer) - 1 &&
@@ -3132,9 +3436,16 @@ static void handle_tab_completion(void) {
         return;
     }
 
+    if (has_exact && cmd_cursor == cmd_ix &&
+        cmd_ix < sizeof(cmd_buffer) - 1 &&
+        (cmd_ix == 0 || cmd_buffer[cmd_ix - 1] != ' ')) {
+        insert_text_at_cursor(" ");
+        return;
+    }
+
     printf("\n");
     for (size_t m = 0; m < match_count; ++m) {
-        printf("%s  ", cmds[match_idx[m]].command);
+        printf("%s  ", subcmds[match_idx[m]]);
     }
     printf("\n");
     redraw_command_line();
@@ -3512,6 +3823,7 @@ void process_background_tasks(void) {
                     reset_mode_b_transfer_ctx();
                     mode_b_stream_locked_frame = NULL;
                     pipeline_force_mode_now(PIPE_MODE_A_TOUCH, PIPE_REQ_SHELL);
+                    nrf_event_block_until = delayed_by_ms(get_absolute_time(), mode_b_fail_block_ms);
                     printf("\nMode-B transfer failed (NRF SPI). Falling back to mode A.\n");
                     print_prompt();
                     lcd_cam_stream_row = cam_height;
