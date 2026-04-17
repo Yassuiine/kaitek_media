@@ -68,12 +68,13 @@ static const uint nrf_spi_cs_pin = I2C1_SDA;    // Shared pin plan: CAM_SDA reus
 static const uint nrf_spi_sck_pin = LCD_CLK_PIN;
 static const uint nrf_spi_mosi_pin = LCD_MOSI_PIN;
 static const uint nrf_spi_miso_pin = LCD_RST_PIN;
-static const uint32_t nrf_spi_cs_setup_us = 15;
-static const uint32_t nrf_spi_cs_hold_us = 4;
-static const uint32_t nrf_spi_frame_gap_us = 200;
-static const uint32_t nrf_validation_rows_per_chunk = 4;
-static uint8_t nrf_validation_rx_chunk[LCD_2IN_WIDTH * 2 * nrf_validation_rows_per_chunk];
-static uint8_t nrf_validation_dummy_chunk[LCD_2IN_WIDTH * 2 * nrf_validation_rows_per_chunk];
+static uint32_t nrf_spi_cs_setup_us = 15;
+static uint32_t nrf_spi_cs_hold_us = 4;
+static uint32_t nrf_spi_frame_gap_us = 200;
+static uint32_t nrf_validation_rows_per_chunk = 4;
+#define NRF_VALIDATION_ROWS_MAX 8
+static uint8_t nrf_validation_rx_chunk[LCD_2IN_WIDTH * 2 * NRF_VALIDATION_ROWS_MAX];
+static uint8_t nrf_validation_dummy_chunk[LCD_2IN_WIDTH * 2 * NRF_VALIDATION_ROWS_MAX];
 static uint8_t mode_b_frame_raw[LCD_2IN_WIDTH * LCD_2IN_HEIGHT * 2];
 typedef struct {
     bool active;
@@ -491,6 +492,11 @@ static int pipeline_mode_b_transfer_frame_via_nrf_to_lcd(const uint8_t *frame) {
             row_count = nrf_validation_rows_per_chunk;
         }
         size_t byte_count = (size_t)cam_width * 2u * row_count;
+        if (byte_count > sizeof(nrf_validation_rx_chunk)) {
+            // chunk size was set beyond NRF_VALIDATION_ROWS_MAX — reset and fail safely
+            reset_mode_b_transfer_ctx();
+            return -1;
+        }
         const uint8_t *tx = frame + ((size_t)row * cam_width * 2u);
 
         // Snapshot first 16 bytes of tx NOW, before the transfer.
@@ -2740,6 +2746,71 @@ static void run_nrf_spi_diag(const size_t argc, const char *argv[]) {
     printf("\n");
 }
 
+static void run_nrf_timing(const size_t argc, const char *argv[]) {
+    if (argc == 0) {
+        uint32_t chunk_bytes = cam_width * 2u * nrf_validation_rows_per_chunk;
+        uint32_t n_chunks = (cam_height + nrf_validation_rows_per_chunk - 1u) / nrf_validation_rows_per_chunk;
+        uint32_t n_transfers = n_chunks + 1u;  // +1 for the flush
+        uint32_t overhead_us = nrf_spi_cs_setup_us + nrf_spi_cs_hold_us + nrf_spi_frame_gap_us;
+        printf("cs_setup=%lu us  cs_hold=%lu us  gap=%lu us  chunk=%lu rows (%lu bytes)\n",
+               (unsigned long)nrf_spi_cs_setup_us,
+               (unsigned long)nrf_spi_cs_hold_us,
+               (unsigned long)nrf_spi_frame_gap_us,
+               (unsigned long)nrf_validation_rows_per_chunk,
+               (unsigned long)chunk_bytes);
+        printf("chunk_rows_max=%u  transfers/frame=%lu  per_transfer_overhead=%lu us\n",
+               NRF_VALIDATION_ROWS_MAX,
+               (unsigned long)n_transfers,
+               (unsigned long)overhead_us);
+        if (nrf_spi_actual_hz > 0) {
+            uint64_t data_us = ((uint64_t)chunk_bytes * 8u * 1000000u) / nrf_spi_actual_hz;
+            uint64_t frame_us = (uint64_t)n_transfers * (data_us + overhead_us);
+            uint32_t fps10 = (frame_us > 0) ? (uint32_t)(10000000u / frame_us) : 0;
+            printf("SPI=%lu Hz  data/transfer=%lu us  frame=%lu ms  est. FPS=%lu.%lu\n",
+                   (unsigned long)nrf_spi_actual_hz,
+                   (unsigned long)data_us,
+                   (unsigned long)(frame_us / 1000u),
+                   (unsigned long)(fps10 / 10u),
+                   (unsigned long)(fps10 % 10u));
+        } else {
+            printf("SPI not initialized (run nrf_spi_init first)\n");
+        }
+        return;
+    }
+    if (argc != 2) {
+        printf("Usage: nrf_timing                (show current settings + FPS estimate)\n");
+        printf("       nrf_timing gap   <us>     (inter-frame gap, e.g. 50)\n");
+        printf("       nrf_timing setup <us>     (CS setup before first SCK, e.g. 10)\n");
+        printf("       nrf_timing hold  <us>     (CS hold after last SCK, e.g. 2)\n");
+        printf("       nrf_timing chunk <rows>   (rows per transfer, 1..%u)\n", NRF_VALIDATION_ROWS_MAX);
+        return;
+    }
+    uint32_t val;
+    if (!parse_u32_arg(argv[1], &val)) {
+        printf("Invalid value: %s\n", argv[1]);
+        return;
+    }
+    if (strcmp(argv[0], "gap") == 0) {
+        nrf_spi_frame_gap_us = val;
+        printf("gap = %lu us\n", (unsigned long)nrf_spi_frame_gap_us);
+    } else if (strcmp(argv[0], "setup") == 0) {
+        nrf_spi_cs_setup_us = val;
+        printf("cs_setup = %lu us\n", (unsigned long)nrf_spi_cs_setup_us);
+    } else if (strcmp(argv[0], "hold") == 0) {
+        nrf_spi_cs_hold_us = val;
+        printf("cs_hold = %lu us\n", (unsigned long)nrf_spi_cs_hold_us);
+    } else if (strcmp(argv[0], "chunk") == 0) {
+        if (val == 0 || val > NRF_VALIDATION_ROWS_MAX) {
+            printf("chunk must be 1..%u\n", NRF_VALIDATION_ROWS_MAX);
+            return;
+        }
+        nrf_validation_rows_per_chunk = val;
+        printf("rows_per_chunk = %lu\n", (unsigned long)nrf_validation_rows_per_chunk);
+    } else {
+        printf("Unknown key '%s'. Use: gap | setup | hold | chunk\n", argv[0]);
+    }
+}
+
 typedef void (*p_fn_t)(const size_t argc, const char *argv[]);
 typedef struct {
     char const *const command;
@@ -2877,6 +2948,14 @@ static cmd_def_t cmds[] = {
      " Run SPI diagnostics.\n"
      " Phase1 keeps CS high for pure MOSI->MISO loopback checks.\n"
      " Phase2 pulses CS low once and prints slave RX sample."},
+    {"nrf_timing", run_nrf_timing,
+     "nrf_timing [gap|setup|hold|chunk <val>]:\n"
+     " Show or tune Mode-B transfer timing.\n"
+     " No args: print current values + FPS estimate.\n"
+     " nrf_timing gap   <us>   - inter-frame gap (default 200, try 50-100)\n"
+     " nrf_timing setup <us>   - CS setup before SCK (default 15, try 10)\n"
+     " nrf_timing hold  <us>   - CS hold after SCK  (default 4,  try 2)\n"
+     " nrf_timing chunk <rows> - rows per transfer   (default 4,  max 16)"},
     {"cam_xclk", run_cam_xclk,
      "cam_xclk [<freq_khz>]:\n"
      " Set camera XCLK frequency. Default 24000\n"
