@@ -7,13 +7,8 @@
 		led = &led0;
 		spis = &spi22;
 		/delete-property/ led1;
-		/delete-property/ sw0;
-		/delete-property/ sw1;
-		/delete-property/ sw2;
-		/delete-property/ sw3;
 		/delete-property/ mcuboot-button0;
 	};
-	/delete-node/ buttons;
 };
 
 /delete-node/ &led1;

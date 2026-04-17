@@ -71,6 +71,47 @@ static const uint nrf_spi_miso_pin = LCD_RST_PIN;
 static const uint32_t nrf_spi_cs_setup_us = 15;
 static const uint32_t nrf_spi_cs_hold_us = 4;
 static const uint32_t nrf_spi_frame_gap_us = 200;
+static const uint32_t nrf_validation_rows_per_chunk = 4;
+static uint8_t nrf_validation_rx_chunk[LCD_2IN_WIDTH * 2 * nrf_validation_rows_per_chunk];
+static uint8_t nrf_validation_dummy_chunk[LCD_2IN_WIDTH * 2 * nrf_validation_rows_per_chunk];
+static uint8_t mode_b_frame_raw[LCD_2IN_WIDTH * LCD_2IN_HEIGHT * 2];
+typedef struct {
+    bool active;
+    const uint8_t *frame;
+    bool first_transfer;
+    uint32_t row;
+    uint32_t prev_row;
+    uint32_t prev_row_count;
+    size_t prev_byte_count;
+    const uint8_t *prev_src;
+    uint8_t prev_tx_fingerprint[16];  // snapshot of first 16 bytes sent in the previous transfer
+} mode_b_transfer_ctx_t;
+static mode_b_transfer_ctx_t mode_b_ctx = {0};
+static bool touch_initialized = false;
+static bool touch_press_latched = false;
+static bool cam_mirror_enabled = false;
+static uint32_t touch_event_count = 0;
+static uint32_t nrf_event_count = 0;
+static absolute_time_t touch_next_poll_time;
+static absolute_time_t nrf_event_poll_next_time;
+static const uint8_t touch_addr = 0x15;
+static const uint8_t touch_reg_chip_id = 0xA7;
+static const uint8_t touch_expected_chip_id = 0xB6;
+static const uint32_t touch_poll_interval_ms = 8;
+static const uint32_t touch_debounce_ms = 180;
+static const uint32_t nrf_event_poll_interval_ms = 35;
+static absolute_time_t touch_debounce_deadline;
+
+static bool nrf_spi_prepare_bus(uint32_t requested_hz);
+static void nrf_spi_drain_rx_fifo(void);
+static void print_prompt(void);
+static void lcd_note_displayed_frame(void);
+static void lcd_display_rows_from_framebuffer(uint32_t start_row, uint32_t row_count);
+static void lcd_display_raw_rows(uint32_t start_row, uint32_t row_count, const uint8_t *raw_rows);
+static void lcd_copy_raw_rows_to_framebuffer(uint32_t start_row, uint32_t row_count, const uint8_t *raw_rows);
+static void shared_enter_cam_prog(void);
+static void shared_leave_cam_prog(void);
+static void reset_mode_b_transfer_ctx(void);
 
 
 enum cam_snap_state_t {
@@ -101,6 +142,24 @@ enum lcd_cam_stream_state_t {
     LCD_CAM_STREAM_DISPLAY_ROWS,
 };
 
+enum pipeline_mode_t {
+    PIPE_MODE_A_TOUCH = 0,   // CAM -> RP RAM -> LCD
+    PIPE_MODE_B_NRF,         // CAM -> RP RAM -> NRF -> RP -> LCD (validation path)
+};
+
+enum pipeline_mode_request_source_t {
+    PIPE_REQ_NONE = 0,
+    PIPE_REQ_TOUCH,
+    PIPE_REQ_NRF,
+    PIPE_REQ_SHELL,
+};
+
+enum shared_pin_state_t {
+    SHARED_PIN_LCD_ACTIVE = 0,
+    SHARED_PIN_NRF_TRANSACTION,
+    SHARED_PIN_CAM_PROG,
+};
+
 static lcd_load_state_t lcd_load_state = LCD_LOAD_IDLE;
 static bool lcd_load_pending = false;
 static FIL lcd_load_file;
@@ -129,6 +188,13 @@ static bool lcd_cam_stream_active = false;
 static uint32_t lcd_cam_stream_row = 0;
 static absolute_time_t lcd_cam_stream_deadline;
 static absolute_time_t lcd_cam_stream_next_step_time;
+static const uint8_t *mode_b_stream_locked_frame = NULL;  // Locked per-frame in Mode B; prevents mid-transfer pointer flip
+static pipeline_mode_t pipeline_mode = PIPE_MODE_A_TOUCH;
+static pipeline_mode_t pipeline_mode_pending = PIPE_MODE_A_TOUCH;
+static pipeline_mode_request_source_t pipeline_mode_pending_source = PIPE_REQ_NONE;
+static bool pipeline_mode_switch_pending = false;
+static bool pipeline_validation_mode_b_enabled = false;
+static shared_pin_state_t shared_pin_state = SHARED_PIN_LCD_ACTIVE;
 
 static cam_snap_state_t cam_snap_state;
 static const UINT cam_snap_chunk_size = 512;
@@ -217,6 +283,388 @@ static void print_hex_bytes(const uint8_t *buf, size_t len) {
         if (i + 1 < len) printf(" ");
     }
 }
+
+static const char *pipeline_mode_name(const pipeline_mode_t mode) {
+    return (mode == PIPE_MODE_B_NRF) ? "B (CAM->NRF->RP->LCD)" : "A (CAM->RP->LCD)";
+}
+
+static const char *pipeline_request_source_name(const pipeline_mode_request_source_t src) {
+    switch (src) {
+    case PIPE_REQ_TOUCH: return "touch";
+    case PIPE_REQ_NRF: return "nrf";
+    case PIPE_REQ_SHELL: return "shell";
+    case PIPE_REQ_NONE:
+    default: return "none";
+    }
+}
+
+static const char *shared_pin_state_name(const shared_pin_state_t state) {
+    switch (state) {
+    case SHARED_PIN_NRF_TRANSACTION: return "NRF_TRANSACTION";
+    case SHARED_PIN_CAM_PROG: return "CAM_PROG";
+    case SHARED_PIN_LCD_ACTIVE:
+    default: return "LCD_ACTIVE";
+    }
+}
+
+static void shared_enter_lcd_active(void) {
+    if (nrf_spi_initialized) {
+        gpio_put(nrf_spi_cs_pin, 1);
+    }
+    if (lcd_initialized) {
+        if (shared_pin_state != SHARED_PIN_LCD_ACTIVE) {
+            // Restore LCD SPI baud after any NRF transaction changed SPI clock.
+            (void)spi_init(SPI_PORT, lcd_spi_hz);
+            gpio_set_function(LCD_CLK_PIN, GPIO_FUNC_SPI);
+            gpio_set_function(LCD_MOSI_PIN, GPIO_FUNC_SPI);
+        }
+        DEV_Digital_Write(LCD_CS_PIN, 1);
+        spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    }
+    shared_pin_state = SHARED_PIN_LCD_ACTIVE;
+}
+
+static void shared_enter_nrf_transaction(void) {
+    if (shared_pin_state != SHARED_PIN_NRF_TRANSACTION || !nrf_spi_initialized) {
+        nrf_spi_prepare_bus(nrf_spi_actual_hz ? nrf_spi_actual_hz : 13000000);
+    }
+    DEV_Digital_Write(LCD_CS_PIN, 1);
+    shared_pin_state = SHARED_PIN_NRF_TRANSACTION;
+}
+
+static void shared_enter_cam_prog(void) {
+    if (nrf_spi_initialized) {
+        gpio_put(nrf_spi_cs_pin, 1);
+        // nrf_spi_prepare_bus() reconfigured I2C1_SDA (== nrf_spi_cs_pin) to GPIO output.
+        // Restore it to I2C function so camera register writes via i2c1 work correctly.
+        gpio_set_function(I2C1_SDA, GPIO_FUNC_I2C);
+        gpio_pull_up(I2C1_SDA);
+    }
+    shared_pin_state = SHARED_PIN_CAM_PROG;
+}
+
+static void shared_leave_cam_prog(void) {
+    if (pipeline_mode == PIPE_MODE_B_NRF && pipeline_validation_mode_b_enabled) {
+        shared_enter_nrf_transaction();
+    } else {
+        shared_enter_lcd_active();
+    }
+}
+
+static void pipeline_request_mode(const pipeline_mode_t next_mode,
+                                  const pipeline_mode_request_source_t source) {
+    if (!lcd_cam_stream_active) {
+        pipeline_mode = next_mode;
+        pipeline_mode_switch_pending = false;
+        pipeline_mode_pending_source = PIPE_REQ_NONE;
+        return;
+    }
+
+    pipeline_mode_pending = next_mode;
+    pipeline_mode_pending_source = source;
+    pipeline_mode_switch_pending = true;
+}
+
+static void pipeline_apply_pending_mode_if_safe(void) {
+    if (!pipeline_mode_switch_pending) return;
+    if (!lcd_cam_stream_active) {
+        pipeline_mode = pipeline_mode_pending;
+        pipeline_mode_switch_pending = false;
+        pipeline_mode_pending_source = PIPE_REQ_NONE;
+        return;
+    }
+
+    // Safe switching point for stream mode: right before consuming the next frame.
+    if (lcd_cam_stream_state != LCD_CAM_STREAM_WAIT_FRAME) return;
+
+    pipeline_mode_t old_mode = pipeline_mode;
+    pipeline_mode = pipeline_mode_pending;
+    if (old_mode == PIPE_MODE_B_NRF && pipeline_mode != PIPE_MODE_B_NRF) {
+        reset_mode_b_transfer_ctx();
+    }
+    printf("\nPipeline switched to mode %s (requested by %s)\n",
+           pipeline_mode_name(pipeline_mode),
+           pipeline_request_source_name(pipeline_mode_pending_source));
+    pipeline_mode_switch_pending = false;
+    pipeline_mode_pending_source = PIPE_REQ_NONE;
+    print_prompt();
+}
+
+static void pipeline_force_mode_now(const pipeline_mode_t mode,
+                                    const pipeline_mode_request_source_t source) {
+    (void)source;
+    pipeline_mode_t old_mode = pipeline_mode;
+    pipeline_mode = mode;
+    pipeline_mode_pending = mode;
+    pipeline_mode_switch_pending = false;
+    pipeline_mode_pending_source = PIPE_REQ_NONE;
+    if (old_mode == PIPE_MODE_B_NRF && mode != PIPE_MODE_B_NRF) {
+        reset_mode_b_transfer_ctx();
+    }
+}
+
+static void cam_apply_mirror_toggle(void) {
+    shared_enter_cam_prog();
+    cam_mirror_enabled = !cam_mirror_enabled;
+    OV5640_WR_Reg(i2c1, 0x3C, TIMING_TC_REG21, cam_mirror_enabled ? 0x06 : 0x00);
+    shared_leave_cam_prog();
+}
+
+static void handle_nrf_button_event_mask(const uint8_t mask) {
+    if (mask == 0) return;
+
+    // Any NRF button event owns the UI and switches to mode B.
+    pipeline_force_mode_now(PIPE_MODE_B_NRF, PIPE_REQ_NRF);
+    nrf_event_count++;
+
+    // Minimal validation behavior: one button action = toggle mirror.
+    if (mask & 0x01) {
+        cam_apply_mirror_toggle();
+        printf("\nNRF event: mirror %s, mode B forced\n", cam_mirror_enabled ? "ON" : "OFF");
+    } else {
+        printf("\nNRF event mask=0x%02X, mode B forced\n", mask);
+    }
+    print_prompt();
+}
+
+static bool nrf_spi_transfer_bytes(const uint8_t *tx, uint8_t *rx, size_t len) {
+    if (!tx || !rx || len == 0) return false;
+
+    shared_enter_nrf_transaction();
+    nrf_spi_drain_rx_fifo();
+    gpio_put(nrf_spi_cs_pin, 0);
+    busy_wait_us_32(nrf_spi_cs_setup_us);
+
+    int ret = spi_write_read_blocking(SPI_PORT, tx, rx, len);
+
+    busy_wait_us_32(nrf_spi_cs_hold_us);
+    gpio_put(nrf_spi_cs_pin, 1);
+    busy_wait_us_32(nrf_spi_frame_gap_us);
+    return ret >= 0 && (size_t)ret == len;
+}
+
+static bool ensure_mode_b_frame_raw(size_t needed_bytes) {
+    return (needed_bytes != 0) && (needed_bytes <= sizeof(mode_b_frame_raw));
+}
+
+static void free_mode_b_frame_raw(void) {
+    mode_b_ctx.active = false;
+}
+
+static bool bytes_all_value(const uint8_t *buf, size_t len, uint8_t value) {
+    for (size_t i = 0; i < len; ++i) {
+        if (buf[i] != value) return false;
+    }
+    return true;
+}
+
+static void reset_mode_b_transfer_ctx(void) {
+    mode_b_ctx.active = false;
+    mode_b_ctx.frame = NULL;
+    mode_b_ctx.first_transfer = true;
+    mode_b_ctx.row = 0;
+    mode_b_ctx.prev_row = 0;
+    mode_b_ctx.prev_row_count = 0;
+    mode_b_ctx.prev_byte_count = 0;
+    mode_b_ctx.prev_src = NULL;
+    memset(mode_b_ctx.prev_tx_fingerprint, 0, sizeof(mode_b_ctx.prev_tx_fingerprint));
+}
+
+// Returns: -1 = failure, 0 = still transferring, 1 = frame displayed.
+static int pipeline_mode_b_transfer_frame_via_nrf_to_lcd(const uint8_t *frame) {
+    if (!frame || !lcd_image) return -1;
+    size_t frame_bytes = (size_t)cam_width * cam_height * 2u;
+    if (!ensure_mode_b_frame_raw(frame_bytes)) {
+        return -1;
+    }
+
+    if (!mode_b_ctx.active || mode_b_ctx.frame != frame) {
+        reset_mode_b_transfer_ctx();
+        mode_b_ctx.active = true;
+        mode_b_ctx.frame = frame;
+    }
+
+    if (mode_b_ctx.row < cam_height) {
+        uint32_t row = mode_b_ctx.row;
+        uint32_t row_count = cam_height - row;
+        if (row_count > nrf_validation_rows_per_chunk) {
+            row_count = nrf_validation_rows_per_chunk;
+        }
+        size_t byte_count = (size_t)cam_width * 2u * row_count;
+        const uint8_t *tx = frame + ((size_t)row * cam_width * 2u);
+
+        // Snapshot first 16 bytes of tx NOW, before the transfer.
+        // prev_src points into the live camera DMA buffer which can be overwritten
+        // at any time; the fingerprint gives us a stable reference for the echo check.
+        uint8_t current_fp[16];
+        memcpy(current_fp, tx, byte_count < 16u ? byte_count : 16u);
+
+        if (!nrf_spi_transfer_bytes(tx, nrf_validation_rx_chunk, byte_count)) {
+            reset_mode_b_transfer_ctx();
+            return -1;
+        }
+        if (bytes_all_value(nrf_validation_rx_chunk, byte_count, 0xFF)) {
+            printf("\nMode-B transfer got all-0xFF chunk at row %lu (SPI link issue)\n",
+                   (unsigned long)row);
+            reset_mode_b_transfer_ctx();
+            return -1;
+        }
+
+        if (!mode_b_ctx.first_transfer) {
+            if (nrf_validation_rx_chunk[0] == 0xA5 && mode_b_ctx.prev_byte_count >= 2u) {
+                uint8_t mask = nrf_validation_rx_chunk[1];
+                nrf_validation_rx_chunk[0] = mode_b_ctx.prev_tx_fingerprint[0];
+                nrf_validation_rx_chunk[1] = mode_b_ctx.prev_tx_fingerprint[1];
+                if (mask != 0) {
+                    handle_nrf_button_event_mask(mask);
+                }
+            }
+
+            // Echo check against the saved fingerprint, not prev_src.
+            // prev_src points into the live camera buffer which the DMA may have
+            // already overwritten by the time this comparison runs.
+            size_t fp_cmp = mode_b_ctx.prev_byte_count < 16u ? mode_b_ctx.prev_byte_count : 16u;
+            if (memcmp(nrf_validation_rx_chunk, mode_b_ctx.prev_tx_fingerprint, fp_cmp) != 0) {
+                printf("\nMode-B echo mismatch at row %lu (MISO open or SPI error)\n",
+                       (unsigned long)mode_b_ctx.prev_row);
+                reset_mode_b_transfer_ctx();
+                return -1;
+            }
+
+            size_t prev_offset = (size_t)mode_b_ctx.prev_row * cam_width * 2u;
+            memcpy(mode_b_frame_raw + prev_offset, nrf_validation_rx_chunk, mode_b_ctx.prev_byte_count);
+        } else {
+            mode_b_ctx.first_transfer = false;
+        }
+
+        mode_b_ctx.prev_row = row;
+        mode_b_ctx.prev_row_count = row_count;
+        mode_b_ctx.prev_byte_count = byte_count;
+        mode_b_ctx.prev_src = tx;
+        memcpy(mode_b_ctx.prev_tx_fingerprint, current_fp, sizeof(current_fp));
+        mode_b_ctx.row += row_count;
+        return 0;
+    }
+
+    if (mode_b_ctx.first_transfer) {
+        reset_mode_b_transfer_ctx();
+        return -1;
+    }
+
+    memset(nrf_validation_dummy_chunk, 0, sizeof(nrf_validation_dummy_chunk));
+    if (!nrf_spi_transfer_bytes(nrf_validation_dummy_chunk, nrf_validation_rx_chunk, mode_b_ctx.prev_byte_count)) {
+        reset_mode_b_transfer_ctx();
+        return -1;
+    }
+    if (bytes_all_value(nrf_validation_rx_chunk, mode_b_ctx.prev_byte_count, 0xFF)) {
+        printf("\nMode-B flush transfer got all-0xFF chunk (SPI link issue)\n");
+        reset_mode_b_transfer_ctx();
+        return -1;
+    }
+
+    if (nrf_validation_rx_chunk[0] == 0xA5 && mode_b_ctx.prev_byte_count >= 2u) {
+        uint8_t mask = nrf_validation_rx_chunk[1];
+        nrf_validation_rx_chunk[0] = mode_b_ctx.prev_tx_fingerprint[0];
+        nrf_validation_rx_chunk[1] = mode_b_ctx.prev_tx_fingerprint[1];
+        if (mask != 0) {
+            handle_nrf_button_event_mask(mask);
+        }
+    }
+
+    // Echo check against saved fingerprint (flush mirrors the per-chunk protocol).
+    size_t flush_fp_cmp = mode_b_ctx.prev_byte_count < 16u ? mode_b_ctx.prev_byte_count : 16u;
+    if (memcmp(nrf_validation_rx_chunk, mode_b_ctx.prev_tx_fingerprint, flush_fp_cmp) != 0) {
+        printf("\nMode-B flush echo mismatch (MISO open or SPI error)\n");
+        reset_mode_b_transfer_ctx();
+        return -1;
+    }
+
+    size_t prev_offset = (size_t)mode_b_ctx.prev_row * cam_width * 2u;
+    memcpy(mode_b_frame_raw + prev_offset, nrf_validation_rx_chunk, mode_b_ctx.prev_byte_count);
+
+    shared_enter_lcd_active();
+    lcd_display_raw_rows(0, cam_height, mode_b_frame_raw);
+    reset_mode_b_transfer_ctx();
+    return 1;
+}
+
+static bool touch_read_reg(uint8_t reg, uint8_t *value) {
+    if (!value) return false;
+    int wr = i2c_write_blocking(I2C_PORT, touch_addr, &reg, 1, true);
+    if (wr != 1) return false;
+    int rd = i2c_read_blocking(I2C_PORT, touch_addr, value, 1, false);
+    return rd == 1;
+}
+
+static bool touch_init_controller(void) {
+    // Touch uses I2C0 on DEV_SDA/SCL. We avoid hard reset pulse because Touch_RST_PIN
+    // is shared with LCD_RST/MISO in this project wiring.
+    i2c_init(I2C_PORT, 400 * 1000);
+    gpio_set_function(DEV_SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(DEV_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(DEV_SDA_PIN);
+    gpio_pull_up(DEV_SCL_PIN);
+
+    gpio_init(Touch_INT_PIN);
+    gpio_set_dir(Touch_INT_PIN, GPIO_IN);
+    gpio_pull_up(Touch_INT_PIN);
+
+    uint8_t chip = 0;
+    if (!touch_read_reg(touch_reg_chip_id, &chip)) {
+        touch_initialized = false;
+        return false;
+    }
+
+    touch_initialized = (chip == touch_expected_chip_id);
+    touch_press_latched = false;
+    touch_debounce_deadline = get_absolute_time();
+    touch_next_poll_time = get_absolute_time();
+    return touch_initialized;
+}
+
+static void touch_handle_mirror_event_if_needed(void) {
+    if (!touch_initialized) return;
+    if (!lcd_cam_stream_active) return;
+    if (!time_reached(touch_next_poll_time)) return;
+    touch_next_poll_time = delayed_by_ms(get_absolute_time(), touch_poll_interval_ms);
+
+    bool pressed = (gpio_get(Touch_INT_PIN) == 0);
+    if (!pressed) {
+        touch_press_latched = false;
+        return;
+    }
+
+    if (touch_press_latched) return;
+    if (!time_reached(touch_debounce_deadline)) return;
+    touch_press_latched = true;
+    touch_debounce_deadline = delayed_by_ms(get_absolute_time(), touch_debounce_ms);
+
+    // Touch event => force Mode A immediately then apply one transformation (mirror toggle).
+    pipeline_force_mode_now(PIPE_MODE_A_TOUCH, PIPE_REQ_TOUCH);
+    cam_apply_mirror_toggle();
+    touch_event_count++;
+    printf("\nTouch event: mirror %s, mode A requested\n", cam_mirror_enabled ? "ON" : "OFF");
+    print_prompt();
+}
+
+static void nrf_poll_button_event_if_needed(void) {
+    if (!nrf_spi_initialized) return;
+    if (!lcd_cam_stream_active) return;
+    if (pipeline_mode == PIPE_MODE_B_NRF && pipeline_validation_mode_b_enabled) return;
+    if (!time_reached(nrf_event_poll_next_time)) return;
+    nrf_event_poll_next_time = delayed_by_ms(get_absolute_time(), nrf_event_poll_interval_ms);
+
+    uint8_t tx[2] = {0x00, 0x00};
+    uint8_t rx[2] = {0x00, 0x00};
+    if (!nrf_spi_transfer_bytes(tx, rx, sizeof(tx))) {
+        return;
+    }
+
+    if (rx[0] == 0xA5) {
+        handle_nrf_button_event_mask(rx[1]);
+    }
+}
+
 const char *chk_dflt_log_drv(const size_t argc, const char *argv[]) {
     if (argc > 1) {
         extra_argument_msg(argv[1]);
@@ -1120,10 +1568,12 @@ static void run_cam_i2c_init(const size_t argc, const char *argv[]){
 //added
 static void run_cam_id(const size_t argc, const char *argv[]){
     if (!expect_argc(argc, argv, 0)) return;
+    shared_enter_cam_prog();
     uint16_t reg;
     reg=OV5640_RD_Reg(i2c1,0x3C,0X300A);
 	reg<<=8;
 	reg|=OV5640_RD_Reg(i2c1,0x3C,0X300B);
+    shared_leave_cam_prog();
     printf("ID: %d \r\n",reg);
 }
 
@@ -1133,7 +1583,9 @@ static void run_cam_defaults(const size_t argc, const char *argv[]){
     // Match the original Waveshare 02-CAM flow:
     // sccb_init() does the I2C setup, applies the default table with embedded
     // delays, and then programs size, image options, PLL and colorspace.
+    shared_enter_cam_prog();
     sccb_init(I2C1_SDA, I2C1_SCL);
+    shared_leave_cam_prog();
     printf("Camera default sensor init applied\n");
 }
 
@@ -1143,6 +1595,8 @@ static void run_cam_size(const size_t argc, const char *argv[]) {
 
     uint32_t w = (uint32_t)atoi(argv[0]);
     uint32_t h = (uint32_t)atoi(argv[1]);
+
+    shared_enter_cam_prog();
 
     // stop pipeline and free old buffer
     free_cam();
@@ -1160,10 +1614,12 @@ static void run_cam_size(const size_t argc, const char *argv[]) {
     // reallocate buffer
     cam_ptr = (uint8_t *)malloc(cam_ful_size * 2);
     if (!cam_ptr) {
+        shared_leave_cam_prog();
         printf("malloc failed for %lu x %lu\n", w, h);
         return;
     }
 
+    shared_leave_cam_prog();
     printf("Size set to %lu x %lu\n", w, h);
     printf("Run cam_dma then cam_start to restart capture\n");
 }
@@ -1172,7 +1628,9 @@ static void run_cam_size(const size_t argc, const char *argv[]) {
 static void run_cam_flip(const size_t argc, const char* argv[]){
     if(!expect_argc(argc,argv,1)) return;
     uint16_t flip = (uint16_t) atoi(argv[0]);
+    shared_enter_cam_prog();
     OV5640_WR_Reg(i2c1, 0x3C, TIMING_TC_REG20, flip);
+    shared_leave_cam_prog();
     printf("Flip set to %u\n", flip);
 }
 
@@ -1180,7 +1638,9 @@ static void run_cam_flip(const size_t argc, const char* argv[]){
 static void run_cam_mirror(const size_t argc, const char *argv[]){
     if(!expect_argc(argc,argv,1)) return;
     uint16_t mirror = (uint16_t) atoi(argv[0]);
+    shared_enter_cam_prog();
     OV5640_WR_Reg(i2c1, 0x3C, TIMING_TC_REG21, mirror);
+    shared_leave_cam_prog();
     printf("Mirror set to %u\n", mirror);
 }
 
@@ -1189,7 +1649,9 @@ static void run_cam_pll(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
 
     uint8_t multiplier = (uint8_t)atoi(argv[0]);
+    shared_enter_cam_prog();
     OV5640_WR_Reg(i2c1, 0x3C, SC_PLL_CONTRL_2, multiplier);
+    shared_leave_cam_prog();
     printf("PLL multiplier set to %u\n", multiplier);
 }
 
@@ -1197,15 +1659,19 @@ static void run_cam_pll(const size_t argc, const char *argv[]) {
 static void run_cam_format(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
 
+    shared_enter_cam_prog();
     if (strcmp(argv[0], "rgb565") == 0) {
         OV5640_WR_Reg(i2c1, 0x3C, FORMAT_CTRL,  0x01);
         OV5640_WR_Reg(i2c1, 0x3C, FORMAT_CTRL00, 0x61);
+        shared_leave_cam_prog();
         printf("Format set to RGB565\n");
     } else if (strcmp(argv[0], "yuv422") == 0) {
         OV5640_WR_Reg(i2c1, 0x3C, FORMAT_CTRL,  0x00);
         OV5640_WR_Reg(i2c1, 0x3C, FORMAT_CTRL00, 0x00);
+        shared_leave_cam_prog();
         printf("Format set to YUV422\n");
     } else {
+        shared_leave_cam_prog();
         printf("Unknown format: %s (use rgb565 or yuv422)\n", argv[0]);
     }
 }
@@ -1237,7 +1703,9 @@ static void run_cam_wreg(const size_t argc, const char *argv[]){
     if(!expect_argc(argc,argv,2)) return;
     uint16_t reg = (uint16_t)strtol(argv[0], NULL, 16);
     uint8_t val = (uint8_t)strtol(argv[1], NULL, 16);
+    shared_enter_cam_prog();
     OV5640_WR_Reg(i2c1,0x3C,reg,val);
+    shared_leave_cam_prog();
     printf("reg 0x%04X = 0x%02X (%u)\n", reg, val, val);
 }
 
@@ -1347,6 +1815,7 @@ static void run_lcd_init(const size_t argc, const char *argv[]) {
         lcd_image = NULL;
         lcd_image_bytes = 0;
     }
+    free_mode_b_frame_raw();
 
     lcd_image_bytes = LCD_2IN.WIDTH * LCD_2IN.HEIGHT * 2;
     lcd_image = (UWORD *)malloc(lcd_image_bytes);
@@ -1364,6 +1833,12 @@ static void run_lcd_init(const size_t argc, const char *argv[]) {
 
     lcd_backlight = 0;
     lcd_initialized = true;
+    if (touch_init_controller()) {
+        printf("Touch initialized (CST816D)\n");
+    } else {
+        printf("Touch init failed (CST816D not detected)\n");
+    }
+    nrf_event_poll_next_time = get_absolute_time();
     printf("LCD initialized (%s)\n", lcd_scan_dir == VERTICAL ? "vertical" : "horizontal");
 }
 
@@ -1728,12 +2203,18 @@ static void finish_lcd_cam_snap(void) {
 
 static void finish_lcd_cam_stream(void) {
     DEV_Digital_Write(LCD_CS_PIN, 1);  // Safety: deassert CS if stopped mid-frame
+    if (nrf_spi_initialized) {
+        gpio_put(nrf_spi_cs_pin, 1);
+    }
+    shared_pin_state = SHARED_PIN_LCD_ACTIVE;
     cam_ptr1 = NULL;                   // Release the framebuffer back to LCD use
     free_cam();
     buffer_ready = false;
     lcd_cam_stream_active = false;
     lcd_cam_stream_state = LCD_CAM_STREAM_IDLE;
     lcd_cam_stream_row = 0;
+    mode_b_stream_locked_frame = NULL;
+    free_mode_b_frame_raw();
 }
 
 static void run_lcd_cam_snap(const size_t argc, const char *argv[]) {
@@ -1851,6 +2332,8 @@ static void run_lcd_cam_stream(const size_t argc, const char *argv[]) {
     cam_set_continuous(true);
     cam_set_use_irq(true);
     buffer_ready = false;
+    reset_mode_b_transfer_ctx();
+    mode_b_stream_locked_frame = NULL;
     config_cam_buffer();
     start_cam();
 
@@ -1860,7 +2343,7 @@ static void run_lcd_cam_stream(const size_t argc, const char *argv[]) {
     lcd_cam_stream_deadline = make_timeout_time_ms(2000);
     lcd_cam_stream_next_step_time = get_absolute_time();
 
-    printf("Starting LCD camera stream in background...\n");
+    printf("Starting LCD camera stream in background (%s)...\n", pipeline_mode_name(pipeline_mode));
 }
 
 static void run_lcd_status(const size_t argc, const char *argv[]){
@@ -1882,8 +2365,95 @@ static void run_lcd_fps(const size_t argc, const char *argv[]) {
     printf("LCD stream active: %s\n", lcd_cam_stream_active ? "yes" : "no");
 }
 
+static void run_touch_status(const size_t argc, const char *argv[]) {
+    if (!expect_argc(argc, argv, 0)) return;
+    printf("Touch initialized: %s\n", touch_initialized ? "yes" : "no");
+    printf("Touch events handled: %lu\n", (unsigned long)touch_event_count);
+    printf("NRF events handled: %lu\n", (unsigned long)nrf_event_count);
+    printf("Mirror state: %s\n", cam_mirror_enabled ? "ON" : "OFF");
+}
+
+static bool parse_pipeline_mode_arg(const char *arg, pipeline_mode_t *mode_out) {
+    if (!arg || !mode_out) return false;
+    if (strcmp(arg, "a") == 0 || strcmp(arg, "A") == 0 || strcmp(arg, "touch") == 0) {
+        *mode_out = PIPE_MODE_A_TOUCH;
+        return true;
+    }
+    if (strcmp(arg, "b") == 0 || strcmp(arg, "B") == 0 || strcmp(arg, "nrf") == 0) {
+        *mode_out = PIPE_MODE_B_NRF;
+        return true;
+    }
+    return false;
+}
+
+static void run_sm_status(const size_t argc, const char *argv[]) {
+    if (!expect_argc(argc, argv, 0)) return;
+
+    printf("Pipeline mode: %s\n", pipeline_mode_name(pipeline_mode));
+    printf("Validation mode-B path enabled: %s\n", pipeline_validation_mode_b_enabled ? "yes" : "no");
+    printf("Shared pin state: %s\n", shared_pin_state_name(shared_pin_state));
+    printf("Pending mode switch: %s\n", pipeline_mode_switch_pending ? "yes" : "no");
+    if (pipeline_mode_switch_pending) {
+        printf("Pending target: %s (source=%s)\n",
+               pipeline_mode_name(pipeline_mode_pending),
+               pipeline_request_source_name(pipeline_mode_pending_source));
+    }
+}
+
+static void run_sm_mode(const size_t argc, const char *argv[]) {
+    if (!expect_argc(argc, argv, 1)) return;
+
+    pipeline_mode_t next_mode;
+    if (!parse_pipeline_mode_arg(argv[0], &next_mode)) {
+        printf("Invalid mode: %s (use a|b|touch|nrf)\n", argv[0]);
+        return;
+    }
+
+    pipeline_request_mode(next_mode, PIPE_REQ_SHELL);
+    if (!pipeline_mode_switch_pending) {
+        printf("Pipeline mode set to %s\n", pipeline_mode_name(pipeline_mode));
+    } else {
+        printf("Pipeline mode switch to %s queued\n", pipeline_mode_name(next_mode));
+    }
+}
+
+static void run_sm_event(const size_t argc, const char *argv[]) {
+    if (!expect_argc(argc, argv, 1)) return;
+
+    if (strcmp(argv[0], "touch") == 0) {
+        pipeline_request_mode(PIPE_MODE_A_TOUCH, PIPE_REQ_TOUCH);
+    } else if (strcmp(argv[0], "nrf") == 0) {
+        pipeline_request_mode(PIPE_MODE_B_NRF, PIPE_REQ_NRF);
+    } else {
+        printf("Invalid event: %s (use touch|nrf)\n", argv[0]);
+        return;
+    }
+
+    if (!pipeline_mode_switch_pending) {
+        printf("Event applied. Active pipeline mode: %s\n", pipeline_mode_name(pipeline_mode));
+    } else {
+        printf("Event accepted. Pending pipeline mode: %s\n", pipeline_mode_name(pipeline_mode_pending));
+    }
+}
+
+static void run_sm_validation(const size_t argc, const char *argv[]) {
+    if (!expect_argc(argc, argv, 1)) return;
+
+    if (strcmp(argv[0], "on") == 0) {
+        pipeline_validation_mode_b_enabled = true;
+    } else if (strcmp(argv[0], "off") == 0) {
+        pipeline_validation_mode_b_enabled = false;
+    } else {
+        printf("Invalid argument: %s (use on|off)\n", argv[0]);
+        return;
+    }
+
+    printf("Validation mode-B full-frame path is now %s\n",
+           pipeline_validation_mode_b_enabled ? "enabled" : "disabled");
+}
+
 static bool nrf_spi_prepare_bus(uint32_t requested_hz) {
-    if (requested_hz == 0) requested_hz = 1000000;
+    if (requested_hz == 0) requested_hz = 13000000;
 
     DEV_Digital_Write(LCD_CS_PIN, 1);  // Keep LCD deselected during NRF transaction tests.
     gpio_init(nrf_spi_cs_pin);
@@ -1897,6 +2467,7 @@ static bool nrf_spi_prepare_bus(uint32_t requested_hz) {
     nrf_spi_actual_hz = spi_init(SPI_PORT, requested_hz);
     spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
     nrf_spi_initialized = true;
+    shared_pin_state = SHARED_PIN_NRF_TRANSACTION;
     return true;
 }
 
@@ -1907,7 +2478,7 @@ static void nrf_spi_drain_rx_fifo(void) {
 }
 
 static void run_nrf_spi_init(const size_t argc, const char *argv[]) {
-    uint32_t requested_hz = 1000000;
+    uint32_t requested_hz = 13000000;
     if (argc > 1) {
         printf("Usage: nrf_spi_init [baud_hz]\n");
         return;
@@ -1916,8 +2487,13 @@ static void run_nrf_spi_init(const size_t argc, const char *argv[]) {
         printf("Invalid baud_hz: %s\n", argv[0]);
         return;
     }
+    if (lcd_cam_stream_active) {
+        printf("Stop lcd_cam_stream before nrf_spi_init to avoid live SPI reconfiguration.\n");
+        return;
+    }
 
     nrf_spi_prepare_bus(requested_hz);
+    nrf_event_poll_next_time = get_absolute_time();
     printf("NRF SPI ready: SCK=%u MOSI=%u MISO=%u CS=%u actual=%lu Hz\n",
            nrf_spi_sck_pin, nrf_spi_mosi_pin, nrf_spi_miso_pin, nrf_spi_cs_pin,
            (unsigned long)nrf_spi_actual_hz);
@@ -1937,7 +2513,7 @@ static void run_nrf_spi_xfer(const size_t argc, const char *argv[]) {
         return;
     }
     if (!nrf_spi_initialized) {
-        nrf_spi_prepare_bus(1000000);
+        nrf_spi_prepare_bus(13000000);
     }
 
     uint8_t tx[256];
@@ -2076,7 +2652,7 @@ static void run_nrf_spi_diag(const size_t argc, const char *argv[]) {
     if (loops > 1000) loops = 1000;
 
     if (!nrf_spi_initialized) {
-        nrf_spi_prepare_bus(1000000);
+        nrf_spi_prepare_bus(13000000);
     }
 
     static const uint8_t tx[8] = {0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18};
@@ -2248,6 +2824,22 @@ static cmd_def_t cmds[] = {
     {"mem-stats", run_mem_stats,
      "mem-stats:\n"
      " Print memory statistics"},
+    {"sm_status", run_sm_status,
+     "sm_status:\n"
+     " Show state-machine status (mode, pending switch, shared pin owner)."},
+    {"sm_mode", run_sm_mode,
+     "sm_mode <a|b|touch|nrf>:\n"
+     " Request pipeline mode switch.\n"
+     " a/touch -> CAM->RP->LCD, b/nrf -> CAM->NRF->RP->LCD."},
+    {"sm_event", run_sm_event,
+     "sm_event <touch|nrf>:\n"
+     " Inject mode-switch event as if raised by touch panel or NRF button."},
+    {"sm_validation", run_sm_validation,
+     "sm_validation <on|off>:\n"
+     " Enable/disable validation-only full-frame Path-B transfer via NRF."},
+    {"touch_status", run_touch_status,
+     "touch_status:\n"
+     " Print touch init state and mirror event counters."},
     {"nrf_spi_init", run_nrf_spi_init,
      "nrf_spi_init [baud_hz]:\n"
      " Configure shared SPI pins for NRF validation (default 1MHz)."},
@@ -2650,6 +3242,10 @@ bool command_input_in_progress(void) {
 }
 
 void process_background_tasks(void) {
+    pipeline_apply_pending_mode_if_safe();
+    touch_handle_mirror_event_if_needed();
+    nrf_poll_button_event_if_needed();
+
     if (cam_snap_pending && time_reached(cam_snap_next_step_time)) {
         switch (cam_snap_state) {
         case CAM_SNAP_WAIT_FRAME:
@@ -2802,9 +3398,42 @@ void process_background_tasks(void) {
                 row_count = lcd_display_row_chunk;
             }
 
-            lcd_display_raw_rows(lcd_cam_stream_row,
-                                 row_count,
-                                 cam_display_ptr + (lcd_cam_stream_row * cam_width * 2));
+            if (pipeline_mode == PIPE_MODE_B_NRF && pipeline_validation_mode_b_enabled) {
+                // Lock cam_display_ptr at the start of each new frame transfer.
+                // cam_display_ptr flips every ~40ms (camera DMA), but Mode B needs
+                // ~80ms to relay one frame chunk-by-chunk. Without locking, the pointer
+                // changes mid-transfer and mode_b_ctx.frame != frame resets it to row 0.
+                if (!mode_b_ctx.active) {
+                    mode_b_stream_locked_frame = cam_display_ptr;
+                }
+                int st = pipeline_mode_b_transfer_frame_via_nrf_to_lcd(mode_b_stream_locked_frame);
+                if (st < 0) {
+                    // NRF SPI error: reset context, fall back to Mode A and continue stream.
+                    reset_mode_b_transfer_ctx();
+                    mode_b_stream_locked_frame = NULL;
+                    pipeline_force_mode_now(PIPE_MODE_A_TOUCH, PIPE_REQ_SHELL);
+                    printf("\nMode-B transfer failed (NRF SPI). Falling back to mode A.\n");
+                    print_prompt();
+                    lcd_cam_stream_row = cam_height;
+                    lcd_cam_stream_next_step_time = get_absolute_time();
+                    return;
+                }
+                if (st == 0) {
+                    // Still transferring this frame; revisit next tick.
+                    lcd_cam_stream_next_step_time = delayed_by_ms(get_absolute_time(), 1);
+                    return;
+                }
+                // st == 1: frame relayed and displayed; fall through to reset loop.
+                mode_b_stream_locked_frame = NULL;
+            } else {
+                if (mode_b_ctx.active) {
+                    reset_mode_b_transfer_ctx();
+                }
+                shared_enter_lcd_active();
+                lcd_display_raw_rows(lcd_cam_stream_row,
+                                     row_count,
+                                     cam_display_ptr + (lcd_cam_stream_row * cam_width * 2));
+            }
             lcd_cam_stream_row = cam_height;  // DMA sent the full frame; skip the 19 remaining no-op chunks
             lcd_cam_stream_next_step_time = get_absolute_time();
             return;
