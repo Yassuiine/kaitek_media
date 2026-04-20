@@ -1,11 +1,12 @@
 /*
- * nRF54L15 DK CPUAPP SPI-slave overlay for RP2350 master validation.
+ * nRF54L15 DK CPUAPP SPI-slave overlay — HSSPI (SPIS00, P2 port, up to 32 MHz).
+ * Wire to Pico: GPIO18(SCK)→P2.06, GPIO19(MOSI)→P2.09, GPIO20(MISO)→P2.08, GPIO22(CS)→P2.10
  */
 
 / {
 	aliases {
 		led = &led0;
-		spis = &spi22;
+		spis = &spi00;               /* switched from spi22 to HSSPI instance */
 		/delete-property/ led1;
 		/delete-property/ mcuboot-button0;
 	};
@@ -13,40 +14,41 @@
 
 /delete-node/ &led1;
 
-&gpiote20 {
-	status = "okay";
-	owned-channels = <0>;
-};
-
 &pinctrl {
-	spi22_default_alt: spi22_default_alt {
+	spi00_slave_default: spi00_slave_default {
 		group1 {
-			/* Use free P1 pins on nRF54L15 DK to avoid P0-domain conflicts. */
-			psels = <NRF_PSEL(SPIS_SCK, 1, 11)>,
-				<NRF_PSEL(SPIS_MOSI, 1, 12)>,
-				<NRF_PSEL(SPIS_MISO, 1, 14)>,
-				<NRF_PSEL(SPIS_CSN, 1, 10)>;
+			psels = <NRF_PSEL(SPIS_SCK,  2, 6)>,
+				<NRF_PSEL(SPIS_MOSI, 2, 9)>,
+				<NRF_PSEL(SPIS_MISO, 2, 8)>,
+				<NRF_PSEL(SPIS_CSN,  2, 10)>;
 		};
 	};
 
-	spi22_sleep_alt: spi22_sleep_alt {
+	spi00_slave_sleep: spi00_slave_sleep {
 		group1 {
-			psels = <NRF_PSEL(SPIS_SCK, 1, 11)>,
-				<NRF_PSEL(SPIS_MOSI, 1, 12)>,
-				<NRF_PSEL(SPIS_MISO, 1, 14)>,
-				<NRF_PSEL(SPIS_CSN, 1, 10)>;
+			psels = <NRF_PSEL(SPIS_SCK,  2, 6)>,
+				<NRF_PSEL(SPIS_MOSI, 2, 9)>,
+				<NRF_PSEL(SPIS_MISO, 2, 8)>,
+				<NRF_PSEL(SPIS_CSN,  2, 10)>;
 			low-power-enable;
 		};
 	};
 };
 
-&spi22 {
+&spi00 {
 	compatible = "nordic,nrf-spis";
 	status = "okay";
+	/delete-property/ cs-gpios;
 	/delete-property/ rx-delay-supported;
 	/delete-property/ rx-delay;
 	def-char = <0xFF>;
-	pinctrl-0 = <&spi22_default_alt>;
-	pinctrl-1 = <&spi22_sleep_alt>;
+	pinctrl-0 = <&spi00_slave_default>;
+	pinctrl-1 = <&spi00_slave_sleep>;
 	pinctrl-names = "default", "sleep";
+	/delete-node/ mx25r6435f@0;
+};
+
+/* Disable the old spi22 slave to release P1 pins */
+&spi22 {
+	status = "disabled";
 };

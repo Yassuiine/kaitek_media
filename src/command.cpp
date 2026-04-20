@@ -1,4 +1,4 @@
-#include <assert.h>
+﻿#include <assert.h>
 #include <ctype.h>
 #include <malloc.h>
 #include <stdio.h>
@@ -30,83 +30,103 @@
 #include "LCD_2in.h"
 #include "GUI_Paint.h"
 
-static char *saveptr;  // For strtok_r
-static volatile bool die;
-static char cmd_buffer[256];
-static size_t cmd_ix;
-static size_t cmd_cursor;
-static const char *PROMPT_STR = "Kaitek> ";
-static const size_t CMD_HISTORY_MAX = 32;
-static char cmd_history[32][256];
-static size_t cmd_history_count;
-static int cmd_history_nav_index = -1;  // -1 means not browsing history
-static char cmd_history_edit_backup[256];
-static size_t cmd_history_edit_backup_len;
-static bool cmd_history_backup_valid;
-static bool cam_snap_pending;
-static absolute_time_t cam_snap_deadline;
-static char cam_snap_path[256];
-static FIL cam_snap_file;
-static bool cam_snap_file_open;
-static uint32_t cam_snap_write_offset;
-static UINT cam_snap_total_written;
-static absolute_time_t cam_snap_next_step_time;
-static bool last_input_was_cr;
-static bool lcd_initialized = false;
-static uint8_t lcd_backlight = 0;
-static UBYTE lcd_scan_dir = VERTICAL;
-static UWORD *lcd_image = NULL;
-static size_t lcd_image_bytes = 0;
-static const uint32_t lcd_spi_hz = 62500000;
-static uint32_t lcd_display_fps = 0;
-static uint32_t lcd_display_frames_total = 0;
-static uint32_t lcd_display_frames_window = 0;
-static uint64_t lcd_display_window_start_us = 0;
-static bool nrf_spi_initialized = false;
-static uint32_t nrf_spi_actual_hz = 0;
-static const uint nrf_spi_cs_pin = I2C1_SDA;    // Shared pin plan: CAM_SDA reused as NRF CS.
-static const uint nrf_spi_sck_pin = LCD_CLK_PIN;
-static const uint nrf_spi_mosi_pin = LCD_MOSI_PIN;
-static const uint nrf_spi_miso_pin = LCD_RST_PIN;
-static uint32_t nrf_spi_cs_setup_us = 15;
-static uint32_t nrf_spi_cs_hold_us = 4;
-static uint32_t nrf_spi_frame_gap_us = 200;
-static const uint32_t nrf_event_min_interval_ms = 250;
-static const uint32_t mode_b_fail_block_ms = 1200;
-static const uint32_t mode_b_retry_safe_hz = 6000000;
-static uint32_t nrf_validation_rows_per_chunk = 4;
-#define NRF_VALIDATION_ROWS_MAX 8
-static uint8_t nrf_validation_rx_chunk[LCD_2IN_WIDTH * 2 * NRF_VALIDATION_ROWS_MAX];
-static uint8_t nrf_validation_dummy_chunk[LCD_2IN_WIDTH * 2 * NRF_VALIDATION_ROWS_MAX];
+static char *saveptr;                    // strtok_r re-entrant parse position; shared across all tokenisation in process_cmd
+static volatile bool die;                // Set by chars_available_callback on Enter to abort a running loop command
+static char cmd_buffer[256];            // In-progress command line being edited; modified in-place by strtok_r on Enter
+static size_t cmd_ix;                   // Logical end of cmd_buffer: number of characters typed (excluding NUL)
+static size_t cmd_cursor;               // Cursor insert position within cmd_buffer; 0 = home, cmd_ix = end
+static const char *PROMPT_STR = "Kaitek> ";  // Shell prompt string printed before every new input line
+static const size_t CMD_HISTORY_MAX = 32;    // Maximum number of history entries retained in the ring
+static char cmd_history[32][256];            // Circular ring of previous command lines (oldest overwritten when full)
+static size_t cmd_history_count;             // Number of valid entries currently stored in cmd_history (0..CMD_HISTORY_MAX)
+static int cmd_history_nav_index = -1;       // Index into cmd_history for Up/Down navigation; -1 = not in history mode
+static char cmd_history_edit_backup[256];    // Snapshot of the in-progress edit saved before Up-arrow enters history mode
+static size_t cmd_history_edit_backup_len;   // Length of the saved edit backup (chars, excluding NUL)
+static bool cmd_history_backup_valid;        // True when cmd_history_edit_backup contains a valid saved line
+
+static bool cam_snap_pending;                   // True while an async cam snap operation is in progress
+static absolute_time_t cam_snap_deadline;       // Absolute time after which the frame-wait phase times out
+static char cam_snap_path[256];                 // Destination file path for the current cam snap operation
+static FIL cam_snap_file;                       // FatFS file object for the output file during cam snap
+static bool cam_snap_file_open;                 // True when cam_snap_file is open and must be closed on finish/abort
+static uint32_t cam_snap_write_offset;          // Byte offset into cam_ptr already written to the file
+static UINT cam_snap_total_written;             // Cumulative bytes successfully written across all chunks so far
+static absolute_time_t cam_snap_next_step_time; // Earliest time the state machine should execute its next step
+static bool last_input_was_cr;                  // Tracks whether the previous byte was CR to suppress the following LF (CRLF â†' CR)
+
+static bool lcd_initialized = false;               // True after lcd_init succeeds; guards all LCD command handlers
+static uint8_t lcd_backlight = 0;                  // Current PWM backlight level in percent (0 = off, 100 = full)
+static UBYTE lcd_scan_dir = VERTICAL;              // Current panel scan direction: VERTICAL (portrait) or HORIZONTAL (landscape)
+static UWORD *lcd_image = NULL;                    // Heap-allocated framebuffer (WIDTH×HEIGHT RGB565 words); NULL before lcd_init
+static size_t lcd_image_bytes = 0;                 // Size of lcd_image in bytes (= WIDTH × HEIGHT × 2)
+static const uint32_t lcd_spi_hz = 62500000;       // Requested SPI baud for the LCD; actual rate set by spi_init()
+static uint32_t lcd_display_fps = 0;               // Rolling one-second display frame rate (frames per second)
+static uint32_t lcd_display_frames_total = 0;      // Total frames pushed to the LCD panel since last lcd_init
+static uint32_t lcd_display_frames_window = 0;     // Frame count in the current FPS measurement window
+static uint64_t lcd_display_window_start_us = 0;   // Timestamp (us) when the current FPS window started
+
+static bool nrf_spi_initialized = false;           // True after nrf_spi_prepare_bus() succeeds at least once
+static uint32_t nrf_spi_actual_hz = 0;             // Baud rate actually achieved by spi_init() for NRF transfers
+// Pico SPI0 pins shared with the LCD bus.  Wire each to the nRF54L15 SPIS00 dedicated P2 pin shown:
+//   Pico GPIO22 (I2C1_SDA) → nRF P2.10  CSN
+//   Pico GPIO18 (LCD_CLK)  → nRF P2.06  SCK   (dedicated HSSPI clock pin, up to 32 MHz)
+//   Pico GPIO19 (LCD_MOSI) → nRF P2.09  SDO   (nRF SDO = data out of nRF = Pico MOSI)
+//   Pico GPIO20 (LCD_RST)  → nRF P2.08  SDI   (nRF SDI = data into nRF = Pico MISO echo)
+// SPIS00 (P2 port) supports up to 32 MHz; SPIS20/21/30 (P0/P1) are limited to 8 MHz.
+static const uint nrf_spi_cs_pin = I2C1_SDA;       // GPIO22 → nRF P2.10 CSN
+static const uint nrf_spi_sck_pin = LCD_CLK_PIN;   // GPIO18 → nRF P2.06 SCK
+static const uint nrf_spi_mosi_pin = LCD_MOSI_PIN; // GPIO19 → nRF P2.09 SDO
+static const uint nrf_spi_miso_pin = LCD_RST_PIN;  // GPIO20 → nRF P2.08 SDI (echo path back to Pico)
+static uint32_t nrf_spi_cs_setup_us = 15;          // CS-assert-to-first-SCK delay; tune down to 2 µs with `nrf timing setup 2` for HSSPI
+static uint32_t nrf_spi_cs_hold_us = 4;            // Last-SCK-to-CS-deassert hold; tune down to 2 µs with `nrf timing hold 2` for HSSPI
+static uint32_t nrf_spi_frame_gap_us = 200;        // Inter-frame idle gap; tune down to 50 µs with `nrf timing gap 50` for HSSPI
+static const uint32_t nrf_event_min_interval_ms = 250;  // Debounce window: ignores NRF button events closer than this
+static const uint32_t mode_b_fail_block_ms = 1200;      // After a Mode-B SPI failure, suppress NRF events for this duration
+static const uint32_t mode_b_retry_safe_hz = 16000000;  // HSSPI safe-fallback baud for one-time all-0xFF recovery retry (was 6 MHz for SPIS20; raised to 16 MHz for SPIS00)
+static uint32_t nrf_validation_rows_per_chunk = 4;      // Number of camera rows transferred per NRF SPI chunk (tunable)
+#define NRF_VALIDATION_ROWS_MAX 8                        // Hard upper bound on rows_per_chunk; sets nrf_validation_rx_chunk size
+static uint8_t nrf_validation_rx_chunk[LCD_2IN_WIDTH * 2 * NRF_VALIDATION_ROWS_MAX];   // Receive buffer for one NRF chunk
+static uint8_t nrf_validation_dummy_chunk[LCD_2IN_WIDTH * 2 * NRF_VALIDATION_ROWS_MAX]; // All-zero payload for the Phase-B flush transfer
+
+// Static relay buffer that assembles the validated Mode-B frame before pushing to the LCD.
+// Must be at least cam_width * cam_height * 2 bytes; sized for the maximum LCD resolution.
 static uint8_t mode_b_frame_raw[LCD_2IN_WIDTH * LCD_2IN_HEIGHT * 2];
+
+// Per-frame transfer context for the Mode-B NRF relay path.
+// Because Mode-B sends one chunk per scheduler tick, this struct persists transfer
+// progress across multiple calls to process_background_tasks().
 typedef struct {
-    bool active;
-    const uint8_t *frame;
-    bool first_transfer;
-    uint32_t row;
-    uint32_t prev_row;
-    uint32_t prev_row_count;
-    size_t prev_byte_count;
-    const uint8_t *prev_src;
-    uint8_t prev_tx_fingerprint[16];  // snapshot of first 16 bytes sent in the previous transfer
+    bool active;                   // True while a frame transfer is in progress
+    const uint8_t *frame;          // Pointer to the locked camera frame being relayed
+    bool first_transfer;           // True until the first chunk has been sent (pipeline not yet primed)
+    uint32_t row;                  // Next camera row to transmit in Phase A
+    uint32_t prev_row;             // Row index of the most recently transmitted chunk
+    uint32_t prev_row_count;       // Row count of the most recently transmitted chunk
+    size_t prev_byte_count;        // Byte count of the most recently transmitted chunk
+    const uint8_t *prev_src;       // Source pointer of the most recently transmitted chunk
+    uint8_t prev_tx_fingerprint[16]; // First 16 bytes of the previously sent chunk; used to validate the echo
 } mode_b_transfer_ctx_t;
 static mode_b_transfer_ctx_t mode_b_ctx = {0};
-static bool touch_initialized = false;
-static bool touch_press_latched = false;
-static bool cam_mirror_enabled = false;
-static uint32_t touch_event_count = 0;
-static uint32_t nrf_event_count = 0;
-static absolute_time_t touch_next_poll_time;
-static absolute_time_t nrf_event_poll_next_time;
-static absolute_time_t nrf_event_block_until;
-static const uint8_t touch_addr = 0x15;
-static const uint8_t touch_reg_chip_id = 0xA7;
-static const uint8_t touch_expected_chip_id = 0xB6;
-static const uint32_t touch_poll_interval_ms = 8;
-static const uint32_t touch_debounce_ms = 180;
-static const uint32_t nrf_event_poll_interval_ms = 35;
-static absolute_time_t touch_debounce_deadline;
 
+static bool touch_initialized = false;              // True after touch_init_controller() confirms the CST816D chip ID
+static bool touch_press_latched = false;            // True while a press is held; prevents repeated trigger events
+static bool cam_mirror_enabled = false;             // Tracks the current OV5640 horizontal mirror state for display
+static uint32_t touch_event_count = 0;             // Total number of debounced touch events that triggered a mirror toggle
+static uint32_t nrf_event_count = 0;               // Total number of NRF button events that triggered an action
+static absolute_time_t touch_next_poll_time;        // Earliest time to re-sample the Touch_INT_PIN
+static absolute_time_t nrf_event_poll_next_time;    // Earliest time to send the next standalone NRF poll transfer
+static absolute_time_t nrf_event_block_until;       // Block NRF event processing until this time (debounce / fail-recovery)
+static const uint8_t touch_addr = 0x15;             // I2C address of the CST816D touch controller on I2C0
+static const uint8_t touch_reg_chip_id = 0xA7;      // CST816D register that returns the chip identification byte
+static const uint8_t touch_expected_chip_id = 0xB6; // Expected chip-ID value confirming a genuine CST816D is present
+static const uint32_t touch_poll_interval_ms = 8;   // How often to sample Touch_INT_PIN (ms); ~125 Hz
+static const uint32_t touch_debounce_ms = 180;      // Minimum gap between two consecutive touch events (ms)
+static const uint32_t nrf_event_poll_interval_ms = 35; // Interval between standalone NRF button-poll transfers in Mode A (ms)
+static absolute_time_t touch_debounce_deadline;     // Earliest time a new touch event will be accepted after the last one
+
+/**
+ * @brief Forward declarations for helpers used before full definitions.
+ */
 static bool nrf_spi_prepare_bus(uint32_t requested_hz);
 static void nrf_spi_drain_rx_fifo(void);
 static void print_prompt(void);
@@ -119,6 +139,9 @@ static void shared_leave_cam_prog(void);
 static void reset_mode_b_transfer_ctx(void);
 
 
+/**
+ * @brief Asynchronous snapshot-to-file phases (`cam snap`).
+ */
 enum cam_snap_state_t {
     CAM_SNAP_IDLE = 0,
     CAM_SNAP_WAIT_FRAME,
@@ -127,6 +150,9 @@ enum cam_snap_state_t {
     CAM_SNAP_CLOSE_FILE,
 };
 
+/**
+ * @brief Asynchronous LCD image load/unload phases.
+ */
 enum lcd_load_state_t{
     LCD_LOAD_IDLE = 0,
     LCD_LOAD_OPEN_FILE,
@@ -135,23 +161,35 @@ enum lcd_load_state_t{
     LCD_LOAD_DISPLAY,
 };
 
+/**
+ * @brief One-shot camera frame to LCD snapshot phases.
+ */
 enum lcd_cam_snap_state_t {
     LCD_CAM_SNAP_IDLE = 0,
     LCD_CAM_SNAP_WAIT_FRAME,
     LCD_CAM_SNAP_DISPLAY_ROWS,
 };
 
+/**
+ * @brief Continuous camera-to-LCD stream phases.
+ */
 enum lcd_cam_stream_state_t {
     LCD_CAM_STREAM_IDLE = 0,
     LCD_CAM_STREAM_WAIT_FRAME,
     LCD_CAM_STREAM_DISPLAY_ROWS,
 };
 
+/**
+ * @brief High-level processing pipeline mode selector.
+ */
 enum pipeline_mode_t {
     PIPE_MODE_A_TOUCH = 0,   // CAM -> RP RAM -> LCD
     PIPE_MODE_B_NRF,         // CAM -> RP RAM -> NRF -> RP -> LCD (validation path)
 };
 
+/**
+ * @brief Origin of mode-switch request for diagnostics and arbitration.
+ */
 enum pipeline_mode_request_source_t {
     PIPE_REQ_NONE = 0,
     PIPE_REQ_TOUCH,
@@ -159,54 +197,56 @@ enum pipeline_mode_request_source_t {
     PIPE_REQ_SHELL,
 };
 
+/**
+ * @brief Logical ownership state of shared pins.
+ */
 enum shared_pin_state_t {
     SHARED_PIN_LCD_ACTIVE = 0,
     SHARED_PIN_NRF_TRANSACTION,
     SHARED_PIN_CAM_PROG,
 };
 
-static lcd_load_state_t lcd_load_state = LCD_LOAD_IDLE;
-static bool lcd_load_pending = false;
-static FIL lcd_load_file;
-static bool lcd_load_file_open = false;
-static char lcd_load_path[256];
-static char lcd_load_status_msg[128];
-static UINT lcd_load_offset = 0;
-static uint32_t lcd_load_display_row = 0;
-static absolute_time_t lcd_load_next_step_time;
-static const uint32_t lcd_display_row_chunk = 16;
-static uint8_t lcd_row_buffer[LCD_2IN_WIDTH * 2 * lcd_display_row_chunk];  // still used by lcd_load
+static lcd_load_state_t lcd_load_state = LCD_LOAD_IDLE; // Current phase of the non-blocking LCD load/display state machine
+static bool lcd_load_pending = false;                    // True while any lcd_load state machine phase is active
+static FIL lcd_load_file;                                // FatFS file object for the image being loaded from SD
+static bool lcd_load_file_open = false;                  // True when lcd_load_file is open and must be closed on finish/abort
+static char lcd_load_path[256];                          // File path of the image currently being loaded
+static char lcd_load_status_msg[128];                    // Optional status message printed on load completion (empty = default msg)
+static UINT lcd_load_offset = 0;                         // Total bytes read from the file so far (tracks progress)
+static uint32_t lcd_load_display_row = 0;                // Next row to send to the LCD panel (advances in lcd_display_row_chunk steps)
+static absolute_time_t lcd_load_next_step_time;          // Earliest time the lcd_load state machine should execute its next step
+static const uint32_t lcd_display_row_chunk = 16;        // Number of rows per background-task tick for lcd_load (SD read + LCD push)
+static uint8_t lcd_row_buffer[LCD_2IN_WIDTH * 2 * lcd_display_row_chunk];  // Scratch buffer for one chunk of rows read from SD
 
-// DMA channels for SPI pixel transfers (claimed on first use)
-static int spi_tx_dma_ch = -1;
-static int spi_rx_dma_ch = -1;
-static volatile uint16_t spi_rx_dummy;  // RX drain sink (prevents FIFO overflow stalling TX)
+static int spi_tx_dma_ch = -1;             // DMA channel for SPI TX (claimed on first use; -1 = not yet claimed)
+static int spi_rx_dma_ch = -1;             // DMA channel for SPI RX drain (claimed on first use; -1 = not yet claimed)
+static volatile uint16_t spi_rx_dummy;     // Discard sink for SPI RX DMA; prevents the 4-deep RX FIFO overflowing and stalling TX
 
-static lcd_cam_snap_state_t lcd_cam_snap_state = LCD_CAM_SNAP_IDLE;
-static bool lcd_cam_snap_pending = false;
-static uint32_t lcd_cam_snap_row = 0;
-static absolute_time_t lcd_cam_snap_deadline;
-static absolute_time_t lcd_cam_snap_next_step_time;
+static lcd_cam_snap_state_t lcd_cam_snap_state = LCD_CAM_SNAP_IDLE; // Current phase of the one-shot cam-to-LCD snapshot state machine
+static bool lcd_cam_snap_pending = false;                            // True while an lcd_cam_snap operation is in progress
+static uint32_t lcd_cam_snap_row = 0;                                // Next row to push to the LCD in the DISPLAY_ROWS phase
+static absolute_time_t lcd_cam_snap_deadline;                        // Absolute time after which the frame-wait phase times out
+static absolute_time_t lcd_cam_snap_next_step_time;                  // Earliest time for the next state machine step
 
-static lcd_cam_stream_state_t lcd_cam_stream_state = LCD_CAM_STREAM_IDLE;
-static bool lcd_cam_stream_active = false;
-static uint32_t lcd_cam_stream_row = 0;
-static absolute_time_t lcd_cam_stream_deadline;
-static absolute_time_t lcd_cam_stream_next_step_time;
-static const uint8_t *mode_b_stream_locked_frame = NULL;  // Locked per-frame in Mode B; prevents mid-transfer pointer flip
-static pipeline_mode_t pipeline_mode = PIPE_MODE_A_TOUCH;
-static pipeline_mode_t pipeline_mode_pending = PIPE_MODE_A_TOUCH;
-static pipeline_mode_request_source_t pipeline_mode_pending_source = PIPE_REQ_NONE;
-static bool pipeline_mode_switch_pending = false;
-static bool pipeline_validation_mode_b_enabled = false;
-static shared_pin_state_t shared_pin_state = SHARED_PIN_LCD_ACTIVE;
+static lcd_cam_stream_state_t lcd_cam_stream_state = LCD_CAM_STREAM_IDLE; // Current phase of the continuous camera stream state machine
+static bool lcd_cam_stream_active = false;                                 // True while lcd_cam_stream is running
+static uint32_t lcd_cam_stream_row = 0;                                    // Next row to process in the DISPLAY_ROWS phase
+static absolute_time_t lcd_cam_stream_deadline;                            // Absolute time after which the frame-wait phase times out
+static absolute_time_t lcd_cam_stream_next_step_time;                      // Earliest time for the next stream state machine step
+static const uint8_t *mode_b_stream_locked_frame = NULL;  // Frame pointer locked at the start of a Mode-B transfer; prevents mid-frame pointer flip when camera DMA swaps buffers
+static pipeline_mode_t pipeline_mode = PIPE_MODE_A_TOUCH;                     // Currently active pipeline mode
+static pipeline_mode_t pipeline_mode_pending = PIPE_MODE_A_TOUCH;             // Target mode for a deferred switch request
+static pipeline_mode_request_source_t pipeline_mode_pending_source = PIPE_REQ_NONE; // Originator of the pending switch request (for logging)
+static bool pipeline_mode_switch_pending = false;                              // True when a mode switch has been requested but not yet applied
+static bool pipeline_validation_mode_b_enabled = false;                        // When true, streaming uses the full NRF echo-validation path
+static shared_pin_state_t shared_pin_state = SHARED_PIN_LCD_ACTIVE;            // Current logical owner of the shared SPI/I2C pins
 
-static cam_snap_state_t cam_snap_state;
-static const UINT cam_snap_chunk_size = 512;
+static cam_snap_state_t cam_snap_state;       // Current phase of the cam snap state machine
+static const UINT cam_snap_chunk_size = 512;  // Bytes written per background-task tick (matches one SD block for efficiency)
 
-bool logger_enabled;
-const uint32_t period = 1000;
-absolute_time_t next_log_time;
+bool logger_enabled;                // When true, process_background_tasks() periodically logs a temperature sample
+const uint32_t period = 1000;       // Logger sampling interval in milliseconds
+absolute_time_t next_log_time;      // Absolute time when the next logger sample should be taken
 
 #pragma GCC diagnostic ignored "-Wunused-function"
 #ifdef NDEBUG 
@@ -214,12 +254,26 @@ absolute_time_t next_log_time;
 #  pragma GCC diagnostic ignored "-Wunused-parameter"
 #endif
 
+/**
+ * @brief Print "Missing argument" to signal the user didn't provide enough args.
+ */
 static void missing_argument_msg() {
     printf("Missing argument\n");
 }
+/**
+ * @brief Print "Unexpected argument: <s>" to signal the user passed too many args.
+ */
 static void extra_argument_msg(const char *s) {
     printf("Unexpected argument: %s\n", s);
 }
+/**
+ * @brief Validate that exactly `expected` arguments were provided; print an error and return false otherwise.
+ *
+ * @param argc Actual argument count.
+ * @param argv Argument vector; argv[expected] is reported if too many args were given.
+ * @param expected Required argument count.
+ * @return true if argc == expected, false otherwise.
+ */
 static bool expect_argc(const size_t argc, const char *argv[], const size_t expected) {
     if (argc < expected) {
         missing_argument_msg();
@@ -232,15 +286,29 @@ static bool expect_argc(const size_t argc, const char *argv[], const size_t expe
     return true;
 }
 
+/**
+ * @brief Parse a decimal uint32 from a shell argument string; rejects empty, non-numeric, and trailing-garbage input.
+ *
+ * @param s   Null-terminated string to parse (e.g. "32000000").
+ * @param out Receives the parsed value on success.
+ * @return true on clean parse, false on NULL pointer, empty string, or any non-digit character.
+ */
 static bool parse_u32_arg(const char *s, uint32_t *out) {
     if (!s || !out) return false;
     char *end = NULL;
     unsigned long v = strtoul(s, &end, 10);
+    // strtoul returns start pointer when no digits were consumed;
+    // *end != '\0' means trailing garbage like "42abc".
     if (end == s || *end != '\0') return false;
     *out = (uint32_t)v;
     return true;
 }
 
+/**
+ * @brief Convert a single hex character to its 4-bit integer value.
+ *
+ * Accepts '0'-'9', 'a'-'f', 'A'-'F'.  Returns -1 for any other character.
+ */
 static int hex_nibble(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
@@ -248,9 +316,22 @@ static int hex_nibble(char c) {
     return -1;
 }
 
+/**
+ * @brief Decode a contiguous hex string (e.g. "A5FF0102") into raw bytes.
+ *
+ * Requires an even-length, non-empty string whose decoded byte count fits in out_cap.
+ * An odd-length hex string can't represent whole bytes; an odd count is therefore rejected.
+ *
+ * @param hex     Null-terminated hex string (case-insensitive).
+ * @param out     Destination buffer.
+ * @param out_cap Capacity of out in bytes.
+ * @param out_len Receives the decoded byte count on success.
+ * @return true on success, false on NULL, empty/odd-length string, invalid chars, or overflow.
+ */
 static bool parse_hex_string_bytes(const char *hex, uint8_t *out, size_t out_cap, size_t *out_len) {
     if (!hex || !out || !out_len) return false;
     size_t n = strlen(hex);
+    // An empty or odd-length hex string can't represent a whole number of bytes.
     if (n == 0 || (n % 2u) != 0) return false;
     size_t bytes = n / 2u;
     if (bytes > out_cap) return false;
@@ -266,6 +347,19 @@ static bool parse_hex_string_bytes(const char *hex, uint8_t *out, size_t out_cap
     return true;
 }
 
+/**
+ * @brief Parse a list of space-separated hex byte tokens into a raw byte array.
+ *
+ * Each argv[i] must be a valid hex byte value in [0x00, 0xFF] with no extra characters.
+ * Used by commands like `nrf xfer A5 FF 01` where bytes arrive as individual tokens.
+ *
+ * @param argc    Number of tokens (= expected output byte count).
+ * @param argv    Array of token strings (each one a hex byte, e.g. "A5").
+ * @param out     Destination buffer.
+ * @param out_cap Capacity of out in bytes.
+ * @param out_len Receives the parsed byte count on success.
+ * @return true on success, false on NULL, zero tokens, overflow, or any invalid token.
+ */
 static bool parse_hex_tokens_bytes(const size_t argc, const char *argv[], uint8_t *out, size_t out_cap, size_t *out_len) {
     if (!out || !out_len) return false;
     if (argc == 0 || argc > out_cap) return false;
@@ -282,8 +376,10 @@ static bool parse_hex_tokens_bytes(const size_t argc, const char *argv[], uint8_
     return true;
 }
 
-static void print_hex_bytes(const uint8_t *buf, size_t len) {
-    for (size_t i = 0; i < len; ++i) {
+/**
+ * @brief Print a byte array as uppercase hex with single spaces between bytes (no trailing space or newline).
+ */
+static void print_hex_bytes(const uint8_t *buf, size_t len) {    for (size_t i = 0; i < len; ++i) {
         printf("%02X", buf[i]);
         if (i + 1 < len) printf(" ");
     }
@@ -312,13 +408,20 @@ static const char *shared_pin_state_name(const shared_pin_state_t state) {
     }
 }
 
+/**
+ * @brief Give the shared SPI bus back to the LCD driver.
+ *
+ * NRF transactions reconfigure SPI clock rate and GPIO functions.
+ * This deasserts the NRF CS, restores the LCD SPI clock rate and pin functions,
+ * then deasserts the LCD CS so the next LCD command starts from a clean state.
+ */
 static void shared_enter_lcd_active(void) {
     if (nrf_spi_initialized) {
         gpio_put(nrf_spi_cs_pin, 1);
     }
     if (lcd_initialized) {
         if (shared_pin_state != SHARED_PIN_LCD_ACTIVE) {
-            // Restore LCD SPI baud after any NRF transaction changed SPI clock.
+            // NRF borrowed these pins at a lower SPI rate; restore them for the LCD driver.
             (void)spi_init(SPI_PORT, lcd_spi_hz);
             gpio_set_function(LCD_CLK_PIN, GPIO_FUNC_SPI);
             gpio_set_function(LCD_MOSI_PIN, GPIO_FUNC_SPI);
@@ -329,14 +432,27 @@ static void shared_enter_lcd_active(void) {
     shared_pin_state = SHARED_PIN_LCD_ACTIVE;
 }
 
+/**
+ * @brief Configure shared SPI pins for an NRF transaction, deassert the LCD CS.
+ *
+ * Calling this before any NRF transfer ensures the LCD is not accidentally
+ * selected and that SPI clock/mode match what the NRF expects.
+ */
 static void shared_enter_nrf_transaction(void) {
     if (shared_pin_state != SHARED_PIN_NRF_TRANSACTION || !nrf_spi_initialized) {
-        nrf_spi_prepare_bus(nrf_spi_actual_hz ? nrf_spi_actual_hz : 13000000);
+        nrf_spi_prepare_bus(nrf_spi_actual_hz ? nrf_spi_actual_hz : 32000000);
     }
     DEV_Digital_Write(LCD_CS_PIN, 1);
     shared_pin_state = SHARED_PIN_NRF_TRANSACTION;
 }
 
+/**
+ * @brief Reclaim the I2C1 bus for OV5640 register access.
+ *
+ * nrf_spi_prepare_bus() repurposes I2C1_SDA as a GPIO output (NRF CS).
+ * Before writing any camera register via i2c1, this must restore I2C1_SDA
+ * to I2C function and re-enable its pull-up.
+ */
 static void shared_enter_cam_prog(void) {
     if (nrf_spi_initialized) {
         gpio_put(nrf_spi_cs_pin, 1);
@@ -348,6 +464,11 @@ static void shared_enter_cam_prog(void) {
     shared_pin_state = SHARED_PIN_CAM_PROG;
 }
 
+/**
+ * @brief Release the I2C1 bus after camera register access and restore the correct SPI owner.
+ *
+ * Returns ownership to NRF (Mode B active) or LCD (all other cases).
+ */
 static void shared_leave_cam_prog(void) {
     if (pipeline_mode == PIPE_MODE_B_NRF && pipeline_validation_mode_b_enabled) {
         shared_enter_nrf_transaction();
@@ -370,8 +491,18 @@ static void pipeline_request_mode(const pipeline_mode_t next_mode,
     pipeline_mode_switch_pending = true;
 }
 
+/**
+ * @brief Apply a queued pipeline mode switch at the next safe moment.
+ *
+ * Mode switches requested during an active stream are deferred to a frame boundary
+ * to avoid changing shared-pin ownership mid-transfer and corrupting the current frame.
+ *
+ */
 static void pipeline_apply_pending_mode_if_safe(void) {
+    // No request => nothing to do.
     if (!pipeline_mode_switch_pending) return;
+
+    // If stream is idle, switch immediately.
     if (!lcd_cam_stream_active) {
         pipeline_mode = pipeline_mode_pending;
         pipeline_mode_switch_pending = false;
@@ -379,11 +510,12 @@ static void pipeline_apply_pending_mode_if_safe(void) {
         return;
     }
 
-    // Safe switching point for stream mode: right before consuming the next frame.
+    // While streaming, only switch at frame boundary to avoid mid-transfer pin ownership flips.
     if (lcd_cam_stream_state != LCD_CAM_STREAM_WAIT_FRAME) return;
 
     pipeline_mode_t old_mode = pipeline_mode;
     pipeline_mode = pipeline_mode_pending;
+    // Leaving mode B invalidates partially assembled mode-B transfer state.
     if (old_mode == PIPE_MODE_B_NRF && pipeline_mode != PIPE_MODE_B_NRF) {
         reset_mode_b_transfer_ctx();
     }
@@ -408,23 +540,39 @@ static void pipeline_force_mode_now(const pipeline_mode_t mode,
     }
 }
 
-static void cam_apply_mirror_toggle(void) {
-    shared_enter_cam_prog();
+/**
+ * @brief Toggle the OV5640 horizontal mirror bit and update cam_mirror_enabled.
+ *
+ * Must take/release I2C1 ownership around the register write because I2C1_SDA
+ * is shared with the NRF CS GPIO.
+ *
+ */
+static void cam_apply_mirror_toggle(void) {    shared_enter_cam_prog();
     cam_mirror_enabled = !cam_mirror_enabled;
     OV5640_WR_Reg(i2c1, 0x3C, TIMING_TC_REG21, cam_mirror_enabled ? 0x06 : 0x00);
     shared_leave_cam_prog();
 }
 
+/**
+ * @brief Process an NRF button event bitmask received during a Mode-B frame transfer.
+ *
+ * A non-zero mask forces the pipeline into Mode B and executes the mapped action
+ * (bit 0 = camera mirror toggle). Debounced by nrf_event_min_interval_ms to prevent
+ * rapid repeat triggers from a single physical button press.
+ *
+ */
 static void handle_nrf_button_event_mask(const uint8_t mask) {
+    // Empty payload means no actionable event.
     if (mask == 0) return;
+    // Debounce/guard repeated button notifications.
     if (!time_reached(nrf_event_block_until)) return;
     nrf_event_block_until = delayed_by_ms(get_absolute_time(), nrf_event_min_interval_ms);
 
-    // Any NRF button event owns the UI and switches to mode B.
+    // Any NRF-origin event forces pipeline mode B.
     pipeline_force_mode_now(PIPE_MODE_B_NRF, PIPE_REQ_NRF);
     nrf_event_count++;
 
-    // Minimal validation behavior: one button action = toggle mirror.
+    // Validation mapping: bit0 toggles camera mirror.
     if (mask & 0x01) {
         cam_apply_mirror_toggle();
         printf("\nNRF event: mirror %s, mode B forced\n", cam_mirror_enabled ? "ON" : "OFF");
@@ -434,38 +582,71 @@ static void handle_nrf_button_event_mask(const uint8_t mask) {
     print_prompt();
 }
 
+/**
+ * @brief Perform a full-duplex SPI transaction with the NRF, including CS timing and bus ownership.
+ *
+ * Sequence: take bus ownership → drain stale RX bytes → assert CS → transfer → hold CS → deassert CS → inter-frame gap.
+ * CS setup/hold/gap times are tunable via nrf_spi_cs_setup_us / cs_hold_us / frame_gap_us.
+ *
+ * @param tx  Bytes to send.
+ * @param rx  Destination for bytes received during the same transfer.
+ * @param len Number of bytes to exchange.
+ * @return true if spi_write_read_blocking returned exactly len bytes, false otherwise.
+ */
 static bool nrf_spi_transfer_bytes(const uint8_t *tx, uint8_t *rx, size_t len) {
     if (!tx || !rx || len == 0) return false;
 
+    // 1) Take shared bus ownership for NRF transfer.
     shared_enter_nrf_transaction();
+    // 2) Drop stale RX bytes from prior transfers.
     nrf_spi_drain_rx_fifo();
+    // 3) Assert CS and honor setup timing.
     gpio_put(nrf_spi_cs_pin, 0);
     busy_wait_us_32(nrf_spi_cs_setup_us);
 
+    // 4) Perform full-duplex SPI transaction.
     int ret = spi_write_read_blocking(SPI_PORT, tx, rx, len);
 
+    // 5) Hold CS then release and keep inter-frame gap.
     busy_wait_us_32(nrf_spi_cs_hold_us);
     gpio_put(nrf_spi_cs_pin, 1);
     busy_wait_us_32(nrf_spi_frame_gap_us);
     return ret >= 0 && (size_t)ret == len;
 }
 
+/**
+ * @brief Check that the static mode_b_frame_raw buffer is large enough for the given frame.
+ *
+ * mode_b_frame_raw is a fixed-size static array. If the camera resolution produces a
+ * frame larger than the buffer, Mode-B transfers must be aborted rather than overflow.
+ */
 static bool ensure_mode_b_frame_raw(size_t needed_bytes) {
     return (needed_bytes != 0) && (needed_bytes <= sizeof(mode_b_frame_raw));
 }
 
-static void free_mode_b_frame_raw(void) {
-    mode_b_ctx.active = false;
+/**
+ * @brief Mark the Mode-B transfer context inactive so the buffer is no longer considered live.
+ */
+static void free_mode_b_frame_raw(void) {    mode_b_ctx.active = false;
 }
 
-static bool bytes_all_value(const uint8_t *buf, size_t len, uint8_t value) {
-    for (size_t i = 0; i < len; ++i) {
+/**
+ * @brief Return true only if every byte in buf equals value.
+ *
+ * Used to detect all-0xFF NRF responses, which indicate a disconnected MISO line
+ * or a slave that hasn't asserted CS yet (SPI bus floating high).
+ */
+static bool bytes_all_value(const uint8_t *buf, size_t len, uint8_t value) {    for (size_t i = 0; i < len; ++i) {
         if (buf[i] != value) return false;
     }
     return true;
 }
 
+/**
+ * @brief Clear all fields of mode_b_ctx to their initial values so the next Mode-B frame starts from a known baseline.
+ */
 static void reset_mode_b_transfer_ctx(void) {
+    // Reset every field so the next mode-B frame starts from a known baseline.
     mode_b_ctx.active = false;
     mode_b_ctx.frame = NULL;
     mode_b_ctx.first_transfer = true;
@@ -477,7 +658,16 @@ static void reset_mode_b_transfer_ctx(void) {
     memset(mode_b_ctx.prev_tx_fingerprint, 0, sizeof(mode_b_ctx.prev_tx_fingerprint));
 }
 
-// Returns: -1 = failure, 0 = still transferring, 1 = frame displayed.
+/**
+ * @brief Send one camera frame through the NRF SPI loopback chunk-by-chunk, validate the echo, then push to LCD.
+ *
+ * Must be called repeatedly from the scheduler until it returns non-zero.
+ * The NRF echoes each received chunk one transfer later (one-transfer pipeline delay), so each call
+ * validates the echoed bytes against a fingerprint saved from the previous chunk.
+ * On completion the validated frame is assembled in mode_b_frame_raw and displayed on the LCD.
+ *
+ * @return -1 on link error (all-0xFF, echo mismatch, or SPI failure), 0 still transferring, 1 frame displayed.
+ */
 static int pipeline_mode_b_transfer_frame_via_nrf_to_lcd(const uint8_t *frame) {
     if (!frame || !lcd_image) return -1;
     size_t frame_bytes = (size_t)cam_width * cam_height * 2u;
@@ -485,12 +675,14 @@ static int pipeline_mode_b_transfer_frame_via_nrf_to_lcd(const uint8_t *frame) {
         return -1;
     }
 
+    // Initialize/refresh transfer context on first entry for this frame pointer.
     if (!mode_b_ctx.active || mode_b_ctx.frame != frame) {
         reset_mode_b_transfer_ctx();
         mode_b_ctx.active = true;
         mode_b_ctx.frame = frame;
     }
 
+    // Phase A: transfer one chunk and (after first pass) consume previous returned chunk.
     if (mode_b_ctx.row < cam_height) {
         uint32_t row = mode_b_ctx.row;
         uint32_t row_count = cam_height - row;
@@ -499,22 +691,23 @@ static int pipeline_mode_b_transfer_frame_via_nrf_to_lcd(const uint8_t *frame) {
         }
         size_t byte_count = (size_t)cam_width * 2u * row_count;
         if (byte_count > sizeof(nrf_validation_rx_chunk)) {
-            // chunk size was set beyond NRF_VALIDATION_ROWS_MAX — reset and fail safely
+            // chunk size was set beyond NRF_VALIDATION_ROWS_MAX â€” reset and fail safely
             reset_mode_b_transfer_ctx();
             return -1;
         }
         const uint8_t *tx = frame + ((size_t)row * cam_width * 2u);
 
-        // Snapshot first 16 bytes of tx NOW, before the transfer.
-        // prev_src points into the live camera DMA buffer which can be overwritten
-        // at any time; the fingerprint gives us a stable reference for the echo check.
+        // Snapshot a fingerprint now. Camera DMA can overwrite live frame memory later.
         uint8_t current_fp[16];
         memcpy(current_fp, tx, byte_count < 16u ? byte_count : 16u);
 
+        // Send chunk to NRF and receive returned bytes.
         if (!nrf_spi_transfer_bytes(tx, nrf_validation_rx_chunk, byte_count)) {
             reset_mode_b_transfer_ctx();
             return -1;
         }
+
+        // All-0xFF indicates bad link/ownership; on row0 try one safe-baud recovery.
         if (bytes_all_value(nrf_validation_rx_chunk, byte_count, 0xFF)) {
             if (row == 0 && nrf_spi_actual_hz > mode_b_retry_safe_hz) {
                 uint32_t prev_hz = nrf_spi_actual_hz;
@@ -539,7 +732,9 @@ static int pipeline_mode_b_transfer_frame_via_nrf_to_lcd(const uint8_t *frame) {
             }
         }
 
+        // Returned bytes correspond to previous chunk once the pipeline is primed.
         if (!mode_b_ctx.first_transfer) {
+            // Optional side-band event marker from NRF in first two bytes.
             if (nrf_validation_rx_chunk[0] == 0xA5 && mode_b_ctx.prev_byte_count >= 2u) {
                 uint8_t mask = nrf_validation_rx_chunk[1];
                 nrf_validation_rx_chunk[0] = mode_b_ctx.prev_tx_fingerprint[0];
@@ -549,9 +744,7 @@ static int pipeline_mode_b_transfer_frame_via_nrf_to_lcd(const uint8_t *frame) {
                 }
             }
 
-            // Echo check against the saved fingerprint, not prev_src.
-            // prev_src points into the live camera buffer which the DMA may have
-            // already overwritten by the time this comparison runs.
+            // Verify returned data matches the previous transmitted chunk fingerprint.
             size_t fp_cmp = mode_b_ctx.prev_byte_count < 16u ? mode_b_ctx.prev_byte_count : 16u;
             if (memcmp(nrf_validation_rx_chunk, mode_b_ctx.prev_tx_fingerprint, fp_cmp) != 0) {
                 printf("\nMode-B echo mismatch at row %lu (MISO open or SPI error)\n",
@@ -560,12 +753,15 @@ static int pipeline_mode_b_transfer_frame_via_nrf_to_lcd(const uint8_t *frame) {
                 return -1;
             }
 
+            // Commit validated returned chunk into full-frame relay buffer.
             size_t prev_offset = (size_t)mode_b_ctx.prev_row * cam_width * 2u;
             memcpy(mode_b_frame_raw + prev_offset, nrf_validation_rx_chunk, mode_b_ctx.prev_byte_count);
         } else {
+            // First transfer only primes the pipeline (no previous chunk to consume yet).
             mode_b_ctx.first_transfer = false;
         }
 
+        // Advance chunk state for next scheduler tick.
         mode_b_ctx.prev_row = row;
         mode_b_ctx.prev_row_count = row_count;
         mode_b_ctx.prev_byte_count = byte_count;
@@ -580,6 +776,7 @@ static int pipeline_mode_b_transfer_frame_via_nrf_to_lcd(const uint8_t *frame) {
         return -1;
     }
 
+    // Phase B (flush): ask NRF to return the final delayed chunk.
     memset(nrf_validation_dummy_chunk, 0, sizeof(nrf_validation_dummy_chunk));
     if (!nrf_spi_transfer_bytes(nrf_validation_dummy_chunk, nrf_validation_rx_chunk, mode_b_ctx.prev_byte_count)) {
         reset_mode_b_transfer_ctx();
@@ -617,6 +814,12 @@ static int pipeline_mode_b_transfer_frame_via_nrf_to_lcd(const uint8_t *frame) {
     return 1;
 }
 
+/**
+ * @brief Read a single register from the CST816D touch controller over I2C0.
+ *
+ * Uses a repeated-start write (register address) followed by a read (1 byte).
+ * Returns false if either the write or the read NAKs.
+ */
 static bool touch_read_reg(uint8_t reg, uint8_t *value) {
     if (!value) return false;
     int wr = i2c_write_blocking(I2C_PORT, touch_addr, &reg, 1, true);
@@ -625,9 +828,16 @@ static bool touch_read_reg(uint8_t reg, uint8_t *value) {
     return rd == 1;
 }
 
+/**
+ * @brief Initialise I2C0 and verify the CST816D touch chip is present by reading its chip-ID register.
+ *
+ * Hardware reset is intentionally skipped: Touch_RST_PIN is shared with LCD_RST/NRF MISO
+ * on this board, so toggling it would corrupt an active LCD or NRF session.
+ * The chip-ID read is sufficient to confirm the controller is powered and responsive.
+ */
 static bool touch_init_controller(void) {
-    // Touch uses I2C0 on DEV_SDA/SCL. We avoid hard reset pulse because Touch_RST_PIN
-    // is shared with LCD_RST/MISO in this project wiring.
+    // Touch uses I2C0 on DEV_SDA/SCL; avoid hard reset because Touch_RST_PIN
+    // is shared with LCD_RST/MISO on this board's wiring.
     i2c_init(I2C_PORT, 400 * 1000);
     gpio_set_function(DEV_SDA_PIN, GPIO_FUNC_I2C);
     gpio_set_function(DEV_SCL_PIN, GPIO_FUNC_I2C);
@@ -651,6 +861,13 @@ static bool touch_init_controller(void) {
     return touch_initialized;
 }
 
+/**
+ * @brief Poll the touch INT pin and, on a debounced press, force Mode A and toggle camera mirror.
+ *
+ * Called every frame from process_background_tasks(). Guards prevent running when
+ * touch is not initialized, when no stream is active, or when the debounce window has not elapsed.
+ *
+ */
 static void touch_handle_mirror_event_if_needed(void) {
     if (!touch_initialized) return;
     if (!lcd_cam_stream_active) return;
@@ -662,7 +879,6 @@ static void touch_handle_mirror_event_if_needed(void) {
         touch_press_latched = false;
         return;
     }
-
     if (touch_press_latched) return;
     if (!time_reached(touch_debounce_deadline)) return;
     touch_press_latched = true;
@@ -676,9 +892,18 @@ static void touch_handle_mirror_event_if_needed(void) {
     print_prompt();
 }
 
+/**
+ * @brief Periodically poll the NRF for a button event when not in Mode-B streaming.
+ *
+ * In Mode-B streaming, button events arrive embedded in frame-transfer echoes and are
+ * handled by pipeline_mode_b_transfer_frame_via_nrf_to_lcd(). This function handles
+ * the Mode-A case where no frame transfer is running and we need an explicit poll.
+ *
+ */
 static void nrf_poll_button_event_if_needed(void) {
     if (!nrf_spi_initialized) return;
     if (!lcd_cam_stream_active) return;
+    // Skip standalone NRF polling during Mode-B streaming — events arrive embedded in transfer echoes instead.
     if (pipeline_mode == PIPE_MODE_B_NRF && pipeline_validation_mode_b_enabled) return;
     if (!time_reached(nrf_event_block_until)) return;
     if (!time_reached(nrf_event_poll_next_time)) return;
@@ -710,6 +935,9 @@ const char *chk_dflt_log_drv(const size_t argc, const char *argv[]) {
     }
     return argv[0];
 }
+/**
+ * @brief Print the current wall-clock date, time, and day-of-year from the AON RTC.
+ */
 static void run_date(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
 
@@ -729,6 +957,9 @@ static void run_date(const size_t argc, const char *argv[]) {
                     // 001 to 366).
     printf("Day of year: %s\n", buf);
 }
+/**
+ * @brief Set the AON RTC from six user-supplied fields (day month year hour min sec).
+ */
 static void run_setrtc(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 6)) return;
 
@@ -807,6 +1038,9 @@ static const char *sd_card_type_string(card_type_t type) {
             return "Unknown";
     }
 }
+/**
+ * @brief Print SD card identity, FatFS volume geometry, free space, and layout details for a logical drive.
+ */
 static void run_info(const size_t argc, const char *argv[]) {
     const char *arg = chk_dflt_log_drv(argc, argv);
     if (!arg)
@@ -891,6 +1125,9 @@ static void run_info(const size_t argc, const char *argv[]) {
            fs_p->csize,
            (uint64_t)sd_card_p->state.fatfs.csize * FF_MAX_SS);
 }
+/**
+ * @brief Format a logical drive with FAT/exFAT, aligning the partition to the SD card's erase unit.
+ */
 static void run_format(const size_t argc, const char *argv[]) {
     const char *arg = chk_dflt_log_drv(argc, argv);
     if (!arg)
@@ -944,8 +1181,7 @@ static void run_format(const size_t argc, const char *argv[]) {
     };
     /* Format the drive */
     printf("Formatting %s (this may take a while)...\n", arg);
-    FRESULT fr = f_mkfs(arg, &opt, 0, 32 * 1024);  // 32 KB: ~32x fewer disk_write calls vs FF_MAX_SS*2
-    if (FR_OK != fr) printf("f_mkfs error: %s (%d)\n", FRESULT_str(fr), fr);
+    FRESULT fr = f_mkfs(arg, &opt, 0, 32 * 1024);  // 32 KB: ~32x fewer disk_write calls vs FF_MAX_SS*2    if (FR_OK != fr) printf("f_mkfs error: %s (%d)\n", FRESULT_str(fr), fr);
 
     /* This only works if the drive is mounted: */
 #if FF_USE_LABEL
@@ -954,6 +1190,9 @@ static void run_format(const size_t argc, const char *argv[]) {
     fr = f_setlabel(label);
 #endif
 }
+/**
+ * @brief Initialise an SD card and mount its FatFS volume, making it accessible for file commands.
+ */
 static void run_mount(const size_t argc, const char *argv[]) {
     const char *arg = chk_dflt_log_drv(argc, argv);
     if (!arg)
@@ -986,6 +1225,9 @@ static void run_mount(const size_t argc, const char *argv[]) {
     }
     sd_card_p->state.mounted = true;
 }
+/**
+ * @brief Unmount a FatFS volume and mark the SD card as uninitialized so it is re-probed on next access.
+ */
 static void run_unmount(const size_t argc, const char *argv[]) {
     const char *arg = chk_dflt_log_drv(argc, argv);
     if (!arg)
@@ -1004,6 +1246,9 @@ static void run_unmount(const size_t argc, const char *argv[]) {
     sd_card_p->state.mounted = false;
     sd_card_p->state.m_Status |= STA_NOINIT;  // in case medium is removed
 }
+/**
+ * @brief Set the FatFS current logical drive (e.g. "0:") so subsequent relative paths resolve to it.
+ */
 static void run_chdrive(const size_t argc, const char *argv[]) {
     const char *arg = chk_dflt_log_drv(argc, argv);
     if (!arg)
@@ -1012,18 +1257,27 @@ static void run_chdrive(const size_t argc, const char *argv[]) {
     FRESULT fr = f_chdrive(arg);
     if (FR_OK != fr) printf("f_chdrive error: %s (%d)\n", FRESULT_str(fr), fr);
 }
+/**
+ * @brief Change the FatFS current working directory to the given path.
+ */
 static void run_cd(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
 
     FRESULT fr = f_chdir(argv[0]);
     if (FR_OK != fr) printf("f_chdir error: %s (%d)\n", FRESULT_str(fr), fr);
 }
+/**
+ * @brief Create a new directory at the given FatFS path.
+ */
 static void run_mkdir(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
 
     FRESULT fr = f_mkdir(argv[0]);
     if (FR_OK != fr) printf("f_mkdir error: %s (%d)\n", FRESULT_str(fr), fr);
 }
+/**
+ * @brief List files and subdirectories in the given path, or in the current working directory if omitted.
+ */
 static void run_ls(const size_t argc, const char *argv[]) {
     if (argc > 1) {
         extra_argument_msg(argv[1]);
@@ -1034,6 +1288,9 @@ static void run_ls(const size_t argc, const char *argv[]) {
     else
         ls("");
 }
+/**
+ * @brief Print the FatFS current working directory path.
+ */
 static void run_pwd(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
 
@@ -1044,6 +1301,9 @@ static void run_pwd(const size_t argc, const char *argv[]) {
     else
         printf("%s", buf);
 }
+/**
+ * @brief Print the contents of a FatFS file to stdout, reading line by line.
+ */
 static void run_cat(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
 
@@ -1060,6 +1320,9 @@ static void run_cat(const size_t argc, const char *argv[]) {
     fr = f_close(&fil);
     if (FR_OK != fr) printf("f_close error: %s (%d)\n", FRESULT_str(fr), fr);
 }
+/**
+ * @brief Copy a file on the FatFS volume, reading up to 32 KiB at a time to limit heap use.
+ */
 static void run_cp(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 2)) return;
 
@@ -1107,12 +1370,18 @@ static void run_cp(const size_t argc, const char *argv[]) {
     fr = f_close(&fdst);
     if (FR_OK != fr) printf("f_close error: %s (%d)\n", FRESULT_str(fr), fr);
 }
+/**
+ * @brief Rename or move a file or directory on the FatFS volume.
+ */
 static void run_mv(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 2)) return;
 
     FRESULT fr = f_rename(argv[0], argv[1]);
     if (FR_OK != fr) printf("f_rename error: %s (%d)\n", FRESULT_str(fr), fr);
 }
+/**
+ * @brief Run the destructive low-level I/O driver test on a physical drive number; SD must be reformatted after.
+ */
 static void run_lliot(const size_t argc, const char *argv[]) {
     const char *arg = chk_dflt_log_drv(argc, argv);
     if (!arg)
@@ -1122,6 +1391,9 @@ static void run_lliot(const size_t argc, const char *argv[]) {
     pnum = strtoul(arg, NULL, 0);
     lliot(pnum);
 }
+/**
+ * @brief Write a large random-data file of a given size and seed, then verify it; useful for SD stress testing.
+ */
 static void run_big_file_test(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 3)) return;
 
@@ -1130,6 +1402,10 @@ static void run_big_file_test(const size_t argc, const char *argv[]) {
     uint32_t seed = atoi(argv[2]);
     big_file_test(pcPathName, size, seed);
 }
+/**
+ * @brief Recursively delete a directory and all its contents from the FatFS volume.
+ *
+ */
 static void del_node(const char *path) {
     FILINFO fno;
     char buff[256];
@@ -1143,10 +1419,16 @@ static void del_node(const char *path) {
         printf("%s error: %s (%d)\n", __func__, FRESULT_str(fr), fr);
     }
 }
+/**
+ * @brief Recursively delete the given directory path and all its contents.
+ */
 static void run_del_node(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
     del_node(argv[0]);
 }
+/**
+ * @brief Remove a file, empty directory (-d), or directory tree (-r) from the FatFS volume.
+ */
 static void run_rm(const size_t argc, const char *argv[]) {
     if (argc < 1) {
         missing_argument_msg();
@@ -1170,11 +1452,17 @@ static void run_rm(const size_t argc, const char *argv[]) {
         if (FR_OK != fr) printf("f_unlink error: %s (%d)\n", FRESULT_str(fr), fr);
     }
 }
+/**
+ * @brief Run the simple FatFS filesystem self-test suite.
+ */
 static void run_simple(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
 
     simple();
 }
+/**
+ * @brief Run the binary write/read throughput benchmark on a logical drive.
+ */
 static void run_bench(const size_t argc, const char *argv[]) {
     const char *arg = chk_dflt_log_drv(argc, argv);
     if (!arg)
@@ -1182,17 +1470,26 @@ static void run_bench(const size_t argc, const char *argv[]) {
 
     bench(arg);
 }
+/**
+ * @brief Create the /cdef fake mount-point and populate it with FatFS example files.
+ */
 static void run_cdef(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
 
     f_mkdir("/cdef");  // fake mountpoint
     vCreateAndVerifyExampleFiles("/cdef");
 }
+/**
+ * @brief Run the stdio-with-current-working-directory test against /cdef (run cdef first).
+ */
 static void run_swcwdt(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
 
     vStdioWithCWDTest("/cdef");
 }
+/**
+ * @brief Repeatedly run cdef + swcwdt in a loop until Enter is pressed (stress test).
+ */
 static void run_loop_swcwdt(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
 
@@ -1205,6 +1502,9 @@ static void run_loop_swcwdt(const size_t argc, const char *argv[]) {
         vStdioWithCWDTest("/cdef");
     } while (!die);
 }
+/**
+ * @brief Enable the periodic temperature logger: initialises the ADC, turns on the internal sensor, and sets the next sample time.
+ */
 static void run_start_logger(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
     adc_init();
@@ -1212,11 +1512,17 @@ static void run_start_logger(const size_t argc, const char *argv[]) {
     logger_enabled = true;
     next_log_time = delayed_by_ms(get_absolute_time(), period);
 }
+/**
+ * @brief Disable the periodic temperature logger by clearing logger_enabled.
+ */
 static void run_stop_logger(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
 
     logger_enabled = false;
 }
+/**
+ * @brief Print heap memory statistics (total, used, free) via malloc_stats().
+ */
 static void run_mem_stats(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
  
@@ -1228,6 +1534,9 @@ static void run_mem_stats(const size_t argc, const char *argv[]) {
 }
 
 /* Derived from pico-examples/clocks/hello_48MHz/hello_48MHz.c */
+/**
+ * @brief Count and print all measurable RP2350 clock frequencies using the hardware frequency counter.
+ */
 static void run_measure_freqs(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
 
@@ -1255,12 +1564,18 @@ static void run_measure_freqs(const size_t argc, const char *argv[]) {
 
     // Can't measure clk_ref / xosc as it is the ref
 }
+/**
+ * @brief Switch the system clock to 48 MHz and reinitialise the default UART.
+ */
 static void run_set_sys_clock_48mhz(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
 
     set_sys_clock_48mhz();
     setup_default_uart();
 }
+/**
+ * @brief Change the system clock to a user-supplied kHz frequency and re-source clk_peri from clk_sys.
+ */
 static void run_set_sys_clock_khz(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
 
@@ -1287,6 +1602,9 @@ static void run_set_sys_clock_khz(const size_t argc, const char *argv[]) {
 
     setup_default_uart();
 }
+/**
+ * @brief Drive the given GPIO pin high (init, direction out, set 1).
+ */
 static void set(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
 
@@ -1296,6 +1614,9 @@ static void set(const size_t argc, const char *argv[]) {
     gpio_set_dir(gp, GPIO_OUT);
     gpio_put(gp, 1);
 }
+/**
+ * @brief Drive the given GPIO pin low (init, direction out, set 0).
+ */
 static void clr(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
 
@@ -1305,8 +1626,11 @@ static void clr(const size_t argc, const char *argv[]) {
     gpio_set_dir(gp, GPIO_OUT);
     gpio_put(gp, 0);
 }
-static void run_test(const size_t argc, const char *argv[]) {    
-    if (!expect_argc(argc, argv, 0)) return;
+/**
+ * @brief Invoke the development test routine my_test() (used for ad-hoc in-tree testing).
+ */
+static void run_test(const size_t argc, const char *argv[]) {
+        if (!expect_argc(argc, argv, 0)) return;
 
     extern bool my_test();
     my_test();
@@ -1314,13 +1638,20 @@ static void run_test(const size_t argc, const char *argv[]) {
 
 static void run_help(const size_t argc, const char *argv[]);
 
+/**
+ * @brief Print the shell prompt string and flush stdout.
+ *
+ */
 static void print_prompt(void) {
     printf("%s", PROMPT_STR);
     stdio_flush();
 }
 
-static void reset_command_line_state(void) {
-    cmd_ix = 0;
+/**
+ * @brief Reset command line state.
+ *
+ */
+static void reset_command_line_state(void) {    cmd_ix = 0;
     cmd_cursor = 0;
     cmd_buffer[0] = '\0';
     cmd_history_nav_index = -1;
@@ -1329,6 +1660,10 @@ static void reset_command_line_state(void) {
     cmd_history_edit_backup[0] = '\0';
 }
 
+/**
+ * @brief Redraw the current command line in-place using CR + ANSI erase-to-EOL, preserving cursor position.
+ *
+ */
 static void redraw_command_line(void) {
     printf("\r%s%s", PROMPT_STR, cmd_buffer);
     printf("\x1b[K");
@@ -1339,9 +1674,14 @@ static void redraw_command_line(void) {
     stdio_flush();
 }
 
+/**
+ * @brief Append a command line to the history ring, silently dropping duplicates of the most recent entry.
+ *
+ * When the ring is full (CMD_HISTORY_MAX entries), the oldest entry is evicted to make room.
+ *
+ */
 static void add_command_to_history(const char *line) {
     if (!line || !line[0]) return;
-
     if (cmd_history_count > 0 &&
         strcmp(cmd_history[cmd_history_count - 1], line) == 0) {
         return;
@@ -1357,12 +1697,22 @@ static void add_command_to_history(const char *line) {
     strlcpy(cmd_history[CMD_HISTORY_MAX - 1], line, sizeof(cmd_history[0]));
 }
 
+/**
+ * @brief Snapshot the current in-progress command line before history navigation overwrites it.
+ *
+ * Allows Down-arrow at the bottom of history to restore the line the user was typing.
+ *
+ */
 static void load_current_edit_backup(void) {
     strlcpy(cmd_history_edit_backup, cmd_buffer, sizeof(cmd_history_edit_backup));
     cmd_history_edit_backup_len = cmd_ix;
     cmd_history_backup_valid = true;
 }
 
+/**
+ * @brief Replace the command buffer with text and move the cursor to the end.
+ *
+ */
 static void set_command_line_text(const char *text) {
     if (!text) text = "";
     strlcpy(cmd_buffer, text, sizeof(cmd_buffer));
@@ -1370,6 +1720,10 @@ static void set_command_line_text(const char *text) {
     cmd_cursor = cmd_ix;
 }
 
+/**
+ * @brief Move one step back in history (older), snapshotting the in-progress edit on first use.
+ *
+ */
 static void history_nav_up(void) {
     if (cmd_history_count == 0) return;
 
@@ -1384,6 +1738,10 @@ static void history_nav_up(void) {
     redraw_command_line();
 }
 
+/**
+ * @brief Move one step forward in history (newer); restores the saved in-progress edit at the bottom.
+ *
+ */
 static void history_nav_down(void) {
     if (cmd_history_nav_index < 0) return;
 
@@ -1401,6 +1759,10 @@ static void history_nav_down(void) {
     redraw_command_line();
 }
 
+/**
+ * @brief Exit history navigation mode without restoring the edit backup (called on any typed character).
+ *
+ */
 static void leave_history_navigation_mode(void) {
     if (cmd_history_nav_index >= 0) {
         cmd_history_nav_index = -1;
@@ -1408,6 +1770,10 @@ static void leave_history_navigation_mode(void) {
     }
 }
 
+/**
+ * @brief Delete the character to the left of the cursor (Backspace / ^H).
+ *
+ */
 static void handle_backspace(void) {
     if (cmd_cursor == 0) return;
     leave_history_navigation_mode();
@@ -1417,6 +1783,10 @@ static void handle_backspace(void) {
     redraw_command_line();
 }
 
+/**
+ * @brief Delete the character under the cursor (Delete key / ^D).
+ *
+ */
 static void handle_delete_at_cursor(void) {
     if (cmd_cursor >= cmd_ix) return;
     leave_history_navigation_mode();
@@ -1425,6 +1795,10 @@ static void handle_delete_at_cursor(void) {
     redraw_command_line();
 }
 
+/**
+ * @brief Insert a printable character at the cursor, shifting the rest of the line right.
+ *
+ */
 static void handle_insert_char(char ch) {
     if (cmd_ix >= sizeof(cmd_buffer) - 1) return;
     leave_history_navigation_mode();
@@ -1435,6 +1809,10 @@ static void handle_insert_char(char ch) {
     redraw_command_line();
 }
 
+/**
+ * @brief Erase from the beginning of the line to the cursor (^U).
+ *
+ */
 static void handle_kill_to_bol(void) {
     if (cmd_cursor == 0) return;
     leave_history_navigation_mode();
@@ -1444,6 +1822,10 @@ static void handle_kill_to_bol(void) {
     redraw_command_line();
 }
 
+/**
+ * @brief Erase from the cursor to the end of the line (^K).
+ *
+ */
 static void handle_kill_to_eol(void) {
     if (cmd_cursor >= cmd_ix) return;
     leave_history_navigation_mode();
@@ -1452,26 +1834,37 @@ static void handle_kill_to_eol(void) {
     redraw_command_line();
 }
 
+/**
+ * @brief Move the cursor to the start of the line (Home / ^A).
+ *
+ */
 static void handle_move_home(void) {
     if (cmd_cursor == 0) return;
     cmd_cursor = 0;
     redraw_command_line();
 }
 
+/**
+ * @brief Move the cursor to the end of the line (End / ^E).
+ *
+ */
 static void handle_move_end(void) {
     if (cmd_cursor == cmd_ix) return;
     cmd_cursor = cmd_ix;
     redraw_command_line();
 }
 
+/**
+ * @brief Insert a multi-character string at the cursor (e.g. tab-completion suffix), clamping to buffer capacity.
+ *
+ */
 static void insert_text_at_cursor(const char *text) {
     if (!text || !text[0]) return;
 
     size_t add = strlen(text);
     if (cmd_ix + add >= sizeof(cmd_buffer)) {
         add = (sizeof(cmd_buffer) - 1) - cmd_ix;
-    }
-    if (add == 0) return;
+    }    if (add == 0) return;
 
     leave_history_navigation_mode();
     memmove(&cmd_buffer[cmd_cursor + add], &cmd_buffer[cmd_cursor], cmd_ix - cmd_cursor + 1);
@@ -1481,6 +1874,13 @@ static void insert_text_at_cursor(const char *text) {
     redraw_command_line();
 }
 
+/**
+ * @brief Allocate the camera frame buffer if not already done.
+ *
+ * The buffer holds two frames (cam_ful_size * 2 bytes) for double-buffering.
+ * Allocation is deferred so commands that don't use the camera don't consume the RAM.
+ * @return true if the buffer is ready, false if malloc failed.
+ */
 static bool ensure_cam_buffer_allocated() {
     if (cam_ptr) return true;
 
@@ -1494,6 +1894,13 @@ static bool ensure_cam_buffer_allocated() {
     return true;
 }
 
+/**
+ * @brief Write the camera frame buffer to a file as raw RGB565 bytes.
+ *
+ * Creates or overwrites the file at path.  Writes exactly cam_ful_size * 2 bytes
+ * (little-endian row-major RGB565).
+ * @return true only if both f_write and f_close succeeded without error.
+ */
 static bool save_cam_buffer_to_file(const char *path) {
     FIL fil;
     FRESULT fr = f_open(&fil, path, FA_WRITE | FA_CREATE_ALWAYS);
@@ -1518,6 +1925,13 @@ static bool save_cam_buffer_to_file(const char *path) {
     return FR_OK == fr && FR_OK == close_fr;
 }
 
+/**
+ * @brief Block until a camera frame is ready or the timeout expires, then free the camera on timeout.
+ *
+ * On timeout, frees the camera DMA resources and prints a message so the caller
+ * doesn't need to handle cleanup.
+ * @return true if a frame arrived within timeout_ms, false if it timed out.
+ */
 static bool wait_for_cam_frame_with_timeout(uint32_t timeout_ms) {
     if (cam_wait_for_frame(timeout_ms)) {
         return true;
@@ -1528,6 +1942,12 @@ static bool wait_for_cam_frame_with_timeout(uint32_t timeout_ms) {
     return false;
 }
 
+/**
+ * @brief Clean up after a cam snap operation: close the file, free the camera, and reset all state.
+ *
+ * Called both on success (after the last chunk write) and on error paths.
+ *
+ */
 static void finish_cam_snap(void) {
     if (cam_snap_file_open) {
         FRESULT close_fr = f_close(&cam_snap_file);
@@ -1547,7 +1967,9 @@ static void finish_cam_snap(void) {
     cam_snap_total_written = 0;
 }
 
-//added
+/**
+ * @brief Read one OV5640 register (hex address) over I2C1 and print its value.
+ */
 static void run_cam_rreg(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
 
@@ -1557,7 +1979,9 @@ static void run_cam_rreg(const size_t argc, const char *argv[]) {
 }
 
 
-//added
+/**
+ * @brief Set the camera XCLK frequency via PWM and print the requested vs actual kHz.
+ */
 static void run_cam_xclk(const size_t argc, const char *argv[]){
     if (argc > 1) {
         printf("Usage: cam_xclk [6000..27000]\n");
@@ -1575,7 +1999,9 @@ static void run_cam_xclk(const size_t argc, const char *argv[]){
            (unsigned long)actual_khz);
 }
 
-//added
+/**
+ * @brief Initialise the i2c1 peripheral at 100 kHz and configure its SDA/SCL GPIO pins.
+ */
 static void init_i2c(){
     i2c_inst_t * i2c = i2c1;
     // Initialize I2C port at 100 kHz
@@ -1588,14 +2014,18 @@ static void init_i2c(){
     gpio_pull_up(I2C1_SCL);
 }
 
-//added
+/**
+ * @brief Initialise the I2C1 bus for camera SCCB communication (calls init_i2c()).
+ */
 static void run_cam_i2c_init(const size_t argc, const char *argv[]){
     if(!expect_argc(argc,argv,0)) return;
     
     init_i2c();
 }
 
-//added
+/**
+ * @brief Read and print the OV5640 chip ID from registers 0x300A/0x300B over I2C1.
+ */
 static void run_cam_id(const size_t argc, const char *argv[]){
     if (!expect_argc(argc, argv, 0)) return;
     shared_enter_cam_prog();
@@ -1607,7 +2037,9 @@ static void run_cam_id(const size_t argc, const char *argv[]){
     printf("ID: %d \r\n",reg);
 }
 
-//added
+/**
+ * @brief Apply the original OV5640 default sensor init sequence via sccb_init() (resets size, PLL, color format).
+ */
 static void run_cam_defaults(const size_t argc, const char *argv[]){
     if (!expect_argc(argc, argv, 0)) return;
     // Match the original Waveshare 02-CAM flow:
@@ -1619,29 +2051,32 @@ static void run_cam_defaults(const size_t argc, const char *argv[]){
     printf("Camera default sensor init applied\n");
 }
 
-//added
+/**
+ * @brief Change the camera output resolution: stops the pipeline, reallocates the frame buffer, and writes the new size to the OV5640.
+ */
 static void run_cam_size(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 2)) return;
 
     uint32_t w = (uint32_t)atoi(argv[0]);
     uint32_t h = (uint32_t)atoi(argv[1]);
 
+    // Take I2C1 ownership before writing camera registers (I2C1_SDA is shared with NRF CS).
     shared_enter_cam_prog();
 
-    // stop pipeline and free old buffer
+    // Stop any running capture pipeline so DMA doesn't write into the buffer we are about to free.
     free_cam();
     free(cam_ptr);
     cam_ptr = NULL;
 
-    // update globals — cam.c will use these from now on
+    // Update the global resolution used by all cam.c / command.cpp callers.
     cam_width    = w;
     cam_height   = h;
     cam_ful_size = w * h;
 
-    // tell sensor new output size
+    // Write the new output window to the OV5640 (X_OUTPUT_SIZE_H encodes both W and H in one call).
     OV5640_WR_Reg_2(i2c1, 0x3C, X_OUTPUT_SIZE_H, w, h);
 
-    // reallocate buffer
+    // Allocate the new double-sized buffer (cam_ful_size pixels × 2 bytes/pixel × 2 for double-buffering).
     cam_ptr = (uint8_t *)malloc(cam_ful_size * 2);
     if (!cam_ptr) {
         shared_leave_cam_prog();
@@ -1654,7 +2089,9 @@ static void run_cam_size(const size_t argc, const char *argv[]) {
     printf("Run cam dma then cam start to restart capture, or run cam snap directly\n");
 }
 
-//added
+/**
+ * @brief Write the vertical flip register (TIMING_TC_REG20) of the OV5640 (0=normal, 6=flipped).
+ */
 static void run_cam_flip(const size_t argc, const char* argv[]){
     if(!expect_argc(argc,argv,1)) return;
     uint16_t flip = (uint16_t) atoi(argv[0]);
@@ -1664,7 +2101,9 @@ static void run_cam_flip(const size_t argc, const char* argv[]){
     printf("Flip set to %u\n", flip);
 }
 
-//added
+/**
+ * @brief Write the horizontal mirror register (TIMING_TC_REG21) of the OV5640 (0=normal, 6=mirrored).
+ */
 static void run_cam_mirror(const size_t argc, const char *argv[]){
     if(!expect_argc(argc,argv,1)) return;
     uint16_t mirror = (uint16_t) atoi(argv[0]);
@@ -1674,7 +2113,9 @@ static void run_cam_mirror(const size_t argc, const char *argv[]){
     printf("Mirror set to %u\n", mirror);
 }
 
-//added
+/**
+ * @brief Write the SC_PLL_CONTRL_2 multiplier register to adjust the OV5640 pixel clock speed.
+ */
 static void run_cam_pll(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
 
@@ -1685,7 +2126,9 @@ static void run_cam_pll(const size_t argc, const char *argv[]) {
     printf("PLL multiplier set to %u\n", multiplier);
 }
 
-//added
+/**
+ * @brief Set the OV5640 output color format to either rgb565 or yuv422 by writing FORMAT_CTRL/FORMAT_CTRL00.
+ */
 static void run_cam_format(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
 
@@ -1706,21 +2149,27 @@ static void run_cam_format(const size_t argc, const char *argv[]) {
     }
 }
 
-//added
+/**
+ * @brief Allocate (or reallocate) the raw camera frame buffer to cam_ful_size * 2 bytes.
+ */
 static void run_cam_alloc(const size_t argc, const char *argv[]){
     if(!expect_argc(argc,argv,0)) return;
     if(cam_ptr) free(cam_ptr);
     cam_ptr = (uint8_t *)malloc(cam_ful_size * 2);
 }
 
-//added
+/**
+ * @brief Enable IRQ-driven capture and configure the DMA channel and buffer for the camera pipeline.
+ */
 static void run_cam_dma(const size_t argc, const char *argv[]){
     if(!expect_argc(argc,argv,0)) return;
     cam_set_use_irq(true);
     config_cam_buffer();
 }
 
-//added
+/**
+ * @brief Enable continuous capture mode, enable IRQ, and start the camera PIO/DMA pipeline.
+ */
 static void run_cam_start(const size_t argc, const char *argv[]){
     if(!expect_argc(argc,argv,0)) return;
     cam_set_continuous(true);
@@ -1728,7 +2177,9 @@ static void run_cam_start(const size_t argc, const char *argv[]){
     start_cam();
 }
 
-//added
+/**
+ * @brief Write one OV5640 register (hex address and value) over I2C1 and confirm the write.
+ */
 static void run_cam_wreg(const size_t argc, const char *argv[]){
     if(!expect_argc(argc,argv,2)) return;
     uint16_t reg = (uint16_t)strtol(argv[0], NULL, 16);
@@ -1739,12 +2190,17 @@ static void run_cam_wreg(const size_t argc, const char *argv[]){
     printf("reg 0x%04X = 0x%02X (%u)\n", reg, val, val);
 }
 
-//added
+/**
+ * @brief Stop the camera DMA pipeline and release its resources (calls free_cam()).
+ */
 static void run_cam_stop(const size_t argc, const char *argv[]){
     if(!expect_argc(argc,argv,0)) return ;
     free_cam();
 }
 
+/**
+ * @brief Print a summary of camera state: resolution, buffer pointers, stream flags, FPS, and mirror status.
+ */
 static void run_cam_status(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
     printf("Resolution:      %lux%lu  (%lu pixels)\n",
@@ -1763,7 +2219,9 @@ static void run_cam_status(const size_t argc, const char *argv[]) {
     printf("Display total:   %lu frames\n", (unsigned long)lcd_display_frames_total);
 }
 
-//added
+/**
+ * @brief Capture one frame synchronously (blocking wait up to 2 s) and save it to the given file path.
+ */
 static void run_cam_capture(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
 
@@ -1776,7 +2234,10 @@ static void run_cam_capture(const size_t argc, const char *argv[]) {
     save_cam_buffer_to_file(argv[0]);
 }
 
-//added
+/**
+ * @brief Arm an asynchronous single-frame capture: configure the camera for one-shot mode, then hand off to
+ *        the background state machine which opens the file, writes chunks, and closes it without blocking the shell.
+ */
 static void run_cam_snap(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
     if (!ensure_cam_buffer_allocated()) return;
@@ -1791,6 +2252,7 @@ static void run_cam_snap(const size_t argc, const char *argv[]) {
     fflush(stdout);
     stdio_flush();
 
+    // One-shot mode: disable continuous capture and IRQ so the DMA stops after a single frame.
     cam_set_continuous(false);
     cam_set_use_irq(false);
     buffer_ready = false;
@@ -1798,11 +2260,12 @@ static void run_cam_snap(const size_t argc, const char *argv[]) {
     printf("cam_snap: before start_cam\n");
     fflush(stdout);
     stdio_flush();
-    start_cam();
+    start_cam();  // Begin PIO + DMA capture; process_background_tasks() will observe buffer_ready
     printf("cam_snap: after start_cam\n");
     fflush(stdout);
     stdio_flush();
 
+    // Arm the background state machine.
     cam_snap_deadline = make_timeout_time_ms(2000);
     cam_snap_next_step_time = get_absolute_time();
     cam_snap_pending = true;
@@ -1812,6 +2275,10 @@ static void run_cam_snap(const size_t argc, const char *argv[]) {
     printf("cam_snap: armed\n");
 }
 
+/**
+ * @brief Initialise the LCD panel: align clk_peri, start SPI at 62.5 MHz, run the panel init sequence,
+ *        allocate the framebuffer, clear to white, attempt touch controller init, and set up NRF poll timer.
+ */
 static void run_lcd_init(const size_t argc, const char *argv[]) {
     if (argc > 1) {
         printf("Usage: lcd_init [vertical|horizontal]\n");
@@ -1829,13 +2296,18 @@ static void run_lcd_init(const size_t argc, const char *argv[]) {
         }
     }
 
+    // Configure RST, DC, and CS as GPIO outputs before touching the panel.
     DEV_GPIO_Mode(LCD_RST_PIN, 1);
     DEV_GPIO_Mode(LCD_DC_PIN, 1);
     DEV_GPIO_Mode(LCD_CS_PIN, 1);
 
+    // Keep CS deasserted and DC low (command mode) during setup.
     DEV_Digital_Write(LCD_CS_PIN, 1);
     DEV_Digital_Write(LCD_DC_PIN, 0);
 
+    // clk_peri must be sourced from clk_sys (not the USB PLL) so SPI can reach the
+    // lcd_spi_hz target without being constrained by the 48 MHz USB PLL ceiling.
+    // Sourcing from clk_sys also keeps SPI timing stable if clk_sys is later changed.
     uint32_t sys_hz = clock_get_hz(clk_sys);
     bool ok = clock_configure(
         clk_peri,
@@ -1849,15 +2321,18 @@ static void run_lcd_init(const size_t argc, const char *argv[]) {
         return;
     }
 
+    // Initialise SPI at the requested LCD baud and assign SPI function to the clock/data pins.
     uint actual = spi_init(SPI_PORT, lcd_spi_hz);
     printf("LCD SPI actual: %u Hz\n", actual);
     gpio_set_function(LCD_CLK_PIN, GPIO_FUNC_SPI);
     gpio_set_function(LCD_MOSI_PIN, GPIO_FUNC_SPI);
 
+    // Initialise backlight PWM (start at 0 / off) and run the panel initialisation sequence.
     DEV_PWM_Init();
     DEV_SET_PWM(0);
     LCD_2IN_Init(lcd_scan_dir);
 
+    // Free any previous framebuffer and Mode-B relay buffer before reallocating.
     if (lcd_image) {
         free(lcd_image);
         lcd_image = NULL;
@@ -1874,22 +2349,28 @@ static void run_lcd_init(const size_t argc, const char *argv[]) {
         return;
     }
 
+    // Attach the GUI paint library to the freshly allocated buffer and clear to white.
     Paint_NewImage((UBYTE *)lcd_image, LCD_2IN.WIDTH, LCD_2IN.HEIGHT, 0, WHITE);
-    Paint_SetScale(65);
+    Paint_SetScale(65);  // 65536-colour (16-bit RGB565) palette
     Paint_Clear(WHITE);
-    LCD_2IN_Display(lcd_image);
+    LCD_2IN_Display(lcd_image);  // Push the white frame to the panel so it is immediately visible
 
     lcd_backlight = 0;
     lcd_initialized = true;
+    // Attempt touch controller init (non-fatal: board may not have the CST816D fitted).
     if (touch_init_controller()) {
         printf("Touch initialized (CST816D)\n");
     } else {
         printf("Touch init failed (CST816D not detected)\n");
     }
+    // Reset the NRF event poll timer so nrf_poll_button_event_if_needed() fires immediately.
     nrf_event_poll_next_time = get_absolute_time();
     printf("LCD initialized (%s)\n", lcd_scan_dir == VERTICAL ? "vertical" : "horizontal");
 }
 
+/**
+ * @brief Set the LCD backlight PWM duty cycle (0–100%) and store it in lcd_backlight.
+ */
 static void run_lcd_bl(const size_t argc, const char *argv[]){
     if(!expect_argc(argc,argv,1)) return;
     if(!lcd_initialized){
@@ -1913,6 +2394,9 @@ static void run_lcd_bl(const size_t argc, const char *argv[]){
     printf("LCD backlight set to %u%%\n", (uint8_t)value);
 }
 
+/**
+ * @brief Fill the entire LCD panel with a solid hex RGB565 color.
+ */
 static void run_lcd_clear(const size_t argc , const char *argv[]){
     if(!expect_argc(argc,argv,1)) return;
     if(!lcd_initialized){
@@ -1935,6 +2419,9 @@ static void run_lcd_clear(const size_t argc , const char *argv[]){
     printf("LCD cleared with color 0x%04X\n", (uint16_t)value);
 }
 
+/**
+ * @brief Draw a single pixel at (x, y) with the given hex RGB565 color directly on the LCD panel.
+ */
 static void run_lcd_pixel(const size_t argc, const char *argv[]){
     if(!expect_argc(argc,argv,3)) return;
     if(!lcd_initialized){
@@ -1972,6 +2459,9 @@ static void run_lcd_pixel(const size_t argc, const char *argv[]){
     printf("Drew pixel at (%ld, %ld) with color 0x%04X\n", x, y, (uint16_t)color);
 }
 
+/**
+ * @brief Fill a rectangle on the LCD panel with a solid color, byte-swapping to panel byte order and writing in 64-pixel chunks.
+ */
 static void run_lcd_fillrect(const size_t argc, const char *argv[]){
     if(!expect_argc(argc,argv,5)) return;
     if(!lcd_initialized){
@@ -2020,17 +2510,22 @@ static void run_lcd_fillrect(const size_t argc, const char *argv[]){
         printf("Color out of range: %lu (use hex RGB565, e.g. ffff for white)\n", color);
         return;
     }
+    // The host supplies color as a little-endian uint16 (e.g. 0xF800 = red in RGB565).
+    // The LCD panel expects big-endian (high byte first on the wire), so swap the bytes once here.
     UWORD color_be = (color >> 8) | (color << 8);
+    // Pre-fill a 64-pixel tile with the byte-swapped color for efficient SPI writes.
     UWORD line_buf[64];
 
     for (int i = 0; i < 64; i++) {
         line_buf[i] = color_be;
     }
 
+    // Set the LCD window to the target rectangle and enter RAM-write mode.
     LCD_2IN_SetWindows((uint16_t)x, (uint16_t)y, (uint16_t)(x + w), (uint16_t)(y + h));
     DEV_Digital_Write(LCD_DC_PIN, 1);
     DEV_Digital_Write(LCD_CS_PIN, 0);
 
+    // Write the rectangle pixel-by-pixel in 64-pixel chunks to avoid large stack buffers.
     uint32_t pixels = (uint32_t)w * (uint32_t)h;
     while (pixels > 0) {
         uint32_t chunk = (pixels > 64) ? 64 : pixels;
@@ -2046,6 +2541,9 @@ static void run_lcd_fillrect(const size_t argc, const char *argv[]){
 
 }
 
+/**
+ * @brief Change the LCD scan direction between vertical (portrait) and horizontal (landscape) without reinitialising.
+ */
 static void run_lcd_set_orientation(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
     if (!lcd_initialized) {
@@ -2076,6 +2574,10 @@ static void run_lcd_set_orientation(const size_t argc, const char *argv[]) {
            lcd_scan_dir == VERTICAL ? "vertical" : "horizontal");
 }
 
+/**
+ * @brief Clean up after an LCD image load: close the file if open and reset all load-state variables.
+ *
+ */
 static void finish_lcd_load(void) {
     if (lcd_load_file_open) {
         f_close(&lcd_load_file);
@@ -2089,12 +2591,23 @@ static void finish_lcd_load(void) {
     lcd_load_status_msg[0] = '\0';
 }
 
+/**
+ * @brief Abort an in-progress LCD image load with an error message, then print the prompt.
+ *
+ */
 static void fail_lcd_load(const char *msg) {
     printf("\n%s\n", msg);
     finish_lcd_load();
     print_prompt();
 }
 
+/**
+ * @brief Begin a non-blocking push of the existing lcd_image framebuffer to the screen.
+ *
+ * Used after in-memory operations (e.g. Paint_Clear) that modify lcd_image in place;
+ * skips file I/O and goes directly to the DISPLAY phase of the state machine.
+ * @return true if the push was enqueued, false if another LCD operation is already running.
+ */
 static bool start_lcd_framebuffer_display(const char *status_msg) {
     if (lcd_load_pending) {
         printf("An LCD image operation is already in progress.\n");
@@ -2116,6 +2629,13 @@ static bool start_lcd_framebuffer_display(const char *status_msg) {
     return true;
 }
 
+/**
+ * @brief Update the display FPS counter whenever a frame is pushed to the LCD.
+ *
+ * Uses a 1-second rolling window: counts frames within the window, then
+ * calculates fps = frames / elapsed_us * 1e6 and resets the window.
+ *
+ */
 static void lcd_note_displayed_frame(void) {
     uint64_t now_us = time_us_64();
     if (lcd_display_window_start_us == 0) {
@@ -2133,8 +2653,13 @@ static void lcd_note_displayed_frame(void) {
     }
 }
 
-static void lcd_display_rows_from_framebuffer(uint32_t start_row, uint32_t row_count) {
-    LCD_2IN_SetWindows(0, (UWORD)start_row, LCD_2IN.WIDTH, (UWORD)(start_row + row_count));
+/**
+ * @brief Push a range of rows from the lcd_image framebuffer to the LCD panel via SPI.
+ *
+ * @param start_row First row to transfer (0 = top of screen).
+ * @param row_count Number of rows to transfer.
+ */
+static void lcd_display_rows_from_framebuffer(uint32_t start_row, uint32_t row_count) {    LCD_2IN_SetWindows(0, (UWORD)start_row, LCD_2IN.WIDTH, (UWORD)(start_row + row_count));
     DEV_Digital_Write(LCD_DC_PIN, 1);
     DEV_Digital_Write(LCD_CS_PIN, 0);
     for (uint32_t row = start_row; row < start_row + row_count; ++row) {
@@ -2143,15 +2668,37 @@ static void lcd_display_rows_from_framebuffer(uint32_t start_row, uint32_t row_c
     DEV_Digital_Write(LCD_CS_PIN, 1);
 }
 
-static void lcd_convert_raw_rgb565_to_panel_bytes(const uint8_t *src, uint8_t *dst, uint32_t pixel_count) {
-    for (uint32_t i = 0; i < pixel_count; ++i) {
+/**
+ * @brief Byte-swap each RGB565 pixel from camera byte order to LCD panel byte order.
+ *
+ * Camera DMA produces [LOW_BYTE, HIGH_BYTE] per pixel (little-endian).
+ * The LCD controller expects [HIGH_BYTE, LOW_BYTE] per pixel (big-endian).
+ * This must be applied before writing raw camera data to lcd_image.
+ *
+ * @param src         Source pixel data in camera/little-endian order (2 bytes/pixel).
+ * @param dst         Destination buffer in panel/big-endian order (2 bytes/pixel).
+ * @param pixel_count Number of pixels to convert.
+ */
+static void lcd_convert_raw_rgb565_to_panel_bytes(const uint8_t *src, uint8_t *dst, uint32_t pixel_count) {    for (uint32_t i = 0; i < pixel_count; ++i) {
         dst[i * 2] = src[i * 2 + 1];
         dst[i * 2 + 1] = src[i * 2];
     }
 }
 
-static void lcd_display_raw_rows(uint32_t start_row, uint32_t row_count, const uint8_t *raw_rows) {
-    (void)row_count;
+/**
+ * @brief Push a complete camera frame to the LCD using DMA for maximum throughput.
+ *
+ * Uses 16-bit SPI DMA mode to avoid per-byte CPU overhead. The camera DMA stores pixels
+ * in little-endian byte order; 16-bit SPI mode transmits HIGH byte first automatically,
+ * producing correct RGB565 on the wire without a CPU-side byte swap.
+ * Only acts when start_row == 0; subsequent chunk calls for the same frame are no-ops
+ * because the full frame was already sent on the first call.
+ *
+ * @param start_row  Must be 0 to trigger the transfer; non-zero calls are silently skipped.
+ * @param row_count  Ignored (full frame always sent).
+ * @param raw_rows   Pointer to the camera pixel buffer (camera byte order, full frame).
+ */
+static void lcd_display_raw_rows(uint32_t start_row, uint32_t row_count, const uint8_t *raw_rows) {    (void)row_count;
     if (start_row > 0) {
         // The full frame was sent on start_row==0. Remaining chunk calls are no-ops.
         return;
@@ -2171,10 +2718,10 @@ static void lcd_display_raw_rows(uint32_t start_row, uint32_t row_count, const u
     // Switch SPI to 16-bit mode.
     // The camera DMA stores each pixel as [LOW_BYTE, HIGH_BYTE] in memory (little-endian).
     // In 16-bit SPI mode the hardware reads the 16-bit word (0xHIGH_LOW) and sends
-    // MSB-first → HIGH byte then LOW byte on the wire: correct RGB565, no CPU swap needed.
+    // MSB-first â†’ HIGH byte then LOW byte on the wire: correct RGB565, no CPU swap needed.
     spi_set_format(SPI_PORT, 16, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
 
-    // TX DMA: raw_rows → SPI TX FIFO (full frame, 16-bit words, DMA-paced)
+    // TX DMA: raw_rows â†’ SPI TX FIFO (full frame, 16-bit words, DMA-paced)
     dma_channel_config tx_cfg = dma_channel_get_default_config((uint)spi_tx_dma_ch);
     channel_config_set_transfer_data_size(&tx_cfg, DMA_SIZE_16);
     channel_config_set_dreq(&tx_cfg, spi_get_dreq(SPI_PORT, true));
@@ -2183,7 +2730,7 @@ static void lcd_display_raw_rows(uint32_t start_row, uint32_t row_count, const u
     dma_channel_configure((uint)spi_tx_dma_ch, &tx_cfg,
                           &spi_get_hw(SPI_PORT)->dr, raw_rows, cam_ful_size, false);
 
-    // RX DMA: drain SPI RX FIFO → spi_rx_dummy.
+    // RX DMA: drain SPI RX FIFO â†’ spi_rx_dummy.
     // Without this the 4-deep RX FIFO overflows, which stalls the TX FIFO and kills throughput.
     dma_channel_config rx_cfg = dma_channel_get_default_config((uint)spi_rx_dma_ch);
     channel_config_set_transfer_data_size(&rx_cfg, DMA_SIZE_16);
@@ -2205,6 +2752,16 @@ static void lcd_display_raw_rows(uint32_t start_row, uint32_t row_count, const u
     lcd_note_displayed_frame();
 }
 
+/**
+ * @brief Copy raw camera rows into the lcd_image framebuffer with byte-order conversion.
+ *
+ * Applies lcd_convert_raw_rgb565_to_panel_bytes per row so that subsequent
+ * lcd_display_rows_from_framebuffer calls send correct panel byte order.
+ *
+ * @param start_row First destination row in lcd_image.
+ * @param row_count Number of rows to copy.
+ * @param raw_rows Source buffer of raw camera pixel data (little-endian RGB565).
+ */
 static void lcd_copy_raw_rows_to_framebuffer(uint32_t start_row, uint32_t row_count, const uint8_t *raw_rows) {
     for (uint32_t row = 0; row < row_count; ++row) {
         uint8_t *dst = (uint8_t *)lcd_image + ((start_row + row) * LCD_2IN_WIDTH * 2);
@@ -2213,6 +2770,17 @@ static void lcd_copy_raw_rows_to_framebuffer(uint32_t start_row, uint32_t row_co
     }
 }
 
+/**
+ * @brief Verify that both the LCD and camera are ready for a camera-to-LCD operation.
+ *
+ * Checks: LCD initialized, lcd_image framebuffer allocated, camera frame buffer allocated,
+ * LCD in vertical orientation (required by the current DMA path), and camera resolution
+ * matches LCD dimensions (240×320). Prints a descriptive error and returns false on the
+ * first failing check.
+ *
+ * @param cmd_name Name of the calling command, used in error messages.
+ * @return true if all preconditions are satisfied, false otherwise.
+ */
 static bool ensure_lcd_camera_ready(const char *cmd_name) {
     if (!lcd_initialized) {
         printf("LCD not initialized. Run lcd_init first.\n");
@@ -2241,6 +2809,12 @@ static bool ensure_lcd_camera_ready(const char *cmd_name) {
     return true;
 }
 
+/**
+ * @brief Reset all lcd_cam_snap state after a snapshot completes or is aborted.
+ *
+ * Releases the camera frame buffer, clears the pending flag, and returns the
+ * state machine to idle so the next lcd_cam_snap command can start cleanly.
+ */
 static void finish_lcd_cam_snap(void) {
     free_cam();
     buffer_ready = false;
@@ -2249,8 +2823,14 @@ static void finish_lcd_cam_snap(void) {
     lcd_cam_snap_row = 0;
 }
 
-static void finish_lcd_cam_stream(void) {
-    DEV_Digital_Write(LCD_CS_PIN, 1);  // Safety: deassert CS if stopped mid-frame
+/**
+ * @brief Tear down an active lcd_cam_stream session and release all shared resources.
+ *
+ * Deasserts both LCD and NRF chip-selects (in case streaming was interrupted mid-frame),
+ * restores shared_pin_state to LCD ownership, releases the camera frame buffer and any
+ * Mode-B raw frame buffer, then resets the stream state machine to idle.
+ */
+static void finish_lcd_cam_stream(void) {    DEV_Digital_Write(LCD_CS_PIN, 1);  // Safety: deassert CS if stopped mid-frame
     if (nrf_spi_initialized) {
         gpio_put(nrf_spi_cs_pin, 1);
     }
@@ -2265,6 +2845,10 @@ static void finish_lcd_cam_stream(void) {
     free_mode_b_frame_raw();
 }
 
+/**
+ * @brief Arm an asynchronous one-shot camera capture and display: configures camera for single-shot mode,
+ *        then hands off to the background state machine which waits for a frame and pushes rows to the LCD.
+ */
 static void run_lcd_cam_snap(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
     if (!ensure_lcd_camera_ready("lcd_cam_snap")) return;
@@ -2288,6 +2872,9 @@ static void run_lcd_cam_snap(const size_t argc, const char *argv[]) {
     printf("Capturing and displaying camera frame in background...\n");
 }
 
+/**
+ * @brief Begin a non-blocking load of a raw 240×320 RGB565 file from SD into the LCD framebuffer and panel.
+ */
 static void run_lcd_load_image(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
 
@@ -2322,6 +2909,9 @@ static void run_lcd_load_image(const size_t argc, const char *argv[]) {
     printf("Loading image in background...\n");
 }
 
+/**
+ * @brief Clear the framebuffer to black and enqueue a non-blocking push to the LCD panel.
+ */
 static void run_lcd_unload_image(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
 
@@ -2343,6 +2933,9 @@ static void run_lcd_unload_image(const size_t argc, const char *argv[]) {
     printf("Clearing LCD in background...\n");
 }
 
+/**
+ * @brief Start or stop the continuous camera-to-LCD background stream; with "stop" tears down the stream and clears the screen.
+ */
 static void run_lcd_cam_stream(const size_t argc, const char *argv[]) {
     if (argc > 1) {
         printf("Usage: lcd_cam_stream [stop]\n");
@@ -2369,18 +2962,20 @@ static void run_lcd_cam_stream(const size_t argc, const char *argv[]) {
         printf("Stopping LCD camera stream...\n");
         return;
     }
-
     if (!ensure_lcd_camera_ready("lcd_cam_stream")) return;
     if (cam_snap_pending || lcd_load_pending || lcd_cam_snap_pending || lcd_cam_stream_active) {
         printf("Another camera or LCD operation is already in progress.\n");
         return;
     }
 
-    cam_ptr1 = (uint8_t *)lcd_image;  // reuse the framebuffer as the 2nd capture buffer
-    cam_set_continuous(true);
-    cam_set_use_irq(true);
+    // Point cam_ptr1 at lcd_image so camera DMA can double-buffer into the LCD framebuffer directly.
+    // The stream display path reads cam_display_ptr (which alternates between cam_ptr and cam_ptr1)
+    // so the LCD always shows the most recently completed frame.
+    cam_ptr1 = (uint8_t *)lcd_image;
+    cam_set_continuous(true);  // Keep capturing frames without stopping after the first one
+    cam_set_use_irq(true);     // Use IRQ/DMA path (non-blocking)
     buffer_ready = false;
-    reset_mode_b_transfer_ctx();
+    reset_mode_b_transfer_ctx();     // Ensure no stale Mode-B state from a previous session
     mode_b_stream_locked_frame = NULL;
     config_cam_buffer();
     start_cam();
@@ -2394,6 +2989,9 @@ static void run_lcd_cam_stream(const size_t argc, const char *argv[]) {
     printf("Starting LCD camera stream in background (%s)...\n", pipeline_mode_name(pipeline_mode));
 }
 
+/**
+ * @brief Print LCD init state, orientation, backlight level, and logical pixel dimensions.
+ */
 static void run_lcd_status(const size_t argc, const char *argv[]){
     if(!expect_argc(argc, argv, 0)) return;
     printf("LCD initialized: %s. ", lcd_initialized ? "yes" : "no");
@@ -2403,6 +3001,9 @@ static void run_lcd_status(const size_t argc, const char *argv[]){
            (lcd_scan_dir == VERTICAL) ? LCD_2IN_HEIGHT : LCD_2IN_WIDTH);
 }
 
+/**
+ * @brief Print the rolling capture FPS, display FPS, and cumulative frame counts.
+ */
 static void run_lcd_fps(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
 
@@ -2413,6 +3014,9 @@ static void run_lcd_fps(const size_t argc, const char *argv[]) {
     printf("LCD stream active: %s\n", lcd_cam_stream_active ? "yes" : "no");
 }
 
+/**
+ * @brief Print touch controller init state, event counters, and current mirror setting.
+ */
 static void run_touch_status(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
     printf("Touch initialized: %s\n", touch_initialized ? "yes" : "no");
@@ -2421,6 +3025,16 @@ static void run_touch_status(const size_t argc, const char *argv[]) {
     printf("Mirror state: %s\n", cam_mirror_enabled ? "ON" : "OFF");
 }
 
+/**
+ * @brief Resolve a user-supplied string to a pipeline_mode_t value.
+ *
+ * Accepts "a", "A", or "touch" for PIPE_MODE_A_TOUCH (direct CAM→LCD path),
+ * and "b", "B", or "nrf" for PIPE_MODE_B_NRF (CAM→NRF echo→LCD validation path).
+ *
+ * @param arg String token from the command line.
+ * @param mode_out Receives the resolved mode on success; unchanged on failure.
+ * @return true if arg matched a known mode, false if unrecognized.
+ */
 static bool parse_pipeline_mode_arg(const char *arg, pipeline_mode_t *mode_out) {
     if (!arg || !mode_out) return false;
     if (strcmp(arg, "a") == 0 || strcmp(arg, "A") == 0 || strcmp(arg, "touch") == 0) {
@@ -2434,6 +3048,9 @@ static bool parse_pipeline_mode_arg(const char *arg, pipeline_mode_t *mode_out) 
     return false;
 }
 
+/**
+ * @brief Print active pipeline mode, validation flag, shared-pin owner, and any pending mode switch.
+ */
 static void run_sm_status(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
 
@@ -2448,6 +3065,9 @@ static void run_sm_status(const size_t argc, const char *argv[]) {
     }
 }
 
+/**
+ * @brief Request a pipeline mode switch (a/touch = Mode A, b/nrf = Mode B); deferred to frame boundary if streaming.
+ */
 static void run_sm_mode(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
 
@@ -2465,6 +3085,9 @@ static void run_sm_mode(const size_t argc, const char *argv[]) {
     }
 }
 
+/**
+ * @brief Inject a synthetic touch or NRF event to trigger a pipeline mode request as if raised by hardware.
+ */
 static void run_sm_event(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
 
@@ -2484,6 +3107,9 @@ static void run_sm_event(const size_t argc, const char *argv[]) {
     }
 }
 
+/**
+ * @brief Enable or disable the full NRF echo-validation path for Mode-B streaming (on/off).
+ */
 static void run_sm_validation(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
 
@@ -2500,33 +3126,56 @@ static void run_sm_validation(const size_t argc, const char *argv[]) {
            pipeline_validation_mode_b_enabled ? "enabled" : "disabled");
 }
 
+/**
+ * @brief Configure the shared SPI bus for NRF communication at the requested baud rate.
+ *
+ * Reclaims LCD_CLK/MOSI/MISO/RST pins as SPI, configures I2C1_SDA as the NRF CS
+ * GPIO output (deasserted), and initialises SPI at Mode 0. The LCD must not be
+ * accessed while NRF owns these pins.
+ */
 static bool nrf_spi_prepare_bus(uint32_t requested_hz) {
-    if (requested_hz == 0) requested_hz = 13000000;
+    if (requested_hz == 0) requested_hz = 32000000;  // Guard: caller passed zero; default to SPIS00 full-speed
 
-    DEV_Digital_Write(LCD_CS_PIN, 1);  // Keep LCD deselected during NRF transaction tests.
+    // Keep the LCD chip-select deasserted while NRF owns the bus.
+    DEV_Digital_Write(LCD_CS_PIN, 1);
+
+    // nrf_spi_cs_pin == I2C1_SDA.  This pin is normally pulled up as I2C SDA.
+    // Reinitialise it as a plain GPIO output so we can drive NRF CS manually.
     gpio_init(nrf_spi_cs_pin);
     gpio_set_dir(nrf_spi_cs_pin, GPIO_OUT);
-    gpio_put(nrf_spi_cs_pin, 1);
+    gpio_put(nrf_spi_cs_pin, 1);  // Deasserted (active-low CS)
 
+    // Reclaim the shared LCD/NRF pins as SPI functions.
+    // LCD driver uses these same pins; they must be restored by shared_enter_lcd_active() before any LCD command.
     gpio_set_function(nrf_spi_sck_pin, GPIO_FUNC_SPI);
     gpio_set_function(nrf_spi_mosi_pin, GPIO_FUNC_SPI);
     gpio_set_function(nrf_spi_miso_pin, GPIO_FUNC_SPI);
 
+    // Re-init SPI at the requested baud; spi_init() returns the actual achieved rate.
     nrf_spi_actual_hz = spi_init(SPI_PORT, requested_hz);
+    // The NRF sample firmware runs SPI Mode 0 (CPOL=0, CPHA=0), 8-bit, MSB-first.
     spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
     nrf_spi_initialized = true;
     shared_pin_state = SHARED_PIN_NRF_TRANSACTION;
     return true;
 }
 
-static void nrf_spi_drain_rx_fifo(void) {
-    while (spi_is_readable(SPI_PORT)) {
+/**
+ * @brief Discard any leftover bytes in the SPI RX FIFO before starting a new transfer.
+ *
+ * Stale bytes from a previous transaction would corrupt the RX data of the next transfer
+ * if not cleared first.
+ */
+static void nrf_spi_drain_rx_fifo(void) {    while (spi_is_readable(SPI_PORT)) {
         (void)spi_get_hw(SPI_PORT)->dr;
     }
 }
 
+/**
+ * @brief Configure the shared SPI bus for NRF SPIS00 at the given baud rate (default 32 MHz → ~30 MHz actual on RP2350 @ 150 MHz) and print the pin mapping.
+ */
 static void run_nrf_spi_init(const size_t argc, const char *argv[]) {
-    uint32_t requested_hz = 13000000;
+    uint32_t requested_hz = 32000000;  // SPIS00 (P2) supports up to 32 MHz; RP2350 @ 150 MHz yields 30 MHz actual (SCKDIV=5)
     if (argc > 1) {
         printf("Usage: nrf_spi_init [baud_hz]\n");
         return;
@@ -2547,6 +3196,9 @@ static void run_nrf_spi_init(const size_t argc, const char *argv[]) {
            (unsigned long)nrf_spi_actual_hz);
 }
 
+/**
+ * @brief Print NRF SPI init state, pin mapping, and current actual baud rate.
+ */
 static void run_nrf_spi_status(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
     printf("NRF SPI initialized: %s\n", nrf_spi_initialized ? "yes" : "no");
@@ -2555,13 +3207,16 @@ static void run_nrf_spi_status(const size_t argc, const char *argv[]) {
     printf("Actual baud: %lu Hz\n", (unsigned long)nrf_spi_actual_hz);
 }
 
+/**
+ * @brief Perform one manual full-duplex SPI transfer with hex byte arguments and print the TX and RX bytes.
+ */
 static void run_nrf_spi_xfer(const size_t argc, const char *argv[]) {
     if (argc < 1 || argc > 256) {
         printf("Usage: nrf_spi_xfer <byte0_hex> [byte1_hex] ... [byte255_hex]\n");
         return;
     }
     if (!nrf_spi_initialized) {
-        nrf_spi_prepare_bus(13000000);
+        nrf_spi_prepare_bus(32000000);
     }
 
     uint8_t tx[256];
@@ -2592,6 +3247,9 @@ static void run_nrf_spi_xfer(const size_t argc, const char *argv[]) {
     printf("\n");
 }
 
+/**
+ * @brief Sweep SPI baud rates from start_hz to stop_hz, measuring pass rate and throughput at each step against an expected echo pattern.
+ */
 static void run_nrf_spi_sweep(const size_t argc, const char *argv[]) {
     if (argc != 6) {
         printf("Usage: nrf_spi_sweep <start_hz> <stop_hz> <step_hz> <loops> <tx_hex> <expect_hex>\n");
@@ -2640,9 +3298,11 @@ static void run_nrf_spi_sweep(const size_t argc, const char *argv[]) {
         restore_hz = start_hz;
     }
 
+    // Iterate over each requested baud point.
     for (uint32_t hz = start_hz; hz <= stop_hz; hz += step_hz) {
         nrf_spi_prepare_bus(hz);
-        // One warm-up transfer after baud change so first measured frame is representative.
+        // One warm-up transfer discarded before measurement: ensures the SPI FIFO and slave
+        // state are stable after the baud-rate change so the first timed frame is representative.
         nrf_spi_drain_rx_fifo();
         gpio_put(nrf_spi_cs_pin, 0);
         busy_wait_us_32(nrf_spi_cs_setup_us);
@@ -2651,9 +3311,10 @@ static void run_nrf_spi_sweep(const size_t argc, const char *argv[]) {
         gpio_put(nrf_spi_cs_pin, 1);
         busy_wait_us_32(nrf_spi_frame_gap_us);
 
-        uint32_t ok = 0;
-        uint32_t fail = 0;
+        uint32_t ok = 0;   // Transfers whose RX exactly matched expect[]
+        uint32_t fail = 0; // Transfers that returned a wrong length or wrong data
         uint64_t t0 = time_us_64();
+        // Timed measurement loop: send 'loops' frames and count pass/fail.
         for (uint32_t i = 0; i < loops; ++i) {
             nrf_spi_drain_rx_fifo();
             gpio_put(nrf_spi_cs_pin, 0);
@@ -2670,6 +3331,8 @@ static void run_nrf_spi_sweep(const size_t argc, const char *argv[]) {
             }
         }
         uint64_t dt = time_us_64() - t0;
+        // Compute throughput: total bytes / elapsed seconds, cast to uint32.
+        // The cast is safe because tx_len * loops can't overflow uint64 for practical sweep sizes.
         uint32_t throughput_bps = 0;
         if (dt > 0) {
             throughput_bps = (uint32_t)(((uint64_t)tx_len * loops * 1000000ULL) / dt);
@@ -2679,13 +3342,17 @@ static void run_nrf_spi_sweep(const size_t argc, const char *argv[]) {
                (unsigned long)hz, (unsigned long)nrf_spi_actual_hz,
                (unsigned long)ok, (unsigned long)fail, (unsigned long)throughput_bps);
 
-        if (hz > stop_hz - step_hz) break;  // avoid uint32 overflow in for-loop increment
+        // Guard against uint32 overflow: if incrementing hz would wrap past stop_hz, stop now.
+        if (hz > stop_hz - step_hz) break;
     }
 
     nrf_spi_prepare_bus(restore_hz);
     printf("Sweep done. Restored SPI baud to actual=%lu Hz\n", (unsigned long)nrf_spi_actual_hz);
 }
 
+/**
+ * @brief Run SPI diagnostics: Phase 1 tests all four CPOL/CPHA modes with CS high (loopback), Phase 2 pulses CS low once and prints the slave response.
+ */
 static void run_nrf_spi_diag(const size_t argc, const char *argv[]) {
     uint32_t loops = 16;
     if (argc > 1) {
@@ -2695,12 +3362,11 @@ static void run_nrf_spi_diag(const size_t argc, const char *argv[]) {
     if (argc == 1 && !parse_u32_arg(argv[0], &loops)) {
         printf("Invalid loops value: %s\n", argv[0]);
         return;
-    }
-    if (loops == 0) loops = 1;
+    }    if (loops == 0) loops = 1;
     if (loops > 1000) loops = 1000;
 
     if (!nrf_spi_initialized) {
-        nrf_spi_prepare_bus(13000000);
+        nrf_spi_prepare_bus(32000000);
     }
 
     static const uint8_t tx[8] = {0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18};
@@ -2770,6 +3436,9 @@ static void run_nrf_spi_diag(const size_t argc, const char *argv[]) {
     printf("\n");
 }
 
+/**
+ * @brief Show or tune Mode-B SPI timing: displays current CS setup/hold/gap/chunk values and an FPS estimate, or sets one parameter.
+ */
 static void run_nrf_timing(const size_t argc, const char *argv[]) {
     if (argc == 0) {
         uint32_t chunk_bytes = cam_width * 2u * nrf_validation_rows_per_chunk;
@@ -2835,12 +3504,20 @@ static void run_nrf_timing(const size_t argc, const char *argv[]) {
     }
 }
 
+/**
+ * @brief Print cam group help.
+ *
+ */
 static void print_cam_group_help(void) {
     printf("cam <subcommand> [args]\n");
     printf("Subcommands: xclk, i2c, id, defaults, size, flip, mirror, pll, format,\n");
     printf("             alloc, dma, start, stop, status, rreg, wreg, snap\n");
 }
 
+/**
+ * @brief Print lcd group help.
+ *
+ */
 static void print_lcd_group_help(void) {
     printf("lcd <subcommand> [args]\n");
     printf("Subcommands: init, bl, clear, pixel, fillrect, orient, snap,\n");
@@ -2848,11 +3525,19 @@ static void print_lcd_group_help(void) {
     printf("Examples: lcd stream, lcd stream -s, lcd load 0:/cam/test0.rgb565\n");
 }
 
+/**
+ * @brief Print sm group help.
+ *
+ */
 static void print_sm_group_help(void) {
     printf("sm <subcommand> [args]\n");
     printf("Subcommands: status, mode, event, validation\n");
 }
 
+/**
+ * @brief Print nrf group help.
+ *
+ */
 static void print_nrf_group_help(void) {
     printf("nrf <subcommand> [args]\n");
     printf("Subcommands: init, status, xfer, sweep, diag, timing\n");
@@ -2901,6 +3586,9 @@ static bool get_group_subcommands(const char *group,
     return false;
 }
 
+/**
+ * @brief Dispatch the "cam <subcommand>" group: routes argv[0] to the corresponding run_cam_* handler.
+ */
 static void run_cam_group(const size_t argc, const char *argv[]) {
     if (argc == 0 || strcmp(argv[0], "help") == 0) {
         print_cam_group_help();
@@ -2910,31 +3598,16 @@ static void run_cam_group(const size_t argc, const char *argv[]) {
     const char *sub = argv[0];
     size_t sub_argc = argc - 1;
     const char **sub_argv = argv + 1;
-
-    if (strcmp(sub, "xclk") == 0) run_cam_xclk(sub_argc, sub_argv);
-    else if (strcmp(sub, "i2c") == 0) run_cam_i2c_init(sub_argc, sub_argv);
-    else if (strcmp(sub, "id") == 0) run_cam_id(sub_argc, sub_argv);
-    else if (strcmp(sub, "defaults") == 0) run_cam_defaults(sub_argc, sub_argv);
-    else if (strcmp(sub, "size") == 0) run_cam_size(sub_argc, sub_argv);
-    else if (strcmp(sub, "flip") == 0) run_cam_flip(sub_argc, sub_argv);
-    else if (strcmp(sub, "mirror") == 0) run_cam_mirror(sub_argc, sub_argv);
-    else if (strcmp(sub, "pll") == 0) run_cam_pll(sub_argc, sub_argv);
-    else if (strcmp(sub, "format") == 0) run_cam_format(sub_argc, sub_argv);
-    else if (strcmp(sub, "alloc") == 0) run_cam_alloc(sub_argc, sub_argv);
-    else if (strcmp(sub, "dma") == 0) run_cam_dma(sub_argc, sub_argv);
-    else if (strcmp(sub, "start") == 0) run_cam_start(sub_argc, sub_argv);
-    else if (strcmp(sub, "stop") == 0) run_cam_stop(sub_argc, sub_argv);
-    else if (strcmp(sub, "status") == 0) run_cam_status(sub_argc, sub_argv);
-    else if (strcmp(sub, "rreg") == 0) run_cam_rreg(sub_argc, sub_argv);
-    else if (strcmp(sub, "wreg") == 0) run_cam_wreg(sub_argc, sub_argv);
-    else if (strcmp(sub, "snap") == 0) run_cam_snap(sub_argc, sub_argv);
-    else if (strcmp(sub, "capture") == 0) run_cam_snap(sub_argc, sub_argv); // alias
+    if (strcmp(sub, "xclk") == 0) run_cam_xclk(sub_argc, sub_argv);    else if (strcmp(sub, "i2c") == 0) run_cam_i2c_init(sub_argc, sub_argv);    else if (strcmp(sub, "id") == 0) run_cam_id(sub_argc, sub_argv);    else if (strcmp(sub, "defaults") == 0) run_cam_defaults(sub_argc, sub_argv);    else if (strcmp(sub, "size") == 0) run_cam_size(sub_argc, sub_argv);    else if (strcmp(sub, "flip") == 0) run_cam_flip(sub_argc, sub_argv);    else if (strcmp(sub, "mirror") == 0) run_cam_mirror(sub_argc, sub_argv);    else if (strcmp(sub, "pll") == 0) run_cam_pll(sub_argc, sub_argv);    else if (strcmp(sub, "format") == 0) run_cam_format(sub_argc, sub_argv);    else if (strcmp(sub, "alloc") == 0) run_cam_alloc(sub_argc, sub_argv);    else if (strcmp(sub, "dma") == 0) run_cam_dma(sub_argc, sub_argv);    else if (strcmp(sub, "start") == 0) run_cam_start(sub_argc, sub_argv);    else if (strcmp(sub, "stop") == 0) run_cam_stop(sub_argc, sub_argv);    else if (strcmp(sub, "status") == 0) run_cam_status(sub_argc, sub_argv);    else if (strcmp(sub, "rreg") == 0) run_cam_rreg(sub_argc, sub_argv);    else if (strcmp(sub, "wreg") == 0) run_cam_wreg(sub_argc, sub_argv);    else if (strcmp(sub, "snap") == 0) run_cam_snap(sub_argc, sub_argv);    else if (strcmp(sub, "capture") == 0) run_cam_snap(sub_argc, sub_argv); // alias
     else {
         printf("Unknown cam subcommand: %s\n", sub);
         print_cam_group_help();
     }
 }
 
+/**
+ * @brief Dispatch the "lcd <subcommand>" group: routes argv[0] to the corresponding run_lcd_* handler.
+ */
 static void run_lcd_group(const size_t argc, const char *argv[]) {
     if (argc == 0 || strcmp(argv[0], "help") == 0) {
         print_lcd_group_help();
@@ -2944,16 +3617,7 @@ static void run_lcd_group(const size_t argc, const char *argv[]) {
     const char *sub = argv[0];
     size_t sub_argc = argc - 1;
     const char **sub_argv = argv + 1;
-
-    if (strcmp(sub, "init") == 0) run_lcd_init(sub_argc, sub_argv);
-    else if (strcmp(sub, "bl") == 0) run_lcd_bl(sub_argc, sub_argv);
-    else if (strcmp(sub, "clear") == 0) run_lcd_clear(sub_argc, sub_argv);
-    else if (strcmp(sub, "pixel") == 0) run_lcd_pixel(sub_argc, sub_argv);
-    else if (strcmp(sub, "fillrect") == 0) run_lcd_fillrect(sub_argc, sub_argv);
-    else if (strcmp(sub, "orient") == 0 || strcmp(sub, "orientation") == 0) run_lcd_set_orientation(sub_argc, sub_argv);
-    else if (strcmp(sub, "snap") == 0) run_lcd_cam_snap(sub_argc, sub_argv);
-    else if (strcmp(sub, "load") == 0) run_lcd_load_image(sub_argc, sub_argv);
-    else if (strcmp(sub, "unload") == 0) run_lcd_unload_image(sub_argc, sub_argv);
+    if (strcmp(sub, "init") == 0) run_lcd_init(sub_argc, sub_argv);    else if (strcmp(sub, "bl") == 0) run_lcd_bl(sub_argc, sub_argv);    else if (strcmp(sub, "clear") == 0) run_lcd_clear(sub_argc, sub_argv);    else if (strcmp(sub, "pixel") == 0) run_lcd_pixel(sub_argc, sub_argv);    else if (strcmp(sub, "fillrect") == 0) run_lcd_fillrect(sub_argc, sub_argv);    else if (strcmp(sub, "orient") == 0 || strcmp(sub, "orientation") == 0) run_lcd_set_orientation(sub_argc, sub_argv);    else if (strcmp(sub, "snap") == 0) run_lcd_cam_snap(sub_argc, sub_argv);    else if (strcmp(sub, "load") == 0) run_lcd_load_image(sub_argc, sub_argv);    else if (strcmp(sub, "unload") == 0) run_lcd_unload_image(sub_argc, sub_argv);
     else if (strcmp(sub, "stream") == 0) {
         if (sub_argc >= 1 && (strcmp(sub_argv[0], "-s") == 0 || strcmp(sub_argv[0], "--stop") == 0)) {
             const char *stop_argv[] = {"stop"};
@@ -2961,14 +3625,16 @@ static void run_lcd_group(const size_t argc, const char *argv[]) {
         } else {
             run_lcd_cam_stream(sub_argc, sub_argv);
         }
-    } else if (strcmp(sub, "status") == 0) run_lcd_status(sub_argc, sub_argv);
-    else if (strcmp(sub, "fps") == 0) run_lcd_fps(sub_argc, sub_argv);
+    } else if (strcmp(sub, "status") == 0) run_lcd_status(sub_argc, sub_argv);    else if (strcmp(sub, "fps") == 0) run_lcd_fps(sub_argc, sub_argv);
     else {
         printf("Unknown lcd subcommand: %s\n", sub);
         print_lcd_group_help();
     }
 }
 
+/**
+ * @brief Dispatch the "sm <subcommand>" group: routes argv[0] to the corresponding run_sm_* handler.
+ */
 static void run_sm_group(const size_t argc, const char *argv[]) {
     if (argc == 0 || strcmp(argv[0], "help") == 0) {
         print_sm_group_help();
@@ -2978,17 +3644,16 @@ static void run_sm_group(const size_t argc, const char *argv[]) {
     const char *sub = argv[0];
     size_t sub_argc = argc - 1;
     const char **sub_argv = argv + 1;
-
-    if (strcmp(sub, "status") == 0) run_sm_status(sub_argc, sub_argv);
-    else if (strcmp(sub, "mode") == 0) run_sm_mode(sub_argc, sub_argv);
-    else if (strcmp(sub, "event") == 0) run_sm_event(sub_argc, sub_argv);
-    else if (strcmp(sub, "validation") == 0) run_sm_validation(sub_argc, sub_argv);
+    if (strcmp(sub, "status") == 0) run_sm_status(sub_argc, sub_argv);    else if (strcmp(sub, "mode") == 0) run_sm_mode(sub_argc, sub_argv);    else if (strcmp(sub, "event") == 0) run_sm_event(sub_argc, sub_argv);    else if (strcmp(sub, "validation") == 0) run_sm_validation(sub_argc, sub_argv);
     else {
         printf("Unknown sm subcommand: %s\n", sub);
         print_sm_group_help();
     }
 }
 
+/**
+ * @brief Dispatch the "nrf <subcommand>" group: routes argv[0] to the corresponding run_nrf_* handler.
+ */
 static void run_nrf_group(const size_t argc, const char *argv[]) {
     if (argc == 0 || strcmp(argv[0], "help") == 0) {
         print_nrf_group_help();
@@ -2998,13 +3663,7 @@ static void run_nrf_group(const size_t argc, const char *argv[]) {
     const char *sub = argv[0];
     size_t sub_argc = argc - 1;
     const char **sub_argv = argv + 1;
-
-    if (strcmp(sub, "init") == 0) run_nrf_spi_init(sub_argc, sub_argv);
-    else if (strcmp(sub, "status") == 0) run_nrf_spi_status(sub_argc, sub_argv);
-    else if (strcmp(sub, "xfer") == 0) run_nrf_spi_xfer(sub_argc, sub_argv);
-    else if (strcmp(sub, "sweep") == 0) run_nrf_spi_sweep(sub_argc, sub_argv);
-    else if (strcmp(sub, "diag") == 0) run_nrf_spi_diag(sub_argc, sub_argv);
-    else if (strcmp(sub, "timing") == 0) run_nrf_timing(sub_argc, sub_argv);
+    if (strcmp(sub, "init") == 0) run_nrf_spi_init(sub_argc, sub_argv);    else if (strcmp(sub, "status") == 0) run_nrf_spi_status(sub_argc, sub_argv);    else if (strcmp(sub, "xfer") == 0) run_nrf_spi_xfer(sub_argc, sub_argv);    else if (strcmp(sub, "sweep") == 0) run_nrf_spi_sweep(sub_argc, sub_argv);    else if (strcmp(sub, "diag") == 0) run_nrf_spi_diag(sub_argc, sub_argv);    else if (strcmp(sub, "timing") == 0) run_nrf_timing(sub_argc, sub_argv);
     else {
         printf("Unknown nrf subcommand: %s\n", sub);
         print_nrf_group_help();
@@ -3147,7 +3806,8 @@ static cmd_def_t cmds[] = {
      " Print touch init state and mirror event counters."},
     {"nrf_spi_init", run_nrf_spi_init,
      "nrf_spi_init [baud_hz]:\n"
-     " Configure shared SPI pins for NRF validation (default 13MHz request)."},
+     " Configure shared SPI pins for NRF SPIS00 (default 32 MHz request, ~30 MHz actual @ 150 MHz sysclk).\n"
+     " Requires nRF54L15 wired on P2.06/P2.08/P2.09/P2.10 (HSSPI dedicated pins)."},
     {"nrf_spi_status", run_nrf_spi_status,
      "nrf_spi_status:\n"
      " Show NRF SPI pin mapping and current baud rate."},
@@ -3168,10 +3828,10 @@ static cmd_def_t cmds[] = {
      "nrf_timing [gap|setup|hold|chunk <val>]:\n"
      " Show or tune Mode-B transfer timing.\n"
      " No args: print current values + FPS estimate.\n"
-     " nrf_timing gap   <us>   - inter-frame gap (default 200, try 50-100)\n"
-     " nrf_timing setup <us>   - CS setup before SCK (default 15, try 10)\n"
-     " nrf_timing hold  <us>   - CS hold after SCK  (default 4,  try 2)\n"
-     " nrf_timing chunk <rows> - rows per transfer   (default 4,  max 16)"},
+     " nrf_timing gap   <us>   - inter-frame gap  (default 200, HSSPI: try 50)\n"
+     " nrf_timing setup <us>   - CS setup before SCK (default 15,  HSSPI: try 2)\n"
+     " nrf_timing hold  <us>   - CS hold after SCK   (default 4,   HSSPI: try 2)\n"
+     " nrf_timing chunk <rows> - rows per transfer   (default 4,   HSSPI: try 8)"},
     {"cam_xclk", run_cam_xclk,
      "cam_xclk [<freq_khz>]:\n"
      " Set camera XCLK frequency. Default 24000\n"
@@ -3295,6 +3955,9 @@ static cmd_def_t cmds[] = {
      "help:\n"
      " Shows this command help."}
 };
+/**
+ * @brief Print the help string for every registered command, one per line.
+ */
 static void run_help(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
 
@@ -3305,9 +3968,18 @@ static void run_help(const size_t argc, const char *argv[]) {
     stdio_flush();
 }
 
+/**
+ * @brief Complete the token under the cursor using the registered command table or group subcommand lists.
+ *
+ * Case 1 (no space before cursor): matches against top-level command names.
+ * Case 2 (space before cursor, first token is a group): matches against that group's subcommand list.
+ * In both cases: single match appends the suffix and a trailing space; multiple matches prints the list;
+ * exact match with multiple prefix-siblings inserts a space instead of listing ambiguous completions.
+ */
 static void handle_tab_completion(void) {
     if (cmd_cursor == 0) return;
 
+    // Find the position of the first space before the cursor to determine which token we are completing.
     size_t first_space = cmd_cursor;
     for (size_t i = 0; i < cmd_cursor; ++i) {
         if (isspace((unsigned char)cmd_buffer[i])) {
@@ -3316,13 +3988,14 @@ static void handle_tab_completion(void) {
         }
     }
 
-    // Case 1: completing the first token (command name)
+    // Case 1: no space found before cursor — we are completing the command name (first token).
     if (first_space == cmd_cursor) {
         char prefix[sizeof(cmd_buffer)];
         memcpy(prefix, cmd_buffer, cmd_cursor);
         prefix[cmd_cursor] = '\0';
         size_t prefix_len = cmd_cursor;
 
+        // Scan every registered command for entries whose name starts with the typed prefix.
         size_t match_idx[count_of(cmds)];
         size_t match_count = 0;
         bool has_exact = false;
@@ -3330,22 +4003,24 @@ static void handle_tab_completion(void) {
             if (strncmp(cmds[i].command, prefix, prefix_len) == 0) {
                 match_idx[match_count++] = i;
                 if (strcmp(cmds[i].command, prefix) == 0) {
-                    has_exact = true;
+                    has_exact = true;  // The typed text already names a command exactly.
                 }
             }
         }
 
         if (match_count == 0) {
-            printf("\a");
+            printf("\a");  // Bell: no match found.
             stdio_flush();
             return;
         }
 
         if (match_count == 1) {
+            // Unique match: fill in the remainder of the command name.
             const char *only = cmds[match_idx[0]].command;
             if (cmd_cursor == cmd_ix && strlen(only) > prefix_len) {
                 insert_text_at_cursor(only + prefix_len);
             }
+            // Append a space so the user can immediately type the first argument.
             if (cmd_cursor == cmd_ix &&
                 cmd_ix < sizeof(cmd_buffer) - 1 &&
                 (cmd_ix == 0 || cmd_buffer[cmd_ix - 1] != ' ')) {
@@ -3354,8 +4029,8 @@ static void handle_tab_completion(void) {
             return;
         }
 
-        // If the typed token is already an exact command, prefer adding a space
-        // instead of dumping a huge list of similarly prefixed aliases.
+        // Multiple matches but the typed text is already an exact command name:
+        // prefer inserting a space over listing a potentially large set of similarly-prefixed aliases.
         if (has_exact && cmd_cursor == cmd_ix &&
             cmd_ix < sizeof(cmd_buffer) - 1 &&
             (cmd_ix == 0 || cmd_buffer[cmd_ix - 1] != ' ')) {
@@ -3363,6 +4038,7 @@ static void handle_tab_completion(void) {
             return;
         }
 
+        // Ambiguous: print all matching command names and redraw the line.
         printf("\n");
         for (size_t m = 0; m < match_count; ++m) {
             printf("%s  ", cmds[match_idx[m]].command);
@@ -3372,7 +4048,7 @@ static void handle_tab_completion(void) {
         return;
     }
 
-    // Case 2: completing only the second token for grouped commands (cam/lcd/sm/nrf)
+    // Case 2: space found — first token is a group command; complete the second token (subcommand).
     char group[32];
     size_t group_len = first_space;
     if (group_len == 0 || group_len >= sizeof(group)) return;
@@ -3382,27 +4058,31 @@ static void handle_tab_completion(void) {
     const char *const *subcmds = NULL;
     size_t subcmd_count = 0;
     if (!get_group_subcommands(group, &subcmds, &subcmd_count)) {
-        return; // no subcommand completion for other commands
+        return; // Not a grouped command; no subcommand completion available.
     }
 
+    // Skip whitespace after the group name to find where the subcommand token starts.
     size_t sub_start = first_space;
     while (sub_start < cmd_cursor && isspace((unsigned char)cmd_buffer[sub_start])) {
         sub_start++;
     }
 
-    // If cursor is already in arg3+ area, don't autocomplete.
+    // If there is already another space between sub_start and cursor, we are in arg3+ territory;
+    // only complete the second token, not further arguments.
     for (size_t i = sub_start; i < cmd_cursor; ++i) {
         if (isspace((unsigned char)cmd_buffer[i])) {
             return;
         }
     }
 
+    // Extract the partial subcommand token typed so far.
     char sub_prefix[sizeof(cmd_buffer)];
     size_t sub_prefix_len = cmd_cursor - sub_start;
     if (sub_prefix_len >= sizeof(sub_prefix)) return;
     memcpy(sub_prefix, &cmd_buffer[sub_start], sub_prefix_len);
     sub_prefix[sub_prefix_len] = '\0';
 
+    // Match partial subcommand against the group's subcommand list.
     size_t match_idx[32];
     size_t match_count = 0;
     bool has_exact = false;
@@ -3418,12 +4098,13 @@ static void handle_tab_completion(void) {
     }
 
     if (match_count == 0) {
-        printf("\a");
+        printf("\a");  // Bell: no subcommand match.
         stdio_flush();
         return;
     }
 
     if (match_count == 1) {
+        // Unique subcommand match: fill suffix and add trailing space.
         const char *only = subcmds[match_idx[0]];
         if (cmd_cursor == cmd_ix && strlen(only) > sub_prefix_len) {
             insert_text_at_cursor(only + sub_prefix_len);
@@ -3435,7 +4116,7 @@ static void handle_tab_completion(void) {
         }
         return;
     }
-
+    // Exact subcommand name typed but siblings exist: prefer space to avoid listing them.
     if (has_exact && cmd_cursor == cmd_ix &&
         cmd_ix < sizeof(cmd_buffer) - 1 &&
         (cmd_ix == 0 || cmd_buffer[cmd_ix - 1] != ' ')) {
@@ -3443,6 +4124,7 @@ static void handle_tab_completion(void) {
         return;
     }
 
+    // Ambiguous subcommand: print all matches and redraw.
     printf("\n");
     for (size_t m = 0; m < match_count; ++m) {
         printf("%s  ", subcmds[match_idx[m]]);
@@ -3452,8 +4134,14 @@ static void handle_tab_completion(void) {
 }
 
 // Break command
-static void chars_available_callback(void *ptr) {
-    (void)ptr;   
+/**
+ * @brief stdio chars-available IRQ callback used to interrupt long-running command handlers.
+ *
+ * Registered via stdio_set_chars_available_callback while a command handler is running.
+ * Ctrl-C triggers a system reset, Esc hits a breakpoint (debug aid), and CR sets the
+ * `die` flag so the handler can abort cleanly on the next iteration.
+ */
+static void chars_available_callback(void *ptr) {    (void)ptr;   
     int cRxedChar = getchar_timeout_us(0);
     switch (cRxedChar) {
     case 3: // Ctrl-C
@@ -3467,20 +4155,34 @@ static void chars_available_callback(void *ptr) {
     }
 }
 
+/**
+ * @brief Tokenize a completed command line and dispatch to the matching handler.
+ *
+ * Splits cmd on spaces with strtok_r: the first token is the command name, subsequent
+ * tokens become argv[0..argc-1] (argv[0] is the first *argument*, not the command name).
+ * Looks up the command name in the cmds table; registers the break-key callback around
+ * the handler call so Ctrl-C / CR can abort long-running operations.
+ *
+ * @param cmd_sz Capacity of the cmd buffer (used for bounds assertions).
+ * @param cmd    Mutable command-line buffer; modified in-place by strtok_r.
+ */
 static void process_cmd(size_t cmd_sz, char *cmd) {
+    // Command dispatcher: tokenize input, resolve handler, and execute with argc/argv.
     assert(cmd);
     assert(cmd[0]);
+
+    // Token 1 is the command name.
     char *cmdn = strtok_r(cmd, " ", &saveptr);
     if (cmdn) {
         assert(cmdn < cmd + cmd_sz);
 
-        /* Breaking with Unix tradition of argv[0] being command name,
-        argv[0] is first argument after command name */
-
+        // argv[0] is the first argument after the command name (not the command name itself).
         size_t argc = 0;
-        const char *argv[10] = {0}; // Arbitrary limit of 10 arguments
+        // 10 slots is generous for every command in this shell; overflow is rejected by the dispatcher.
+        const char *argv[10] = {0};
         const char *arg_p;
         do {
+            // Remaining tokens become argv[0..argc-1].
             arg_p = strtok_r(NULL, " ", &saveptr);
             if (arg_p) {
                 assert(arg_p < cmd + cmd_sz);
@@ -3496,9 +4198,9 @@ static void process_cmd(size_t cmd_sz, char *cmd) {
         for (i = 0; i < count_of(cmds); ++i) {
             if (0 == strcmp(cmds[i].command, cmdn)) {
                 
-                // get notified when there are input characters available
+                // Allow long-running handlers to observe break keys via callback.
                 stdio_set_chars_available_callback(chars_available_callback, NULL);
-                // run the command
+                // Dispatch command handler.
                 (*cmds[i].function)(argc, argv);
                 stdio_set_chars_available_callback(NULL, NULL);
 
@@ -3509,22 +4211,32 @@ static void process_cmd(size_t cmd_sz, char *cmd) {
     }
 }
 
+/**
+ * @brief Process one input byte from stdio: run the ANSI escape FSM, handle readline shortcuts,
+ *        insert/delete characters, and dispatch the command on CR/LF.
+ */
 void process_stdio(int cRxedChar) {
+    // ANSI escape sequence FSM states.
+    // Transitions: NONE -> ESC_SEEN (on ESC) -> ESC_CSI (on '[') -> action (on final byte)
+    // ESC_CSI_3 handles the two-byte Delete sequence: ESC [ 3 ~
     enum esc_state_t {
         ESC_NONE = 0,
-        ESC_SEEN,
-        ESC_CSI,
-        ESC_CSI_3,
+        ESC_SEEN,    // Received ESC (0x1B); waiting for '['
+        ESC_CSI,     // Received ESC '['; waiting for the final byte
+        ESC_CSI_3,   // Received ESC '[' '3'; waiting for '~' (Delete key)
     };
     static enum esc_state_t esc_state = ESC_NONE;
 
+    // Reject multi-byte UTF-8 and NUL; this shell only handles 7-bit ASCII.
     if (!(0 < cRxedChar && cRxedChar <= 0x7F)) {
-        return; // Not dealing with multibyte characters
+        return;
     }
 
     if (esc_state != ESC_NONE) {
+        // We are mid-sequence in the ANSI escape FSM; route byte accordingly.
         switch (esc_state) {
         case ESC_SEEN:
+            // Waiting for CSI introducer '['; anything else aborts the sequence.
             if (cRxedChar == '[') {
                 esc_state = ESC_CSI;
             } else {
@@ -3532,34 +4244,35 @@ void process_stdio(int cRxedChar) {
             }
             return;
         case ESC_CSI:
+            // Received ESC '['; the next byte selects the action.
             switch (cRxedChar) {
-            case 'A':  // Up
+            case 'A':  // Up arrow: older history entry
                 history_nav_up();
                 break;
-            case 'B':  // Down
+            case 'B':  // Down arrow: newer history entry
                 history_nav_down();
                 break;
-            case 'C':  // Right
+            case 'C':  // Right arrow: move cursor one character right
                 if (cmd_cursor < cmd_ix) {
                     cmd_cursor++;
                     redraw_command_line();
                 }
                 break;
-            case 'D':  // Left
+            case 'D':  // Left arrow: move cursor one character left
                 if (cmd_cursor > 0) {
                     cmd_cursor--;
                     redraw_command_line();
                 }
                 break;
-            case 'H':  // Home
+            case 'H':  // Home: move cursor to beginning of line
                 cmd_cursor = 0;
                 redraw_command_line();
                 break;
-            case 'F':  // End
+            case 'F':  // End: move cursor to end of line
                 cmd_cursor = cmd_ix;
                 redraw_command_line();
                 break;
-            case '3':  // Delete (expects '~')
+            case '3':  // Start of Delete key sequence (ESC [ 3 ~): wait for the '~'
                 esc_state = ESC_CSI_3;
                 return;
             default:
@@ -3568,6 +4281,7 @@ void process_stdio(int cRxedChar) {
             esc_state = ESC_NONE;
             return;
         case ESC_CSI_3:
+            // Complete the Delete sequence: ESC [ 3 ~
             if (cRxedChar == '~') {
                 handle_delete_at_cursor();
             }
@@ -3578,36 +4292,34 @@ void process_stdio(int cRxedChar) {
             break;
         }
     }
-
-    if (cRxedChar == 27) {  // ESC
+    if (cRxedChar == 27) {  // ESC: begin ANSI escape sequence
         esc_state = ESC_SEEN;
         return;
     }
 
-    // Linux-style readline shortcuts
-    if (cRxedChar == 1) {   // Ctrl+A: start of line
+    // Readline-compatible editing shortcuts (Emacs bindings).
+    if (cRxedChar == 1) {   // Ctrl+A: move to start of line
         handle_move_home();
         return;
-    }
-    if (cRxedChar == 5) {   // Ctrl+E: end of line
+    }    if (cRxedChar == 5) {   // Ctrl+E: move to end of line
         handle_move_end();
         return;
-    }
-    if (cRxedChar == 11) {  // Ctrl+K: delete from cursor to end of line
+    }    if (cRxedChar == 11) {  // Ctrl+K: kill from cursor to end of line
         handle_kill_to_eol();
         return;
-    }
-    if (cRxedChar == 21) {  // Ctrl+U: delete from cursor to beginning of line
+    }    if (cRxedChar == 21) {  // Ctrl+U: kill from start of line to cursor
         handle_kill_to_bol();
         return;
     }
-
+    // Discard any other non-printable byte that is not one of the handled specials below.
     if (!isprint(cRxedChar) && '\r' != cRxedChar && '\n' != cRxedChar &&
         '\t' != cRxedChar &&
         '\b' != cRxedChar && cRxedChar != 127) {
         return;
     }
 
+    // CRLF handling: Windows/serial terminals send CR then LF; suppress the LF so we don't
+    // process two Enter events from one keypress.
     if (cRxedChar == '\n' && last_input_was_cr) {
         last_input_was_cr = false;
         return;
@@ -3616,27 +4328,28 @@ void process_stdio(int cRxedChar) {
         last_input_was_cr = (cRxedChar == '\r');
         printf("%c", cRxedChar);  // echo Enter
         stdio_flush();
-        /* Just to space the output from the input. */
+        // Print a blank line so command output starts on a fresh line below the prompt.
         printf("%c", '\n');
         stdio_flush();
 
-        if (!cmd_buffer[0]) {  // Empty input
+        if (!cmd_buffer[0]) {  // Empty line: just reprint the prompt and do nothing
             reset_command_line_state();
             print_prompt();
             return;
         }
 
+        // Save to history before strtok_r mutates cmd_buffer during dispatch.
         add_command_to_history(cmd_buffer);
 
-        /* Process the input string received prior to the newline. */
+        // Tokenize and dispatch the completed command line.
         process_cmd(sizeof cmd_buffer, cmd_buffer);
 
-        /* Reset everything for next cmd */
+        // Clear all edit state for the next command line.
         reset_command_line_state();
         memset(cmd_buffer, 0, sizeof cmd_buffer);
         printf("\n");
         print_prompt();
-    } else {  // Not newline
+    } else {  // Printable character, Tab, or Backspace/Delete
         last_input_was_cr = false;
         if (cRxedChar == '\t') {
             handle_tab_completion();
@@ -3648,23 +4361,45 @@ void process_stdio(int cRxedChar) {
     }
 }
 
+/**
+ * @brief Internal helper: command input in progress.
+ *
+ * @return `true` on success, `false` otherwise.
+ */
 bool command_input_in_progress(void) {
     return cmd_ix > 0;
 }
 
+/**
+ * @brief Run all non-blocking background state machines once per main-loop iteration.
+ *
+ * Called from the main loop as frequently as possible.  Each state machine checks its
+ * own pending flag and time guard before doing any work, so back-to-back calls are cheap
+ * when nothing is due.  The four machines are:
+ *   1. cam_snap        — single-frame capture to SD file
+ *   2. lcd_cam_snap    — single-frame capture to LCD display
+ *   3. lcd_cam_stream  — continuous camera-to-LCD preview (Mode A or Mode B)
+ *   4. lcd_load        — raw image file load from SD to LCD
+ */
 void process_background_tasks(void) {
+    // Run lightweight per-frame housekeeping before the heavier state machines.
+    // These are cheap: pipeline_apply checks a flag, touch/nrf poll check timestamps.
     pipeline_apply_pending_mode_if_safe();
     touch_handle_mirror_event_if_needed();
     nrf_poll_button_event_if_needed();
 
+    // --- State machine 1: cam_snap (single frame -> SD file) ---
+    // Phases: WAIT_FRAME -> OPEN_FILE -> WRITE_FILE (repeated) -> CLOSE_FILE
     if (cam_snap_pending && time_reached(cam_snap_next_step_time)) {
         switch (cam_snap_state) {
         case CAM_SNAP_WAIT_FRAME:
+            // Poll cam_wait_for_frame() non-blocking (timeout=0); advance when DMA signals a complete frame.
             if (cam_wait_for_frame(0)) {
                 cam_snap_state = CAM_SNAP_OPEN_FILE;
                 cam_snap_next_step_time = delayed_by_ms(get_absolute_time(), 1);
                 return;
             }
+            // Timeout guard: if the camera hasn't produced a frame within 2 s, abort.
             if (time_reached(cam_snap_deadline)) {
                 finish_cam_snap();
                 printf("\nCamera capture timed out after 2000 ms\n");
@@ -3673,6 +4408,7 @@ void process_background_tasks(void) {
             return;
 
         case CAM_SNAP_OPEN_FILE: {
+            // Create the destination file; abort the snap on any FatFS error.
             FRESULT fr = f_open(&cam_snap_file, cam_snap_path, FA_WRITE | FA_CREATE_ALWAYS);
             if (FR_OK != fr) {
                 printf("\nf_open error: %s (%d)\n", FRESULT_str(fr), fr);
@@ -3687,8 +4423,10 @@ void process_background_tasks(void) {
         }
 
         case CAM_SNAP_WRITE_FILE: {
+            // Write one chunk (cam_snap_chunk_size bytes) per tick to keep the main loop responsive.
             uint32_t total_bytes = cam_ful_size * 2;
             if (cam_snap_write_offset >= total_bytes) {
+                // All data written; proceed to close the file.
                 cam_snap_state = CAM_SNAP_CLOSE_FILE;
                 return;
             }
@@ -3696,7 +4434,7 @@ void process_background_tasks(void) {
             UINT chunk = cam_snap_chunk_size;
             uint32_t remaining = total_bytes - cam_snap_write_offset;
             if (remaining < chunk) {
-                chunk = (UINT)remaining;
+                chunk = (UINT)remaining;  // Last partial chunk
             }
 
             UINT bw = 0;
@@ -3719,6 +4457,7 @@ void process_background_tasks(void) {
         }
 
         case CAM_SNAP_CLOSE_FILE: {
+            // Copy path and byte count before finish_cam_snap() resets them.
             char completed_path[sizeof(cam_snap_path)];
             strlcpy(completed_path, cam_snap_path, sizeof(completed_path));
             UINT completed_written = cam_snap_total_written;
@@ -3734,15 +4473,19 @@ void process_background_tasks(void) {
         }
     }
 
+    // --- State machine 2: lcd_cam_snap (single frame -> LCD) ---
+    // Phases: WAIT_FRAME -> DISPLAY_ROWS (repeated until all rows sent)
     if (lcd_cam_snap_pending && time_reached(lcd_cam_snap_next_step_time)) {
         switch (lcd_cam_snap_state) {
         case LCD_CAM_SNAP_WAIT_FRAME:
+            // Poll for a complete frame; advance once the DMA buffer is ready.
             if (cam_wait_for_frame(0)) {
                 lcd_cam_snap_state = LCD_CAM_SNAP_DISPLAY_ROWS;
                 lcd_cam_snap_row = 0;
                 lcd_cam_snap_next_step_time = delayed_by_ms(get_absolute_time(), 1);
                 return;
             }
+            // Abort on timeout (2 s).
             if (time_reached(lcd_cam_snap_deadline)) {
                 finish_lcd_cam_snap();
                 printf("\nLCD camera snapshot timed out after 2000 ms\n");
@@ -3751,6 +4494,8 @@ void process_background_tasks(void) {
             return;
 
         case LCD_CAM_SNAP_DISPLAY_ROWS: {
+            // Push one chunk of rows per tick using DMA; lcd_display_raw_rows() handles the full frame
+            // on the first call (start_row == 0) and is a no-op for subsequent calls.
             if (lcd_cam_snap_row >= cam_height) {
                 finish_lcd_cam_snap();
                 printf("\nCaptured and displayed camera frame on LCD\n");
@@ -3777,15 +4522,19 @@ void process_background_tasks(void) {
         }
     }
 
+    // --- State machine 3: lcd_cam_stream (continuous camera -> LCD) ---
+    // Phases: WAIT_FRAME -> DISPLAY_ROWS (back to WAIT_FRAME each frame)
     if (lcd_cam_stream_active && time_reached(lcd_cam_stream_next_step_time)) {
         switch (lcd_cam_stream_state) {
         case LCD_CAM_STREAM_WAIT_FRAME:
+            // Non-blocking poll for a fresh camera frame from DMA.
             if (cam_wait_for_frame(0)) {
                 lcd_cam_stream_state = LCD_CAM_STREAM_DISPLAY_ROWS;
                 lcd_cam_stream_row = 0;
-                lcd_cam_stream_next_step_time = get_absolute_time();
+                lcd_cam_stream_next_step_time = get_absolute_time();  // No inter-tick delay in display phase
                 return;
             }
+            // Per-frame timeout: if camera stops producing frames (e.g. PIO stall), stop the stream.
             if (time_reached(lcd_cam_stream_deadline)) {
                 finish_lcd_cam_stream();
                 printf("\nLCD camera stream timed out after 2000 ms\n");
@@ -3795,6 +4544,7 @@ void process_background_tasks(void) {
 
         case LCD_CAM_STREAM_DISPLAY_ROWS: {
             if (lcd_cam_stream_row >= cam_height) {
+                // All rows for this frame have been sent; re-arm the camera and wait for the next frame.
                 buffer_ready = false;
                 config_cam_buffer();
                 start_cam();
@@ -3810,6 +4560,7 @@ void process_background_tasks(void) {
             }
 
             if (pipeline_mode == PIPE_MODE_B_NRF && pipeline_validation_mode_b_enabled) {
+                // Mode B: relay the frame through the NRF loopback path one chunk at a time.
                 // Lock cam_display_ptr at the start of each new frame transfer.
                 // cam_display_ptr flips every ~40ms (camera DMA), but Mode B needs
                 // ~80ms to relay one frame chunk-by-chunk. Without locking, the pointer
@@ -3819,25 +4570,28 @@ void process_background_tasks(void) {
                 }
                 int st = pipeline_mode_b_transfer_frame_via_nrf_to_lcd(mode_b_stream_locked_frame);
                 if (st < 0) {
-                    // NRF SPI error: reset context, fall back to Mode A and continue stream.
+                    // NRF SPI error (all-0xFF or echo mismatch): abandon this frame,
+                    // fall back to Mode A, and block NRF events for mode_b_fail_block_ms.
                     reset_mode_b_transfer_ctx();
                     mode_b_stream_locked_frame = NULL;
                     pipeline_force_mode_now(PIPE_MODE_A_TOUCH, PIPE_REQ_SHELL);
                     nrf_event_block_until = delayed_by_ms(get_absolute_time(), mode_b_fail_block_ms);
                     printf("\nMode-B transfer failed (NRF SPI). Falling back to mode A.\n");
                     print_prompt();
-                    lcd_cam_stream_row = cam_height;
+                    lcd_cam_stream_row = cam_height;  // Skip remaining rows; restart at frame boundary
                     lcd_cam_stream_next_step_time = get_absolute_time();
                     return;
                 }
                 if (st == 0) {
-                    // Still transferring this frame; revisit next tick.
+                    // Still transferring this frame (chunks remain); schedule next tick.
                     lcd_cam_stream_next_step_time = delayed_by_ms(get_absolute_time(), 1);
                     return;
                 }
-                // st == 1: frame relayed and displayed; fall through to reset loop.
+                // st == 1: Mode-B frame fully validated and displayed; fall through to advance row counter.
                 mode_b_stream_locked_frame = NULL;
             } else {
+                // Mode A: direct DMA push of camera data to LCD (no NRF relay).
+                // If a stale Mode-B context exists (e.g. from a mid-stream mode switch), discard it.
                 if (mode_b_ctx.active) {
                     reset_mode_b_transfer_ctx();
                 }
@@ -3846,7 +4600,8 @@ void process_background_tasks(void) {
                                      row_count,
                                      cam_display_ptr + (lcd_cam_stream_row * cam_width * 2));
             }
-            lcd_cam_stream_row = cam_height;  // DMA sent the full frame; skip the 19 remaining no-op chunks
+            // lcd_display_raw_rows() sends the full frame on row 0 via DMA; mark all rows done.
+            lcd_cam_stream_row = cam_height;
             lcd_cam_stream_next_step_time = get_absolute_time();
             return;
         }
@@ -3857,6 +4612,8 @@ void process_background_tasks(void) {
         }
     }
 
+    // --- State machine 4: lcd_load (SD image file -> framebuffer -> LCD) ---
+    // Early-exit when no load is pending or the next step is not yet due.
     if (!lcd_load_pending) {
         return;
     }
@@ -3867,6 +4624,7 @@ void process_background_tasks(void) {
 
     switch (lcd_load_state) {
     case LCD_LOAD_OPEN_FILE: {
+        // Open the image file and validate its size before reading.
         FRESULT fr = f_open(&lcd_load_file, lcd_load_path, FA_READ);
         if (FR_OK != fr) {
             printf("\nf_open error: %s (%d)\n", FRESULT_str(fr), fr);
@@ -3877,6 +4635,7 @@ void process_background_tasks(void) {
 
         lcd_load_file_open = true;
 
+        // Reject files that don't exactly match the framebuffer size (wrong resolution or format).
         if (f_size(&lcd_load_file) != lcd_image_bytes) {
             printf("\nImage file size mismatch: expected %u bytes\n", (unsigned)lcd_image_bytes);
             finish_lcd_load();
@@ -3890,7 +4649,9 @@ void process_background_tasks(void) {
     }
 
     case LCD_LOAD_READ_FILE: {
+        // Read lcd_display_row_chunk rows per tick: copy into framebuffer (with byte swap), push to LCD.
         if (lcd_load_display_row >= LCD_2IN.HEIGHT) {
+            // All rows read and displayed; proceed to close the file.
             lcd_load_state = LCD_LOAD_CLOSE_FILE;
             return;
         }
@@ -3915,6 +4676,7 @@ void process_background_tasks(void) {
             return;
         }
 
+        // Convert from file (camera little-endian) byte order to panel big-endian, then push to hardware.
         lcd_copy_raw_rows_to_framebuffer(lcd_load_display_row, row_count, lcd_row_buffer);
         lcd_display_rows_from_framebuffer(lcd_load_display_row, row_count);
         lcd_load_display_row += row_count;
@@ -3924,6 +4686,7 @@ void process_background_tasks(void) {
     }
 
     case LCD_LOAD_CLOSE_FILE: {
+        // Close the file and report completion (or a custom status message if one was set).
         FRESULT fr = f_close(&lcd_load_file);
         lcd_load_file_open = false;
         if (FR_OK != fr) {
@@ -3944,6 +4707,8 @@ void process_background_tasks(void) {
     }
 
     case LCD_LOAD_DISPLAY: {
+        // Push the existing framebuffer content to the LCD panel row-by-row without reading from SD.
+        // Used after in-memory operations (Paint_Clear, etc.) that modify lcd_image directly.
         if (lcd_load_display_row >= LCD_2IN.HEIGHT) {
             if (lcd_load_status_msg[0]) {
                 printf("\n%s\n", lcd_load_status_msg);

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:docs.nordicsemi.com)",
+      "WebFetch(domain:devzone.nordicsemi.com)"
+    ]
+  }
+}

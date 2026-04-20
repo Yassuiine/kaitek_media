@@ -168,8 +168,13 @@ int main(void)
 	pending_button_events = 0;
 	LOG_INF("buttons initial=0x%02X", debounced_button_state);
 
+	size_t prev_frame_len = sizeof(rx_buffer); /* start safe: full clear on first iteration */
 	while (1) {
-		memset(rx_buffer, 0x00, sizeof(rx_buffer));
+		/* Clear only as many bytes as the previous transfer received.
+		 * Clearing all 4096 bytes on every 4-byte benchmark frame added ~300 µs of
+		 * dead time between spi_transceive calls, causing the Pico to fire again
+		 * before the slave re-armed (50 % failure with 200 µs gap). */
+		memset(rx_buffer, 0x00, prev_frame_len);
 		gpio_pin_set_dt(&led, 0);
 		int ret = spi_transceive(spis_dev, &spis_config, &tx_set, &rx_set);
 		gpio_pin_set_dt(&led, 1);
@@ -191,6 +196,7 @@ int main(void)
 		}
 
 		if (ret > 0) {
+			prev_frame_len = (size_t)ret;
 			update_button_events();
 			memcpy(tx_buffer, rx_buffer, (size_t)ret);
 			last_rx0 = rx_buffer[0];
