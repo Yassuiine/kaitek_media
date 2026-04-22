@@ -9,11 +9,17 @@
 #include <zephyr/drivers/gpio.h>
 #include <string.h>
 
+#define NRF_BENCH_MODE  // Compile with this defined to enable the SPI slave test mode that logs transfer stats and button events; undefine for production build without logging and NRF event handling
+
 #define BUF_SIZE 4096
+
+static const struct device *spis_dev = DEVICE_DT_GET(DT_ALIAS(spis));
+static const struct spi_config spis_config = {.operation = SPI_OP_MODE_SLAVE | SPI_WORD_SET(8) | SPI_MODE_CPHA};
+
+#ifdef NRF_BENCH_MODE
+
 #define BUTTON_DEBOUNCE_SAMPLES 4
 #define BUTTON_RETRIGGER_GUARD_MS 350
-static const struct device *spis_dev = DEVICE_DT_GET(DT_ALIAS(spis));
-static const struct spi_config spis_config = {.operation = SPI_OP_MODE_SLAVE | SPI_WORD_SET(8)};
 
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led), gpios);
 static const struct gpio_dt_spec btn0 = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
@@ -38,10 +44,11 @@ static uint8_t last_rx0;
 static uint8_t last_rx1;
 static uint8_t last_rx2;
 static uint8_t last_rx3;
+static uint8_t last_rx13;
+static uint8_t last_rx14;
 
 static void fill_tx_pattern(void)
 {
-	/* Fixed pattern so RP side can use deterministic expected bytes in sweep tests. */
 	for (size_t i = 0; i < BUF_SIZE; ++i) {
 		tx_buffer[i] = (i & 1u) ? 0xA5 : 0x5A;
 	}
@@ -120,7 +127,7 @@ static void update_button_events(void)
 
 int main(void)
 {
-	bool status;
+	int status;
 	uint32_t frame_count = 0;
 	struct spi_buf tx_spi_buf = {.buf = tx_buffer, .len = sizeof(tx_buffer)};
 	struct spi_buf rx_spi_buf = {.buf = rx_buffer, .len = sizeof(rx_buffer)};
@@ -159,7 +166,7 @@ int main(void)
 	fill_tx_pattern();
 	LOG_INF("TX pattern[0..3]=%02X %02X %02X %02X",
 		tx_buffer[0], tx_buffer[1], tx_buffer[2], tx_buffer[3]);
-	LOG_INF("diag: BUF_SIZE=%u, SPI slave 8-bit mode, button aliases sw0..sw3 enabled", BUF_SIZE);
+	LOG_INF("diag: BUF_SIZE=%u, SPI slave 8-bit Mode1 (CPHA=1), button aliases sw0..sw3 enabled", BUF_SIZE);
 	debounced_button_state = read_button_state();
 	memset(button_change_count, 0, sizeof(button_change_count));
 	for (size_t i = 0; i < 4; ++i) {
@@ -203,6 +210,8 @@ int main(void)
 			last_rx1 = (ret > 1) ? rx_buffer[1] : 0;
 			last_rx2 = (ret > 2) ? rx_buffer[2] : 0;
 			last_rx3 = (ret > 3) ? rx_buffer[3] : 0;
+			last_rx13 = (ret > 13) ? rx_buffer[13] : 0;
+			last_rx14 = (ret > 14) ? rx_buffer[14] : 0;
 			if (pending_button_events != 0 && ret >= 2) {
 				/* Inject one-shot event marker in next transfer payload. */
 				tx_buffer[0] = 0xA5;
@@ -218,8 +227,8 @@ int main(void)
 			uint8_t chk = xor_checksum(rx_buffer, (ret > 0) ? (size_t)ret : sizeof(rx_buffer));
 			bool all_ff = (ret > 0) ? buffer_all_value(rx_buffer, (size_t)ret, 0xFF) : false;
 			bool all_00 = (ret > 0) ? buffer_all_value(rx_buffer, (size_t)ret, 0x00) : false;
-			LOG_INF("count=%u ret=%d RX[0..3]=%02X %02X %02X %02X xor=%02X pend=0x%02X err=%u zero=%u short=%u marker=%u all00=%u allFF=%u",
-				frame_count, ret, last_rx0, last_rx1, last_rx2, last_rx3, chk, pending_button_events,
+			LOG_INF("count=%u ret=%d RX[0..3]=%02X %02X %02X %02X RX[13..14]=%02X %02X xor=%02X pend=0x%02X err=%u zero=%u short=%u marker=%u all00=%u allFF=%u",
+				frame_count, ret, last_rx0, last_rx1, last_rx2, last_rx3, last_rx13, last_rx14, chk, pending_button_events,
 				error_count, zero_frame_count, short_frame_count, marker_inject_count,
 				all_00 ? 1u : 0u, all_ff ? 1u : 0u);
 		}
@@ -227,3 +236,36 @@ int main(void)
 
 	return 0;
 }
+
+#else /* NRF_BENCH_MODE not defined — production build */
+
+LOG_MODULE_REGISTER(nrf_spis, LOG_LEVEL_INF);
+
+static uint8_t tx_buffer[BUF_SIZE];
+static uint8_t rx_buffer[BUF_SIZE];
+
+int main(void)
+{
+	struct spi_buf tx_spi_buf = {.buf = tx_buffer, .len = sizeof(tx_buffer)};
+	struct spi_buf rx_spi_buf = {.buf = rx_buffer, .len = sizeof(rx_buffer)};
+	struct spi_buf_set tx_set = {.buffers = &tx_spi_buf, .count = 1};
+	struct spi_buf_set rx_set = {.buffers = &rx_spi_buf, .count = 1};
+
+	__ASSERT(device_is_ready(spis_dev), "SPI device not ready");
+
+	LOG_INF("nRF54L15 SPIS ready (production build, Mode 1, %u B buffer)", BUF_SIZE);
+
+	while (1) {
+		/* TODO: production logic — fill tx_buffer with FFT/audio results,
+		 * then block here until the RP master completes a transfer. */
+		int ret = spi_transceive(spis_dev, &spis_config, &tx_set, &rx_set);
+		if (ret < 0) {
+			LOG_ERR("spi_transceive failed: %d", ret);
+			k_msleep(10);
+		}
+	}
+
+	return 0;
+}
+
+#endif /* NRF_BENCH_MODE */

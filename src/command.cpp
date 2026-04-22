@@ -30,6 +30,8 @@
 #include "LCD_2in.h"
 #include "GUI_Paint.h"
 
+#define NRF_BENCH_ENABLED  // Compile with this defined to enable the SPI slave test mode that logs transfer stats and button events; undefine for production build without logging and NRF event handling
+
 static char *saveptr;                    // strtok_r re-entrant parse position; shared across all tokenisation in process_cmd
 static volatile bool die;                // Set by chars_available_callback on Enter to abort a running loop command
 static char cmd_buffer[256];            // In-progress command line being edited; modified in-place by strtok_r on Enter
@@ -88,9 +90,8 @@ static uint32_t nrf_validation_rows_per_chunk = 4;      // Number of camera rows
 static uint8_t nrf_validation_rx_chunk[LCD_2IN_WIDTH * 2 * NRF_VALIDATION_ROWS_MAX];   // Receive buffer for one NRF chunk
 static uint8_t nrf_validation_dummy_chunk[LCD_2IN_WIDTH * 2 * NRF_VALIDATION_ROWS_MAX]; // All-zero payload for the Phase-B flush transfer
 
-// Static relay buffer that assembles the validated Mode-B frame before pushing to the LCD.
-// Must be at least cam_width * cam_height * 2 bytes; sized for the maximum LCD resolution.
-static uint8_t mode_b_frame_raw[LCD_2IN_WIDTH * LCD_2IN_HEIGHT * 2];
+// Mode-B assembles echoed chunks directly into lcd_image interpreted as bytes.
+// This avoids a second full-frame static buffer and saves ~153 KB of RAM.
 
 // Per-frame transfer context for the Mode-B NRF relay path.
 // Because Mode-B sends one chunk per scheduler tick, this struct persists transfer
@@ -417,17 +418,21 @@ static const char *shared_pin_state_name(const shared_pin_state_t state) {
  */
 static void shared_enter_lcd_active(void) {
     if (nrf_spi_initialized) {
+        // cam_prog may have switched this pin back to I2C; force it to GPIO output first.
+        gpio_init(nrf_spi_cs_pin);
+        gpio_set_dir(nrf_spi_cs_pin, GPIO_OUT);
         gpio_put(nrf_spi_cs_pin, 1);
     }
-    if (lcd_initialized) {
-        if (shared_pin_state != SHARED_PIN_LCD_ACTIVE) {
-            // NRF borrowed these pins at a lower SPI rate; restore them for the LCD driver.
-            (void)spi_init(SPI_PORT, lcd_spi_hz);
-            gpio_set_function(LCD_CLK_PIN, GPIO_FUNC_SPI);
-            gpio_set_function(LCD_MOSI_PIN, GPIO_FUNC_SPI);
-        }
-        DEV_Digital_Write(LCD_CS_PIN, 1);
+    // Always restore SPI clock/data pin ownership and LCD SPI mode before LCD accesses.
+    if (shared_pin_state != SHARED_PIN_LCD_ACTIVE) {
+        // NRF may have left SPI at Mode 1 and/or a lower clock rate.
+        (void)spi_init(SPI_PORT, lcd_spi_hz);
+        gpio_set_function(LCD_CLK_PIN, GPIO_FUNC_SPI);
+        gpio_set_function(LCD_MOSI_PIN, GPIO_FUNC_SPI);
         spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    }
+    if (lcd_initialized) {
+        DEV_Digital_Write(LCD_CS_PIN, 1);
     }
     shared_pin_state = SHARED_PIN_LCD_ACTIVE;
 }
@@ -440,7 +445,7 @@ static void shared_enter_lcd_active(void) {
  */
 static void shared_enter_nrf_transaction(void) {
     if (shared_pin_state != SHARED_PIN_NRF_TRANSACTION || !nrf_spi_initialized) {
-        nrf_spi_prepare_bus(nrf_spi_actual_hz ? nrf_spi_actual_hz : 32000000);
+        nrf_spi_prepare_bus(nrf_spi_actual_hz ? nrf_spi_actual_hz : 15000000);
     }
     DEV_Digital_Write(LCD_CS_PIN, 1);
     shared_pin_state = SHARED_PIN_NRF_TRANSACTION;
@@ -608,20 +613,21 @@ static bool nrf_spi_transfer_bytes(const uint8_t *tx, uint8_t *rx, size_t len) {
     int ret = spi_write_read_blocking(SPI_PORT, tx, rx, len);
 
     // 5) Hold CS then release and keep inter-frame gap.
+    //    Apply the same floor as the bench: 400 µs + 2 µs/byte covers nRF SPIS re-arm
+    //    overhead regardless of frame size. nrf_spi_frame_gap_us is honoured if larger.
+    uint32_t min_gap = 400u + (uint32_t)(len * 2u);
+    uint32_t gap = (nrf_spi_frame_gap_us > min_gap) ? nrf_spi_frame_gap_us : min_gap;
     busy_wait_us_32(nrf_spi_cs_hold_us);
     gpio_put(nrf_spi_cs_pin, 1);
-    busy_wait_us_32(nrf_spi_frame_gap_us);
+    busy_wait_us_32(gap);
     return ret >= 0 && (size_t)ret == len;
 }
 
 /**
- * @brief Check that the static mode_b_frame_raw buffer is large enough for the given frame.
- *
- * mode_b_frame_raw is a fixed-size static array. If the camera resolution produces a
- * frame larger than the buffer, Mode-B transfers must be aborted rather than overflow.
+ * @brief Check that lcd_image can be safely used as the Mode-B frame assembly buffer.
  */
 static bool ensure_mode_b_frame_raw(size_t needed_bytes) {
-    return (needed_bytes != 0) && (needed_bytes <= sizeof(mode_b_frame_raw));
+    return (lcd_image != NULL) && (needed_bytes != 0) && (needed_bytes <= lcd_image_bytes);
 }
 
 /**
@@ -674,6 +680,7 @@ static int pipeline_mode_b_transfer_frame_via_nrf_to_lcd(const uint8_t *frame) {
     if (!ensure_mode_b_frame_raw(frame_bytes)) {
         return -1;
     }
+    uint8_t *mode_b_frame_raw = (uint8_t *)lcd_image;
 
     // Initialize/refresh transfer context on first entry for this frame pointer.
     if (!mode_b_ctx.active || mode_b_ctx.frame != frame) {
@@ -707,23 +714,18 @@ static int pipeline_mode_b_transfer_frame_via_nrf_to_lcd(const uint8_t *frame) {
             return -1;
         }
 
-        // All-0xFF indicates bad link/ownership; on row0 try one safe-baud recovery.
+        // All-0xFF: nRF MISO high — slave not yet armed or recovering from I2C/CS disturbance.
+        // On row 0 only: wait 2 ms for the nRF SPIS to re-arm and retry once at same speed.
         if (bytes_all_value(nrf_validation_rx_chunk, byte_count, 0xFF)) {
-            if (row == 0 && nrf_spi_actual_hz > mode_b_retry_safe_hz) {
-                uint32_t prev_hz = nrf_spi_actual_hz;
-                printf("\nMode-B row0 all-0xFF at %lu Hz, retrying at safer SPI rate...\n",
-                       (unsigned long)prev_hz);
-                nrf_spi_prepare_bus(mode_b_retry_safe_hz);
+            if (row == 0) {
+                busy_wait_us_32(2000);
                 if (!nrf_spi_transfer_bytes(tx, nrf_validation_rx_chunk, byte_count) ||
                     bytes_all_value(nrf_validation_rx_chunk, byte_count, 0xFF)) {
-                    nrf_spi_prepare_bus(prev_hz);
-                    printf("\nMode-B transfer got all-0xFF chunk at row %lu (SPI link issue)\n",
-                           (unsigned long)row);
+                    printf("\nMode-B transfer got all-0xFF chunk at row 0 (SPI link issue)\n");
                     reset_mode_b_transfer_ctx();
                     return -1;
                 }
-                printf("Mode-B retry recovered at %lu Hz (staying at this rate)\n",
-                       (unsigned long)nrf_spi_actual_hz);
+                printf("\nMode-B row0 retry recovered (nRF re-armed)\n");
             } else {
                 printf("\nMode-B transfer got all-0xFF chunk at row %lu (SPI link issue)\n",
                        (unsigned long)row);
@@ -2062,6 +2064,8 @@ static void run_cam_size(const size_t argc, const char *argv[]) {
 
     // Take I2C1 ownership before writing camera registers (I2C1_SDA is shared with NRF CS).
     shared_enter_cam_prog();
+    // Re-assert I2C pin mux each time in case a previous shared-pin state changed GPIO mode.
+    init_i2c();
 
     // Stop any running capture pipeline so DMA doesn't write into the buffer we are about to free.
     free_cam();
@@ -2074,7 +2078,12 @@ static void run_cam_size(const size_t argc, const char *argv[]) {
     cam_ful_size = w * h;
 
     // Write the new output window to the OV5640 (X_OUTPUT_SIZE_H encodes both W and H in one call).
-    OV5640_WR_Reg_2(i2c1, 0x3C, X_OUTPUT_SIZE_H, w, h);
+    uint8_t wr = OV5640_WR_Reg_2(i2c1, 0x3C, X_OUTPUT_SIZE_H, w, h);
+    if (wr == 0xFF) {
+        shared_leave_cam_prog();
+        printf("cam size failed: SCCB write timed out (check CAM_SDA/CAM_SCL wiring or shared-pin state)\n");
+        return;
+    }
 
     // Allocate the new double-sized buffer (cam_ful_size pixels × 2 bytes/pixel × 2 for double-buffering).
     cam_ptr = (uint8_t *)malloc(cam_ful_size * 2);
@@ -2241,6 +2250,10 @@ static void run_cam_capture(const size_t argc, const char *argv[]) {
 static void run_cam_snap(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
     if (!ensure_cam_buffer_allocated()) return;
+    if (lcd_load_pending || lcd_cam_snap_pending || lcd_cam_stream_active) {
+        printf("Another camera or LCD operation is already in progress.\n");
+        return;
+    }
     if (cam_snap_pending) {
         printf("A camera snapshot is already in progress\n");
         return;
@@ -2252,18 +2265,60 @@ static void run_cam_snap(const size_t argc, const char *argv[]) {
     fflush(stdout);
     stdio_flush();
 
+    // Defensive reset: after heavy stream mode switching, DMA/PIO state may still be
+    // mid-transition for one loop tick. Force a clean one-shot baseline here so cam_snap
+    // cannot inherit a stale busy channel/SM state and appear to hang at "armed".
+    cam_ptr1 = NULL;
+    free_cam();
+
+    // Verify VSYNC (GP8) is actually toggling before arming the PIO.
+    // If the camera is not free-running, cam_wait_for_frame will hang forever.
+    {
+        const uint vsync_pin = CAM_BASE_PIN + 8;
+        gpio_init(vsync_pin);
+        gpio_set_dir(vsync_pin, GPIO_IN);
+        int transitions = 0;
+        bool prev = gpio_get(vsync_pin);
+        uint64_t deadline_us = time_us_64() + 100000;  // 100 ms ≈ 3 frames at 30 fps
+        while (time_us_64() < deadline_us) {
+            bool cur = gpio_get(vsync_pin);
+            if (cur != prev) { transitions++; prev = cur; }
+        }
+        // Restore pin to PIO0 so picampinos_program_init can use it.
+        gpio_set_function(vsync_pin, GPIO_FUNC_PIO0);
+        printf("VSYNC check (GP%u): %d transitions in 100 ms\n", vsync_pin, transitions);
+        if (transitions == 0) {
+            printf("VSYNC missing — re-initialising camera sensor...\n");
+            shared_enter_cam_prog();
+            sccb_init(I2C1_SDA, I2C1_SCL);
+            shared_leave_cam_prog();
+            // Re-check after reinit — give the sensor one frame to stabilise.
+            sleep_ms(50);
+            gpio_init(vsync_pin);
+            gpio_set_dir(vsync_pin, GPIO_IN);
+            transitions = 0;
+            prev = gpio_get(vsync_pin);
+            deadline_us = time_us_64() + 100000;
+            while (time_us_64() < deadline_us) {
+                bool cur = gpio_get(vsync_pin);
+                if (cur != prev) { transitions++; prev = cur; }
+            }
+            gpio_set_function(vsync_pin, GPIO_FUNC_PIO0);
+            if (transitions == 0) {
+                printf("ERROR: camera still not responding after reinit\n");
+                print_prompt();
+                return;
+            }
+            printf("Camera recovered — VSYNC restored (%d transitions)\n", transitions);
+        }
+    }
+
     // One-shot mode: disable continuous capture and IRQ so the DMA stops after a single frame.
     cam_set_continuous(false);
     cam_set_use_irq(false);
     buffer_ready = false;
     config_cam_buffer();
-    printf("cam_snap: before start_cam\n");
-    fflush(stdout);
-    stdio_flush();
     start_cam();  // Begin PIO + DMA capture; process_background_tasks() will observe buffer_ready
-    printf("cam_snap: after start_cam\n");
-    fflush(stdout);
-    stdio_flush();
 
     // Arm the background state machine.
     cam_snap_deadline = make_timeout_time_ms(2000);
@@ -2272,7 +2327,6 @@ static void run_cam_snap(const size_t argc, const char *argv[]) {
     cam_snap_state = CAM_SNAP_WAIT_FRAME;
     cam_snap_write_offset = 0;
     cam_snap_total_written = 0;
-    printf("cam_snap: armed\n");
 }
 
 /**
@@ -2295,6 +2349,9 @@ static void run_lcd_init(const size_t argc, const char *argv[]) {
             return;
         }
     }
+
+    // If NRF borrowed shared SPI pins earlier, deterministically restore LCD bus ownership first.
+    shared_enter_lcd_active();
 
     // Configure RST, DC, and CS as GPIO outputs before touching the panel.
     DEV_GPIO_Mode(LCD_RST_PIN, 1);
@@ -2323,6 +2380,7 @@ static void run_lcd_init(const size_t argc, const char *argv[]) {
 
     // Initialise SPI at the requested LCD baud and assign SPI function to the clock/data pins.
     uint actual = spi_init(SPI_PORT, lcd_spi_hz);
+    spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
     printf("LCD SPI actual: %u Hz\n", actual);
     gpio_set_function(LCD_CLK_PIN, GPIO_FUNC_SPI);
     gpio_set_function(LCD_MOSI_PIN, GPIO_FUNC_SPI);
@@ -3134,7 +3192,7 @@ static void run_sm_validation(const size_t argc, const char *argv[]) {
  * accessed while NRF owns these pins.
  */
 static bool nrf_spi_prepare_bus(uint32_t requested_hz) {
-    if (requested_hz == 0) requested_hz = 32000000;  // Guard: caller passed zero; default to SPIS00 full-speed
+    if (requested_hz == 0) requested_hz = 15000000;  // Guard: caller passed zero; default to 15 MHz (max confirmed reliable)
 
     // Keep the LCD chip-select deasserted while NRF owns the bus.
     DEV_Digital_Write(LCD_CS_PIN, 1);
@@ -3153,8 +3211,7 @@ static bool nrf_spi_prepare_bus(uint32_t requested_hz) {
 
     // Re-init SPI at the requested baud; spi_init() returns the actual achieved rate.
     nrf_spi_actual_hz = spi_init(SPI_PORT, requested_hz);
-    // The NRF sample firmware runs SPI Mode 0 (CPOL=0, CPHA=0), 8-bit, MSB-first.
-    spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_1, SPI_MSB_FIRST);
     nrf_spi_initialized = true;
     shared_pin_state = SHARED_PIN_NRF_TRANSACTION;
     return true;
@@ -3175,7 +3232,7 @@ static void nrf_spi_drain_rx_fifo(void) {    while (spi_is_readable(SPI_PORT)) {
  * @brief Configure the shared SPI bus for NRF SPIS00 at the given baud rate (default 32 MHz → ~30 MHz actual on RP2350 @ 150 MHz) and print the pin mapping.
  */
 static void run_nrf_spi_init(const size_t argc, const char *argv[]) {
-    uint32_t requested_hz = 32000000;  // SPIS00 (P2) supports up to 32 MHz; RP2350 @ 150 MHz yields 30 MHz actual (SCKDIV=5)
+    uint32_t requested_hz = 15000000;  // Confirmed max reliable via bench sweep (Mode 1, all frame sizes 1–4096 B pass 100%)
     if (argc > 1) {
         printf("Usage: nrf_spi_init [baud_hz]\n");
         return;
@@ -3216,7 +3273,7 @@ static void run_nrf_spi_xfer(const size_t argc, const char *argv[]) {
         return;
     }
     if (!nrf_spi_initialized) {
-        nrf_spi_prepare_bus(32000000);
+        nrf_spi_prepare_bus(15000000);
     }
 
     uint8_t tx[256];
@@ -3350,6 +3407,120 @@ static void run_nrf_spi_sweep(const size_t argc, const char *argv[]) {
     printf("Sweep done. Restored SPI baud to actual=%lu Hz\n", (unsigned long)nrf_spi_actual_hz);
 }
 
+#ifdef NRF_BENCH_ENABLED
+/**
+ * @brief Throughput benchmark: send <frame_bytes> of an auto-generated pattern for <loops> iterations,
+ *        validate the echo, and report ok/fail counts and throughput in B/s.
+ *
+ * Avoids the 512-char hex string limitation of nrf_spi_sweep for large frames.
+ * Pattern: tx[i] = i & 0xFF (incrementing 00..FF repeating).
+ * After a warm-up transfer that primes the nRF's echo buffer, each timed transfer
+ * receives the previously-sent pattern back and validates it byte-for-byte.
+ */
+static void run_nrf_spi_bench(const size_t argc, const char *argv[]) {
+    if (argc != 2) {
+        printf("Usage: nrf bench <frame_bytes> <loops>\n");
+        printf("  frame_bytes: 1..4096  loops: 1..10000\n");
+        printf("Example: nrf bench 256 50\n");
+        return;
+    }
+    uint32_t frame_bytes = 0, loops = 0;
+    if (!parse_u32_arg(argv[0], &frame_bytes) || !parse_u32_arg(argv[1], &loops)) {
+        printf("Invalid arguments\n");
+        return;
+    }
+    if (frame_bytes < 1 || frame_bytes > 4096) {
+        printf("frame_bytes must be 1..4096\n");
+        return;
+    }
+    if (loops < 1 || loops > 10000) {
+        printf("loops must be 1..10000\n");
+        return;
+    }
+    if (!nrf_spi_initialized) {
+        nrf_spi_prepare_bus(15000000);
+    }
+
+    /* For large frames the nRF SPIS driver needs more re-arm time.
+     * Fixed floor of 400 µs covers Zephyr SPIS driver overhead regardless of frame size,
+     * plus 2 µs/byte for DMA proportional cost. 32 B → 464 µs, 256 B → 912 µs, 4096 B → 8592 µs.
+     * Without the floor, small-to-medium frames (e.g. 32 B → 160 µs) fell below the 350 µs
+     * re-arm minimum and SPIS output TXD.MAXCNT=0 → all-zero transfers. */
+    uint32_t effective_gap = nrf_spi_frame_gap_us;
+    uint32_t scaled_gap = 400u + frame_bytes * 2u;
+    if (scaled_gap > effective_gap) {
+        effective_gap = scaled_gap;
+        printf("NOTE: gap auto-scaled to %lu us for %lu B frame (current gap=%lu us is too small).\n"
+               "      Run `nrf timing gap %lu` to keep this as default, or bench will auto-scale.\n",
+               (unsigned long)effective_gap, (unsigned long)frame_bytes,
+               (unsigned long)nrf_spi_frame_gap_us, (unsigned long)effective_gap);
+    }
+
+    /* Static to avoid blowing the stack with 4 KB frames. */
+    static uint8_t bench_tx[4096];
+    static uint8_t bench_rx[4096];
+
+    for (uint32_t i = 0; i < frame_bytes; i++) {
+        bench_tx[i] = (uint8_t)(i & 0xFF);
+    }
+
+    /* Warm-up: prime the nRF's tx_buffer with our pattern. */
+    nrf_spi_drain_rx_fifo();
+    gpio_put(nrf_spi_cs_pin, 0);
+    busy_wait_us_32(nrf_spi_cs_setup_us);
+    (void)spi_write_read_blocking(SPI_PORT, bench_tx, bench_rx, frame_bytes);
+    busy_wait_us_32(nrf_spi_cs_hold_us);
+    gpio_put(nrf_spi_cs_pin, 1);
+    busy_wait_us_32(effective_gap);
+
+    uint32_t ok = 0, fail = 0;
+    bool printed_diag = false;
+    uint64_t t0 = time_us_64();
+
+    for (uint32_t i = 0; i < loops; i++) {
+        nrf_spi_drain_rx_fifo();
+        gpio_put(nrf_spi_cs_pin, 0);
+        busy_wait_us_32(nrf_spi_cs_setup_us);
+        int ret = spi_write_read_blocking(SPI_PORT, bench_tx, bench_rx, frame_bytes);
+        busy_wait_us_32(nrf_spi_cs_hold_us);
+        gpio_put(nrf_spi_cs_pin, 1);
+        busy_wait_us_32(effective_gap);
+
+        if (ret == (int)frame_bytes && memcmp(bench_rx, bench_tx, frame_bytes) == 0) {
+            ok++;
+        } else {
+            fail++;
+            /* Print first 16 bytes of the first failure to diagnose:
+             *   All 0xFF → nRF not armed (gap still too small)
+             *   5A/A5 pattern → nRF sent its initial fill, warm-up didn't take
+             *   Shifted/partial match → bit alignment or framing error */
+            if (!printed_diag) {
+                printed_diag = true;
+                printf("FAIL diag (frame %lu): ret=%d\n  TX[0..15]:", (unsigned long)i, ret);
+                for (size_t d = 0; d < 16 && d < frame_bytes; d++) printf(" %02X", bench_tx[d]);
+                printf("\n  RX[0..15]:");
+                for (size_t d = 0; d < 16 && d < frame_bytes; d++) printf(" %02X", bench_rx[d]);
+                printf("\n");
+            }
+        }
+    }
+
+    uint64_t dt = time_us_64() - t0;
+    uint32_t throughput = (dt > 0) ? (uint32_t)(((uint64_t)frame_bytes * loops * 1000000ULL) / dt) : 0;
+
+    printf("bench: %lu B/frame  %lu loops  actual=%lu Hz\n",
+           (unsigned long)frame_bytes, (unsigned long)loops, (unsigned long)nrf_spi_actual_hz);
+    printf("timing: setup=%lu us  hold=%lu us  gap=%lu us (effective)\n",
+           (unsigned long)nrf_spi_cs_setup_us,
+           (unsigned long)nrf_spi_cs_hold_us,
+           (unsigned long)effective_gap);
+    printf("ok=%lu fail=%lu throughput=%lu B/s (%lu KB/s)\n",
+           (unsigned long)ok, (unsigned long)fail,
+           (unsigned long)throughput, (unsigned long)(throughput / 1024));
+}
+#endif /* NRF_BENCH_ENABLED */
+
+#ifdef NRF_BENCH_ENABLED
 /**
  * @brief Run SPI diagnostics: Phase 1 tests all four CPOL/CPHA modes with CS high (loopback), Phase 2 pulses CS low once and prints the slave response.
  */
@@ -3366,7 +3537,7 @@ static void run_nrf_spi_diag(const size_t argc, const char *argv[]) {
     if (loops > 1000) loops = 1000;
 
     if (!nrf_spi_initialized) {
-        nrf_spi_prepare_bus(32000000);
+        nrf_spi_prepare_bus(15000000);
     }
 
     static const uint8_t tx[8] = {0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18};
@@ -3418,8 +3589,8 @@ static void run_nrf_spi_diag(const size_t argc, const char *argv[]) {
                modes[m].name, (unsigned long)ok, (unsigned long)fail);
     }
 
-    // Restore operational mode used by current NRF sample.
-    spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    // Restore operational mode (Mode 1: CPOL=0, CPHA=1).
+    spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_1, SPI_MSB_FIRST);
 
     printf("Slave phase: pulse CS low once and print RX\n");
     memset(rx, 0, sizeof(rx));
@@ -3435,6 +3606,7 @@ static void run_nrf_spi_diag(const size_t argc, const char *argv[]) {
     print_hex_bytes(rx, sizeof(rx));
     printf("\n");
 }
+#endif /* NRF_BENCH_ENABLED */
 
 /**
  * @brief Show or tune Mode-B SPI timing: displays current CS setup/hold/gap/chunk values and an FPS estimate, or sets one parameter.
@@ -3540,7 +3712,11 @@ static void print_sm_group_help(void) {
  */
 static void print_nrf_group_help(void) {
     printf("nrf <subcommand> [args]\n");
-    printf("Subcommands: init, status, xfer, sweep, diag, timing\n");
+#ifdef NRF_BENCH_ENABLED
+    printf("Subcommands: init, status, xfer, sweep, bench, diag, timing\n");
+#else
+    printf("Subcommands: init, status, xfer, timing\n");
+#endif
 }
 
 static const char *const cam_group_subcmds[] = {
@@ -3553,10 +3729,14 @@ static const char *const lcd_group_subcmds[] = {
     "snap", "load", "unload", "stream", "status", "fps"
 };
 static const char *const sm_group_subcmds[] = {
-    "status", "mode", "event", "validation"
+    "status", "mode", "event", "validation",
 };
 static const char *const nrf_group_subcmds[] = {
-    "init", "status", "xfer", "sweep", "diag", "timing"
+    "init", "status", "xfer", "sweep",
+#ifdef NRF_BENCH_ENABLED
+    "bench", "diag",
+#endif
+    "timing",
 };
 
 static bool get_group_subcommands(const char *group,
@@ -3644,7 +3824,10 @@ static void run_sm_group(const size_t argc, const char *argv[]) {
     const char *sub = argv[0];
     size_t sub_argc = argc - 1;
     const char **sub_argv = argv + 1;
-    if (strcmp(sub, "status") == 0) run_sm_status(sub_argc, sub_argv);    else if (strcmp(sub, "mode") == 0) run_sm_mode(sub_argc, sub_argv);    else if (strcmp(sub, "event") == 0) run_sm_event(sub_argc, sub_argv);    else if (strcmp(sub, "validation") == 0) run_sm_validation(sub_argc, sub_argv);
+    if (strcmp(sub, "status") == 0) run_sm_status(sub_argc, sub_argv);
+    else if (strcmp(sub, "mode") == 0) run_sm_mode(sub_argc, sub_argv);
+    else if (strcmp(sub, "event") == 0) run_sm_event(sub_argc, sub_argv);
+    else if (strcmp(sub, "validation") == 0) run_sm_validation(sub_argc, sub_argv);
     else {
         printf("Unknown sm subcommand: %s\n", sub);
         print_sm_group_help();
@@ -3663,7 +3846,15 @@ static void run_nrf_group(const size_t argc, const char *argv[]) {
     const char *sub = argv[0];
     size_t sub_argc = argc - 1;
     const char **sub_argv = argv + 1;
-    if (strcmp(sub, "init") == 0) run_nrf_spi_init(sub_argc, sub_argv);    else if (strcmp(sub, "status") == 0) run_nrf_spi_status(sub_argc, sub_argv);    else if (strcmp(sub, "xfer") == 0) run_nrf_spi_xfer(sub_argc, sub_argv);    else if (strcmp(sub, "sweep") == 0) run_nrf_spi_sweep(sub_argc, sub_argv);    else if (strcmp(sub, "diag") == 0) run_nrf_spi_diag(sub_argc, sub_argv);    else if (strcmp(sub, "timing") == 0) run_nrf_timing(sub_argc, sub_argv);
+    if (strcmp(sub, "init") == 0) run_nrf_spi_init(sub_argc, sub_argv);
+    else if (strcmp(sub, "status") == 0) run_nrf_spi_status(sub_argc, sub_argv);
+    else if (strcmp(sub, "xfer") == 0) run_nrf_spi_xfer(sub_argc, sub_argv);
+    else if (strcmp(sub, "sweep") == 0) run_nrf_spi_sweep(sub_argc, sub_argv);
+#ifdef NRF_BENCH_ENABLED
+    else if (strcmp(sub, "bench") == 0) run_nrf_spi_bench(sub_argc, sub_argv);
+    else if (strcmp(sub, "diag") == 0) run_nrf_spi_diag(sub_argc, sub_argv);
+#endif
+    else if (strcmp(sub, "timing") == 0) run_nrf_timing(sub_argc, sub_argv);
     else {
         printf("Unknown nrf subcommand: %s\n", sub);
         print_nrf_group_help();
@@ -3806,7 +3997,7 @@ static cmd_def_t cmds[] = {
      " Print touch init state and mirror event counters."},
     {"nrf_spi_init", run_nrf_spi_init,
      "nrf_spi_init [baud_hz]:\n"
-     " Configure shared SPI pins for NRF SPIS00 (default 32 MHz request, ~30 MHz actual @ 150 MHz sysclk).\n"
+     " Configure shared SPI pins for NRF SPIS00 (default 15 MHz, confirmed max reliable).\n"
      " Requires nRF54L15 wired on P2.06/P2.08/P2.09/P2.10 (HSSPI dedicated pins)."},
     {"nrf_spi_status", run_nrf_spi_status,
      "nrf_spi_status:\n"
@@ -3819,11 +4010,18 @@ static cmd_def_t cmds[] = {
      "nrf_spi_sweep <start_hz> <stop_hz> <step_hz> <loops> <tx_hex> <expect_hex>:\n"
      " Sweep SPI rates and report pass/fail against expected response.\n"
      "\te.g.: nrf_spi_sweep 1000000 32000000 1000000 200 A55A0102 5AA5AABB"},
+#ifdef NRF_BENCH_ENABLED
+    {"nrf_spi_bench", run_nrf_spi_bench,
+     "nrf_spi_bench <frame_bytes> <loops>:\n"
+     " Throughput benchmark with auto-generated pattern (no hex typing).\n"
+     " Reports ok/fail counts and throughput in B/s and KB/s.\n"
+     "\te.g.: nrf_spi_bench 256 500"},
     {"nrf_spi_diag", run_nrf_spi_diag,
      "nrf_spi_diag [loops]:\n"
      " Run SPI diagnostics.\n"
      " Phase1 keeps CS high for pure MOSI->MISO loopback checks.\n"
      " Phase2 pulses CS low once and prints slave RX sample."},
+#endif
     {"nrf_timing", run_nrf_timing,
      "nrf_timing [gap|setup|hold|chunk <val>]:\n"
      " Show or tune Mode-B transfer timing.\n"
@@ -4392,22 +4590,50 @@ void process_background_tasks(void) {
     // Phases: WAIT_FRAME -> OPEN_FILE -> WRITE_FILE (repeated) -> CLOSE_FILE
     if (cam_snap_pending && time_reached(cam_snap_next_step_time)) {
         switch (cam_snap_state) {
-        case CAM_SNAP_WAIT_FRAME:
+        case CAM_SNAP_WAIT_FRAME: {
             // Poll cam_wait_for_frame() non-blocking (timeout=0); advance when DMA signals a complete frame.
             if (cam_wait_for_frame(0)) {
                 cam_snap_state = CAM_SNAP_OPEN_FILE;
-                cam_snap_next_step_time = delayed_by_ms(get_absolute_time(), 1);
+                cam_snap_next_step_time = get_absolute_time();
                 return;
             }
             // Timeout guard: if the camera hasn't produced a frame within 2 s, abort.
             if (time_reached(cam_snap_deadline)) {
+                printf("\ncam snap: TIMEOUT — DMA busy=%d buffer_ready=%d\n",
+                       cam_get_dma_busy(), buffer_ready);
                 finish_cam_snap();
-                printf("\nCamera capture timed out after 2000 ms\n");
+                print_prompt();
+                return;
+            }
+            // Progress: print DMA state every 500 ms so the user can see activity.
+            static absolute_time_t cam_snap_next_diag = {0};
+            if (time_reached(cam_snap_next_diag)) {
+                cam_snap_next_diag = delayed_by_ms(get_absolute_time(), 500);
+                printf("\ncam snap: waiting for frame (DMA busy=%d buffer_ready=%d)\n",
+                       cam_get_dma_busy(), buffer_ready);
                 print_prompt();
             }
             return;
+        }
 
         case CAM_SNAP_OPEN_FILE: {
+            // Auto-create parent directory if it doesn't exist.
+            {
+                char dir_buf[sizeof(cam_snap_path)];
+                strncpy(dir_buf, cam_snap_path, sizeof(dir_buf) - 1);
+                dir_buf[sizeof(dir_buf) - 1] = '\0';
+                char *last_slash = strrchr(dir_buf, '/');
+                if (last_slash && last_slash != dir_buf) {
+                    *last_slash = '\0';
+                    FRESULT mfr = f_mkdir(dir_buf);
+                    if (mfr != FR_OK && mfr != FR_EXIST) {
+                        printf("\nf_mkdir error: %s (%d)\n", FRESULT_str(mfr), mfr);
+                        finish_cam_snap();
+                        print_prompt();
+                        return;
+                    }
+                }
+            }
             // Create the destination file; abort the snap on any FatFS error.
             FRESULT fr = f_open(&cam_snap_file, cam_snap_path, FA_WRITE | FA_CREATE_ALWAYS);
             if (FR_OK != fr) {
@@ -4452,7 +4678,7 @@ void process_background_tasks(void) {
 
             cam_snap_write_offset += bw;
             cam_snap_total_written += bw;
-            cam_snap_next_step_time = delayed_by_ms(get_absolute_time(), 1);
+            cam_snap_next_step_time = get_absolute_time();
             return;
         }
 

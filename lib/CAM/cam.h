@@ -82,6 +82,7 @@ dma_channel_config get_cam_config(PIO pio, uint32_t sm, uint32_t dma_chan);
 void cam_handler();
 uint32_t cam_get_capture_fps(void);
 uint32_t cam_get_capture_frames_total(void);
+bool cam_get_dma_busy(void);
 
 #ifdef __cplusplus
 }

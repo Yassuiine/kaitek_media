@@ -45,6 +45,7 @@ static bool cam_dma_claimed = false;
 static volatile bool cam_continuous = true;
 static bool cam_use_irq = true;
 static bool cam_sm_running = false;
+static volatile bool cam_seen_dma_busy = false;
 static volatile uint32_t cam_capture_fps = 0;
 static volatile uint32_t cam_capture_frames_total = 0;
 static uint32_t cam_capture_frames_window = 0;
@@ -150,7 +151,12 @@ void config_cam_buffer()
     } else {
         dma_channel_set_irq0_enabled(DMA_CAM_RD_CH, false);
     }
-    dma_channel_start(DMA_CAM_RD_CH); // Start DMA transfer
+    cam_seen_dma_busy = false;
+    buffer_ready = false;
+    dma_channel_start(DMA_CAM_RD_CH);
+    // Mark that DMA was armed so cam_wait_for_frame correctly detects completion
+    // even if DMA finishes before the first poll (e.g. VSYNC fires immediately).
+    cam_seen_dma_busy = true;
 }
 
 /********************************************************************************
@@ -247,11 +253,19 @@ void free_cam()
     if (cam_dma_claimed) {
         dma_channel_set_irq0_enabled(DMA_CAM_RD_CH, false);
         dma_channel_abort(DMA_CAM_RD_CH);
+        // Ensure abort has propagated before any subsequent re-config/restart.
+        // Without this, a fast stop->start sequence can observe the channel as still
+        // busy and skip re-arming, which makes one-shot capture appear stuck.
+        absolute_time_t dma_abort_deadline = make_timeout_time_ms(5);
+        while (dma_channel_is_busy(DMA_CAM_RD_CH) && !time_reached(dma_abort_deadline)) {
+            tight_loop_contents();
+        }
     }
     pio_sm_set_enabled(pio_cam, sm_cam, false);
     pio_sm_clear_fifos(pio_cam, sm_cam);
     pio_sm_restart(pio_cam, sm_cam);
     cam_sm_running = false;
+    cam_seen_dma_busy = false;
     buffer_ready = false;
 }
 
@@ -271,11 +285,28 @@ bool cam_wait_for_frame(uint32_t timeout_ms)
         return false;
     }
 
-    // In continuous mode the IRQ sets buffer_ready and immediately restarts DMA,
-    // so the DMA-busy flag may already be true again before we get to poll it.
-    // Check the flag first to avoid falsely timing out.
+    // In IRQ mode, completion is signaled by cam_handler via buffer_ready.
+    // In continuous mode the IRQ may restart DMA before this function runs,
+    // so buffer_ready is the only stable completion indicator.
     if (buffer_ready) {
         return true;
+    }
+
+    // For IRQ-driven capture there is nothing else to poll.
+    if (cam_use_irq) {
+        return false;
+    }
+
+    // Non-IRQ one-shot path: poll DMA busy state.
+    // Important guard:
+    // If DMA never actually started (or was aborted before starting), busy is false
+    // from the very first check. That does NOT mean a frame is complete.
+    bool busy = dma_channel_is_busy(DMA_CAM_RD_CH);
+    if (busy) {
+        cam_seen_dma_busy = true;
+    } else if (!cam_seen_dma_busy) {
+        // Not busy yet and we have never seen this transfer become busy -> no frame.
+        return false;
     }
 
     absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
@@ -287,6 +318,7 @@ bool cam_wait_for_frame(uint32_t timeout_ms)
     }
 
     // Non-continuous path: cam_ptr is the single capture buffer.
+    cam_seen_dma_busy = false;
     cam_display_ptr = cam_ptr;
     buffer_ready = true;
     cam_note_captured_frame();
@@ -301,6 +333,12 @@ uint32_t cam_get_capture_fps(void)
 uint32_t cam_get_capture_frames_total(void)
 {
     return cam_capture_frames_total;
+}
+
+bool cam_get_dma_busy(void)
+{
+    if (!cam_dma_claimed) return false;
+    return dma_channel_is_busy(DMA_CAM_RD_CH);
 }
 
 /********************************************************************************

@@ -30,6 +30,9 @@
 #include "pico/stdlib.h"
 #include "ov5640.h"
 
+// Prevent infinite shell hangs when SCCB/I2C is busy or pin ownership is wrong.
+#define OV5640_I2C_TIMEOUT_US 5000u
+
 // Define the default register settings for the OV5640 sensor
 const uint16_t sensor_default_regs[][2] = {
     {SYSTEM_CTROL0, 0x82},  // software reset
@@ -298,8 +301,14 @@ uint8_t OV5640_RD_Reg(i2c_inst_t *i2c,
     uint8_t reg_low = reg & 0xFF;
 
     uint8_t reg_data[2] = {reg_high, reg_low};
-    i2c_write_blocking(i2c, addr, reg_data, 2, true);
-    i2c_read_blocking(i2c, addr, &val, 1, false);  
+    int wr = i2c_write_timeout_us(i2c, addr, reg_data, 2, true, OV5640_I2C_TIMEOUT_US);
+    if (wr < 0) {
+        return 0xFF;
+    }
+    int rd = i2c_read_timeout_us(i2c, addr, &val, 1, false, OV5640_I2C_TIMEOUT_US);
+    if (rd < 0) {
+        return 0xFF;
+    }
     return val;
 }
 
@@ -317,9 +326,11 @@ uint8_t OV5640_WR_Reg(i2c_inst_t *i2c,
     msg[1] = reg & 0xFF;
     msg[2] = data;
 
-    uint8_t ret=0;
-    ret=i2c_write_blocking(i2c, addr, msg, 3, false);
-    return ret;
+    int ret = i2c_write_timeout_us(i2c, addr, msg, 3, false, OV5640_I2C_TIMEOUT_US);
+    if (ret < 0) {
+        return 0xFF;
+    }
+    return (uint8_t)ret;
 }
 
 /********************************************************************************
@@ -336,25 +347,36 @@ uint8_t OV5640_WR_Reg_2(i2c_inst_t *i2c,
     msg[0] = reg >> 8;
     msg[1] = reg & 0xFF;
     msg[2] = data1 >> 8;
-    uint8_t ret=0;
-    ret=i2c_write_blocking(i2c, addr, msg, 3, false);
+    int ret = i2c_write_timeout_us(i2c, addr, msg, 3, false, OV5640_I2C_TIMEOUT_US);
+    if (ret < 0) {
+        return 0xFF;
+    }
 
     reg+=1;
     msg[0] = reg >> 8;
     msg[1] = reg & 0xFF;
     msg[2] = data1 & 0xFF;
-    ret=i2c_write_blocking(i2c, addr, msg, 3, false);
+    ret = i2c_write_timeout_us(i2c, addr, msg, 3, false, OV5640_I2C_TIMEOUT_US);
+    if (ret < 0) {
+        return 0xFF;
+    }
 
     reg+=1;
     msg[0] = reg >> 8;
     msg[1] = reg & 0xFF;
     msg[2] = data2 >> 8;
-    ret=i2c_write_blocking(i2c, addr, msg, 3, false);
+    ret = i2c_write_timeout_us(i2c, addr, msg, 3, false, OV5640_I2C_TIMEOUT_US);
+    if (ret < 0) {
+        return 0xFF;
+    }
 
     reg+=1;
     msg[0] = reg >> 8;
     msg[1] = reg & 0xFF;
     msg[2] = data2 & 0xFF;
-    ret=i2c_write_blocking(i2c, addr, msg, 3, false);
-    return ret;
+    ret = i2c_write_timeout_us(i2c, addr, msg, 3, false, OV5640_I2C_TIMEOUT_US);
+    if (ret < 0) {
+        return 0xFF;
+    }
+    return (uint8_t)ret;
 }
