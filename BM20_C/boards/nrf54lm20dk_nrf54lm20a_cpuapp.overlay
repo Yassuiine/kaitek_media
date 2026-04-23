@@ -1,0 +1,48 @@
+/*
+ * nRF54LM20 DK CPUAPP SPI-slave overlay.
+ * Uses spi21 (SPIS21) — pins confirmed by Zephyr spi_controller_peripheral test for this board.
+ * Wire to Pico: GPIO18(SCK)→P1.24, GPIO19(MOSI)→P1.14, GPIO20(MISO)→P1.31, GPIO22(CS)→P1.4
+ */
+
+/ {
+	aliases {
+		led = &led0;
+		spis = &spi21;
+	};
+};
+
+&pinctrl {
+	spi21_slave_default: spi21_slave_default {
+		group1 {
+			psels = <NRF_PSEL(SPIS_SCK,  1, 24)>,
+				<NRF_PSEL(SPIS_MOSI, 1, 14)>,
+				<NRF_PSEL(SPIS_MISO, 1, 31)>,
+				<NRF_PSEL(SPIS_CSN,  1, 4)>;
+		};
+	};
+
+	spi21_slave_sleep: spi21_slave_sleep {
+		group1 {
+			psels = <NRF_PSEL(SPIS_SCK,  1, 24)>,
+				<NRF_PSEL(SPIS_MOSI, 1, 14)>,
+				<NRF_PSEL(SPIS_MISO, 1, 31)>,
+				<NRF_PSEL(SPIS_CSN,  1, 4)>;
+			low-power-enable;
+		};
+	};
+};
+
+&gpio1 {
+	status = "okay";
+};
+
+&spi21 {
+	compatible = "nordic,nrf-spis";
+	status = "okay";
+	def-char = <0xFF>;
+	pinctrl-0 = <&spi21_slave_default>;
+	pinctrl-1 = <&spi21_slave_sleep>;
+	pinctrl-names = "default", "sleep";
+	/delete-property/ rx-delay-supported;
+	/delete-property/ rx-delay;
+};
