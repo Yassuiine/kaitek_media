@@ -3,7 +3,12 @@
     "allow": [
       "Bash(python3 -c ' *)",
       "Bash(python -c ' *)",
-      "Bash(grep -v \"//\")"
+      "Bash(grep -v \"//\")",
+      "Read(//c/ncs/v3.2.4/zephyr/boards/nordic/nrf54lm20dk/doc/**)",
+      "Read(//c/ncs/v3.2.4/zephyr/dts/arm/nordic/**)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\kaite\\03-FatFs_clean\\BM20_C"
     ]
   }
 }
