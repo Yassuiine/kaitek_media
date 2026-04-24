@@ -45,6 +45,7 @@ static int cmd_history_nav_index = -1;       // Index into cmd_history for Up/Do
 static char cmd_history_edit_backup[256];    // Snapshot of the in-progress edit saved before Up-arrow enters history mode
 static size_t cmd_history_edit_backup_len;   // Length of the saved edit backup (chars, excluding NUL)
 static bool cmd_history_backup_valid;        // True when cmd_history_edit_backup contains a valid saved line
+static bool tab_was_last_key;                // True after a Tab that left the token unchanged (arms second-Tab list display)
 
 static bool cam_snap_pending;                   // True while an async cam snap operation is in progress
 static absolute_time_t cam_snap_deadline;       // Absolute time after which the frame-wait phase times out
@@ -1670,6 +1671,7 @@ static void reset_command_line_state(void) {    cmd_ix = 0;
     cmd_history_backup_valid = false;
     cmd_history_edit_backup_len = 0;
     cmd_history_edit_backup[0] = '\0';
+    tab_was_last_key = false;
 }
 
 /**
@@ -3871,6 +3873,18 @@ static void run_nrf_group(const size_t argc, const char *argv[]) {
     }
 }
 
+static void run_alias_dotdot(const size_t argc, const char *argv[]) {
+    (void)argc; (void)argv;
+    const char *args[] = {".."};
+    run_cd(1, args);
+}
+
+static void run_alias_dotdotdot(const size_t argc, const char *argv[]) {
+    (void)argc; (void)argv;
+    const char *args[] = {"../.."};
+    run_cd(1, args);
+}
+
 typedef void (*p_fn_t)(const size_t argc, const char *argv[]);
 typedef struct {
     char const *const command;
@@ -3937,6 +3951,9 @@ static cmd_def_t cmds[] = {
      "pwd:\n"
      " Print Working Directory"},
     {"ls", run_ls, "ls [pathname]:\n List directory"},
+    {"ll",  run_ls,              "ll: Alias for ls"},
+    {"..",  run_alias_dotdot,    "..: Change to parent directory"},
+    {"...", run_alias_dotdotdot, "...: Change up two directories"},
     // {"dir", run_ls, "dir:\n List directory"},
     {"cat", run_cat, "cat <filename>:\n Type file contents"},
     {"simple", run_simple, "simple:\n Run simple FS tests"},
@@ -4219,6 +4236,7 @@ static void handle_tab_completion(void) {
         if (match_count == 0) {
             printf("\a");  // Bell: no match found.
             stdio_flush();
+            tab_was_last_key = false;
             return;
         }
 
@@ -4234,6 +4252,7 @@ static void handle_tab_completion(void) {
                 (cmd_ix == 0 || cmd_buffer[cmd_ix - 1] != ' ')) {
                 insert_text_at_cursor(" ");
             }
+            tab_was_last_key = false;
             return;
         }
 
@@ -4243,16 +4262,41 @@ static void handle_tab_completion(void) {
             cmd_ix < sizeof(cmd_buffer) - 1 &&
             (cmd_ix == 0 || cmd_buffer[cmd_ix - 1] != ' ')) {
             insert_text_at_cursor(" ");
+            tab_was_last_key = false;
             return;
         }
 
-        // Ambiguous: print all matching command names and redraw the line.
-        printf("\n");
-        for (size_t m = 0; m < match_count; ++m) {
-            printf("%s  ", cmds[match_idx[m]].command);
+        // First Tab: extend to the longest common prefix of all matches.
+        size_t lcp_len = strlen(cmds[match_idx[0]].command);
+        for (size_t m = 1; m < match_count; ++m) {
+            const char *s = cmds[match_idx[m]].command;
+            size_t i = prefix_len;
+            while (i < lcp_len && s[i] == cmds[match_idx[0]].command[i]) ++i;
+            lcp_len = i;
         }
-        printf("\n");
-        redraw_command_line();
+        if (lcp_len > prefix_len && cmd_cursor == cmd_ix) {
+            char suffix[32];
+            size_t suffix_len = lcp_len - prefix_len;
+            if (suffix_len >= sizeof(suffix)) suffix_len = sizeof(suffix) - 1;
+            memcpy(suffix, cmds[match_idx[0]].command + prefix_len, suffix_len);
+            suffix[suffix_len] = '\0';
+            insert_text_at_cursor(suffix);
+            tab_was_last_key = false;
+            return;
+        }
+        // Nothing to extend: second Tab on the same token prints the list.
+        if (tab_was_last_key) {
+            printf("\n");
+            for (size_t m = 0; m < match_count; ++m) {
+                printf("%s  ", cmds[match_idx[m]].command);
+            }
+            printf("\n");
+            redraw_command_line();
+            tab_was_last_key = false;
+        } else {
+            tab_was_last_key = true;
+            stdio_flush();
+        }
         return;
     }
 
@@ -4308,6 +4352,7 @@ static void handle_tab_completion(void) {
     if (match_count == 0) {
         printf("\a");  // Bell: no subcommand match.
         stdio_flush();
+        tab_was_last_key = false;
         return;
     }
 
@@ -4322,6 +4367,7 @@ static void handle_tab_completion(void) {
             (cmd_ix == 0 || cmd_buffer[cmd_ix - 1] != ' ')) {
             insert_text_at_cursor(" ");
         }
+        tab_was_last_key = false;
         return;
     }
     // Exact subcommand name typed but siblings exist: prefer space to avoid listing them.
@@ -4329,16 +4375,41 @@ static void handle_tab_completion(void) {
         cmd_ix < sizeof(cmd_buffer) - 1 &&
         (cmd_ix == 0 || cmd_buffer[cmd_ix - 1] != ' ')) {
         insert_text_at_cursor(" ");
+        tab_was_last_key = false;
         return;
     }
 
-    // Ambiguous subcommand: print all matches and redraw.
-    printf("\n");
-    for (size_t m = 0; m < match_count; ++m) {
-        printf("%s  ", subcmds[match_idx[m]]);
+    // First Tab: extend to the longest common prefix of all subcommand matches.
+    size_t lcp_len = strlen(subcmds[match_idx[0]]);
+    for (size_t m = 1; m < match_count; ++m) {
+        const char *s = subcmds[match_idx[m]];
+        size_t i = sub_prefix_len;
+        while (i < lcp_len && s[i] == subcmds[match_idx[0]][i]) ++i;
+        lcp_len = i;
     }
-    printf("\n");
-    redraw_command_line();
+    if (lcp_len > sub_prefix_len && cmd_cursor == cmd_ix) {
+        char suffix[32];
+        size_t suffix_len = lcp_len - sub_prefix_len;
+        if (suffix_len >= sizeof(suffix)) suffix_len = sizeof(suffix) - 1;
+        memcpy(suffix, subcmds[match_idx[0]] + sub_prefix_len, suffix_len);
+        suffix[suffix_len] = '\0';
+        insert_text_at_cursor(suffix);
+        tab_was_last_key = false;
+        return;
+    }
+    // Nothing to extend: second Tab on the same token prints the list.
+    if (tab_was_last_key) {
+        printf("\n");
+        for (size_t m = 0; m < match_count; ++m) {
+            printf("%s  ", subcmds[match_idx[m]]);
+        }
+        printf("\n");
+        redraw_command_line();
+        tab_was_last_key = false;
+    } else {
+        tab_was_last_key = true;
+        stdio_flush();
+    }
 }
 
 // Break command
@@ -4439,6 +4510,7 @@ void process_stdio(int cRxedChar) {
     if (!(0 < cRxedChar && cRxedChar <= 0x7F)) {
         return;
     }
+    if (cRxedChar != '\t') tab_was_last_key = false;
 
     if (esc_state != ESC_NONE) {
         // We are mid-sequence in the ANSI escape FSM; route byte accordingly.
