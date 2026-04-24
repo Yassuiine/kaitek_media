@@ -749,8 +749,18 @@ static int pipeline_mode_b_transfer_frame_via_nrf_to_lcd(const uint8_t *frame) {
             // Verify returned data matches the previous transmitted chunk fingerprint.
             size_t fp_cmp = mode_b_ctx.prev_byte_count < 16u ? mode_b_ctx.prev_byte_count : 16u;
             if (memcmp(nrf_validation_rx_chunk, mode_b_ctx.prev_tx_fingerprint, fp_cmp) != 0) {
-                printf("\nMode-B echo mismatch at row %lu (MISO open or SPI error)\n",
-                       (unsigned long)mode_b_ctx.prev_row);
+                printf("\nMode-B echo mismatch at row %lu\n"
+                       "  expected: %02X %02X %02X %02X  %02X %02X %02X %02X\n"
+                       "  received: %02X %02X %02X %02X  %02X %02X %02X %02X\n",
+                       (unsigned long)mode_b_ctx.prev_row,
+                       mode_b_ctx.prev_tx_fingerprint[0], mode_b_ctx.prev_tx_fingerprint[1],
+                       mode_b_ctx.prev_tx_fingerprint[2], mode_b_ctx.prev_tx_fingerprint[3],
+                       mode_b_ctx.prev_tx_fingerprint[4], mode_b_ctx.prev_tx_fingerprint[5],
+                       mode_b_ctx.prev_tx_fingerprint[6], mode_b_ctx.prev_tx_fingerprint[7],
+                       nrf_validation_rx_chunk[0], nrf_validation_rx_chunk[1],
+                       nrf_validation_rx_chunk[2], nrf_validation_rx_chunk[3],
+                       nrf_validation_rx_chunk[4], nrf_validation_rx_chunk[5],
+                       nrf_validation_rx_chunk[6], nrf_validation_rx_chunk[7]);
                 reset_mode_b_transfer_ctx();
                 return -1;
             }
