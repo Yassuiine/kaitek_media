@@ -1,4 +1,6 @@
 build
-!.vscode/*
-_cmp_02cam
-_cmp_lcd
+.vscode/
+_cmp_02cam/
+_cmp_lcd/
+.claude/
+docs/
