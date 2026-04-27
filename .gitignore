@@ -4,3 +4,5 @@ _cmp_02cam/
 _cmp_lcd/
 .claude/
 docs/
+.tmp_kicad/
+ToDo.txt
