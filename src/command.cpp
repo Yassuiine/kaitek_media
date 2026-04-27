@@ -2612,6 +2612,114 @@ static void run_lcd_fillrect(const size_t argc, const char *argv[]){
 }
 
 /**
+ * @brief Render a text string directly to the LCD panel via LCD_2IN_SetWindows + SPI.
+ * Bypasses the Paint framebuffer so the coordinate system matches all other drawing commands.
+ * Syntax: lcd text <x> <y> <size> <fg_hex> <bg_hex> <word> [word ...]
+ * Size selects the font height: 8, 12, 16, 20, or 24.
+ */
+static void run_lcd_text(const size_t argc, const char *argv[]) {
+    if (argc < 6) {
+        printf("Usage: lcd text <x> <y> <size> <fg_hex> <bg_hex> <message...>\n");
+        printf("  size: 8 | 12 | 16 | 20 | 24\n");
+        printf("  e.g.: lcd text 0 0 16 ffff 0000 Hello world\n");
+        return;
+    }
+    if (!lcd_initialized) {
+        printf("LCD not initialized. Run lcd_init first.\n");
+        return;
+    }
+
+    char *end;
+    long x = strtol(argv[0], &end, 10);
+    if (end == argv[0] || *end != '\0') { printf("Invalid x: %s\n", argv[0]); return; }
+    long y = strtol(argv[1], &end, 10);
+    if (end == argv[1] || *end != '\0') { printf("Invalid y: %s\n", argv[1]); return; }
+    long size = strtol(argv[2], &end, 10);
+    if (end == argv[2] || *end != '\0') { printf("Invalid size: %s\n", argv[2]); return; }
+    unsigned long fg = strtoul(argv[3], &end, 16);
+    if (end == argv[3] || *end != '\0') { printf("Invalid fg color: %s\n", argv[3]); return; }
+    unsigned long bg = strtoul(argv[4], &end, 16);
+    if (end == argv[4] || *end != '\0') { printf("Invalid bg color: %s\n", argv[4]); return; }
+
+    sFONT *font;
+    switch (size) {
+        case  8: font = &Font8;  break;
+        case 12: font = &Font12; break;
+        case 16: font = &Font16; break;
+        case 20: font = &Font20; break;
+        case 24: font = &Font24; break;
+        default:
+            printf("Invalid size %ld — use 8, 12, 16, 20, or 24.\n", size);
+            return;
+    }
+
+    /* Join remaining argv words into one string separated by spaces. */
+    char msg[256];
+    size_t pos = 0;
+    for (size_t i = 5; i < argc && pos < sizeof(msg) - 1; i++) {
+        if (i > 5 && pos < sizeof(msg) - 1) msg[pos++] = ' ';
+        size_t len = strlen(argv[i]);
+        if (pos + len >= sizeof(msg)) len = sizeof(msg) - 1 - pos;
+        memcpy(msg + pos, argv[i], len);
+        pos += len;
+    }
+    msg[pos] = '\0';
+
+    int lcd_width  = (lcd_scan_dir == VERTICAL) ? LCD_2IN_WIDTH  : LCD_2IN_HEIGHT;
+    int lcd_height = (lcd_scan_dir == VERTICAL) ? LCD_2IN_HEIGHT : LCD_2IN_WIDTH;
+
+    /* ILI9488 expects big-endian RGB565 on the wire — byte-swap once here. */
+    uint16_t fg_be = (uint16_t)((fg >> 8) | (fg << 8));
+    uint16_t bg_be = (uint16_t)((bg >> 8) | (bg << 8));
+
+    /* Pixel row buffer — max font width is 17 (Font24). */
+    uint16_t row_buf[20];
+
+    uint32_t bytes_per_row = (font->Width + 7u) / 8u;
+
+    uint16_t cur_x = (uint16_t)x;
+    uint16_t cur_y = (uint16_t)y;
+
+    for (const char *p = msg; *p; p++) {
+        uint8_t ch = (uint8_t)*p;
+        if (ch < 32 || ch > 126) ch = '?';
+
+        if ((int)(cur_x + font->Width) > lcd_width) {
+            cur_x = (uint16_t)x;
+            cur_y += (uint16_t)font->Height;
+        }
+        if ((int)(cur_y + font->Height) > lcd_height) break;
+
+        const uint8_t *char_data = font->table + (size_t)(ch - ' ') * bytes_per_row * font->Height;
+
+        /* Column address 0 maps to the physical right edge of the panel (MX=1 effective).
+         * Physical col cur_x → address (lcd_width - cur_x - Width). */
+        uint16_t x_addr = (uint16_t)(lcd_width - (int)cur_x - (int)font->Width);
+        LCD_2IN_SetWindows(x_addr, cur_y,
+                           (uint16_t)(x_addr + font->Width),
+                           (uint16_t)(cur_y + font->Height));
+        DEV_Digital_Write(LCD_DC_PIN, 1);
+        DEV_Digital_Write(LCD_CS_PIN, 0);
+
+        for (uint16_t row = 0; row < font->Height; row++) {
+            for (uint16_t col = 0; col < font->Width; col++) {
+                uint8_t byte = char_data[row * bytes_per_row + col / 8u];
+                /* SPI fills physical right→left within the window, so reverse column order. */
+                uint16_t dst = (uint16_t)(font->Width - 1u - col);
+                row_buf[dst] = (byte & (0x80u >> (col % 8u))) ? fg_be : bg_be;
+            }
+            DEV_SPI_Write_nByte((uint8_t *)row_buf, font->Width * 2u);
+        }
+
+        DEV_Digital_Write(LCD_CS_PIN, 1);
+        cur_x += (uint16_t)font->Width;
+    }
+
+    printf("Text drawn at (%ld,%ld) size=%ld fg=0x%04lX bg=0x%04lX: \"%s\"\n",
+           x, y, size, fg, bg, msg);
+}
+
+/**
  * @brief Change the LCD scan direction between vertical (portrait) and horizontal (landscape) without reinitialising.
  */
 static void run_lcd_set_orientation(const size_t argc, const char *argv[]) {
@@ -3712,7 +3820,7 @@ static void print_cam_group_help(void) {
  */
 static void print_lcd_group_help(void) {
     printf("lcd <subcommand> [args]\n");
-    printf("Subcommands: init, bl, clear, pixel, fillrect, orient, snap,\n");
+    printf("Subcommands: init, bl, clear, pixel, fillrect, text, orient, snap,\n");
     printf("             load, unload, stream, status, fps\n");
     printf("Examples: lcd stream, lcd stream -s, lcd load 0:/cam/test0.rgb565\n");
 }
@@ -3745,7 +3853,7 @@ static const char *const cam_group_subcmds[] = {
     "snap", "capture"
 };
 static const char *const lcd_group_subcmds[] = {
-    "init", "bl", "clear", "pixel", "fillrect", "orient", "orientation",
+    "init", "bl", "clear", "pixel", "fillrect", "text", "orient", "orientation",
     "snap", "load", "unload", "stream", "status", "fps"
 };
 static const char *const sm_group_subcmds[] = {
@@ -3817,7 +3925,8 @@ static void run_lcd_group(const size_t argc, const char *argv[]) {
     const char *sub = argv[0];
     size_t sub_argc = argc - 1;
     const char **sub_argv = argv + 1;
-    if (strcmp(sub, "init") == 0) run_lcd_init(sub_argc, sub_argv);    else if (strcmp(sub, "bl") == 0) run_lcd_bl(sub_argc, sub_argv);    else if (strcmp(sub, "clear") == 0) run_lcd_clear(sub_argc, sub_argv);    else if (strcmp(sub, "pixel") == 0) run_lcd_pixel(sub_argc, sub_argv);    else if (strcmp(sub, "fillrect") == 0) run_lcd_fillrect(sub_argc, sub_argv);    else if (strcmp(sub, "orient") == 0 || strcmp(sub, "orientation") == 0) run_lcd_set_orientation(sub_argc, sub_argv);    else if (strcmp(sub, "snap") == 0) run_lcd_cam_snap(sub_argc, sub_argv);    else if (strcmp(sub, "load") == 0) run_lcd_load_image(sub_argc, sub_argv);    else if (strcmp(sub, "unload") == 0) run_lcd_unload_image(sub_argc, sub_argv);
+    if (strcmp(sub, "init") == 0) run_lcd_init(sub_argc, sub_argv);    else if (strcmp(sub, "bl") == 0) run_lcd_bl(sub_argc, sub_argv);    else if (strcmp(sub, "clear") == 0) run_lcd_clear(sub_argc, sub_argv);    else if (strcmp(sub, "pixel") == 0) run_lcd_pixel(sub_argc, sub_argv);    else if (strcmp(sub, "fillrect") == 0) run_lcd_fillrect(sub_argc, sub_argv);    else if (strcmp(sub, "text") == 0) run_lcd_text(sub_argc, sub_argv);
+    else if (strcmp(sub, "orient") == 0 || strcmp(sub, "orientation") == 0) run_lcd_set_orientation(sub_argc, sub_argv);    else if (strcmp(sub, "snap") == 0) run_lcd_cam_snap(sub_argc, sub_argv);    else if (strcmp(sub, "load") == 0) run_lcd_load_image(sub_argc, sub_argv);    else if (strcmp(sub, "unload") == 0) run_lcd_unload_image(sub_argc, sub_argv);
     else if (strcmp(sub, "stream") == 0) {
         if (sub_argc >= 1 && (strcmp(sub_argv[0], "-s") == 0 || strcmp(sub_argv[0], "--stop") == 0)) {
             const char *stop_argv[] = {"stop"};
@@ -4147,6 +4256,10 @@ static cmd_def_t cmds[] = {
      "lcd_fillrect <x> <y> <w> <h> <color>:\n"
      " Fill a rectangle on the LCD with the specified color (hex RGB565, e.g. ffff for white)\n"
      "\te.g.: lcd_fillrect 50 50 100 100 ffff"},
+    {"lcd_text", run_lcd_text,
+     "lcd_text <x> <y> <size> <fg_hex> <bg_hex> <message...>:\n"
+     " Draw a text string on the LCD. size: 8|12|16|20|24\n"
+     "\te.g.: lcd_text 0 0 16 ffff 0000 Hello world"},
     {"lcd_set_orientation", run_lcd_set_orientation,
      "lcd_set_orientation <vertical|horizontal>:\n"
      " Set the scan direction of the LCD (default vertical)"},
