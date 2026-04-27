@@ -1,0 +1,42 @@
+; ============================================================
+;  live_cam_test.ttl  -  Use Case 6.4: SPI Loopback / Connectivity Test
+;  Shell Interface Reference Rev 1.0, Kaimasys 2025
+;
+;  Sync strategy: wait for 'Kaitek> ' after each command .
+;
+;  Usage: TeraTerm > Control > Macro  (must already be connected)
+; ============================================================
+
+; ---- Already connected - no connect needed ----
+; connect '/C=3 /BAUD=115200'
+
+timeout = 3
+
+sendln ''
+waitln 'Kaitek> '
+
+; Step 1 - nrf init
+sendln 'nrf init 15000000'
+waitln 'NRF SPI ready: SCK=18 MOSI=19 MISO=20 CS=22 actual=15000000 Hz'
+
+if result = 1 then
+    waitln 'Kaitek> '
+; Step 2 - prime slave
+    sendln 'nrf xfer AB AB AB AB'
+    waitln 'Kaitek> '
+; Step 3 - resend and verify
+    timeout = 1
+    sendln 'nrf xfer AB AB AB AB'
+    waitln 'PASSED'
+    if result = 1 then
+        waitln 'Kaitek> '
+        messagebox 'PASS: NRF SPI loopback successful.' 'NRF SPI Test'
+    else
+        messagebox 'FAIL: NRF SPI loopback failed. Check connections and power.' 'NRF SPI Test'
+    endif
+else
+    messagebox 'FAIL: NRF SPI initialization failed. Check connections and power.' 'NRF Test'
+    waitln 'Kaitek> '
+endif
+end
+

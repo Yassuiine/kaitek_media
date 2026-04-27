@@ -1998,7 +1998,7 @@ static void run_cam_rreg(const size_t argc, const char *argv[]) {
  */
 static void run_cam_xclk(const size_t argc, const char *argv[]){
     if (argc > 1) {
-        printf("Usage: cam_xclk [6000..27000]\n");
+        printf("Usage: cam_xclk [freq_khz]  (default 24000)\n");
         return;
     }
 
@@ -3263,6 +3263,9 @@ static void run_nrf_spi_init(const size_t argc, const char *argv[]) {
     printf("NRF SPI ready: SCK=%u MOSI=%u MISO=%u CS=%u actual=%lu Hz\n",
            nrf_spi_sck_pin, nrf_spi_mosi_pin, nrf_spi_miso_pin, nrf_spi_cs_pin,
            (unsigned long)nrf_spi_actual_hz);
+    printf("Timing defaults: gap=%lu us  setup=%lu us  hold=%lu us  chunk=%lu rows\n",
+           (unsigned long)nrf_spi_frame_gap_us, (unsigned long)nrf_spi_cs_setup_us,
+           (unsigned long)nrf_spi_cs_hold_us, (unsigned long)nrf_validation_rows_per_chunk);
 }
 
 /**
@@ -3306,6 +3309,7 @@ static void run_nrf_spi_xfer(const size_t argc, const char *argv[]) {
 
     if (ret < 0 || (size_t)ret != n) {
         printf("SPI transfer failed (%d)\n", ret);
+        printf("FAILED\n");
         return;
     }
 
@@ -3313,7 +3317,7 @@ static void run_nrf_spi_xfer(const size_t argc, const char *argv[]) {
     print_hex_bytes(tx, n);
     printf("\nRX: ");
     print_hex_bytes(rx, n);
-    printf("\n");
+    printf("\nPASSED\n");
 }
 
 /**
@@ -3668,21 +3672,25 @@ static void run_nrf_timing(const size_t argc, const char *argv[]) {
         return;
     }
     if (strcmp(argv[0], "gap") == 0) {
+        uint32_t old = nrf_spi_frame_gap_us;
         nrf_spi_frame_gap_us = val;
-        printf("gap = %lu us\n", (unsigned long)nrf_spi_frame_gap_us);
+        printf("gap: %lu -> %lu us\n", (unsigned long)old, (unsigned long)nrf_spi_frame_gap_us);
     } else if (strcmp(argv[0], "setup") == 0) {
+        uint32_t old = nrf_spi_cs_setup_us;
         nrf_spi_cs_setup_us = val;
-        printf("cs_setup = %lu us\n", (unsigned long)nrf_spi_cs_setup_us);
+        printf("cs_setup: %lu -> %lu us\n", (unsigned long)old, (unsigned long)nrf_spi_cs_setup_us);
     } else if (strcmp(argv[0], "hold") == 0) {
+        uint32_t old = nrf_spi_cs_hold_us;
         nrf_spi_cs_hold_us = val;
-        printf("cs_hold = %lu us\n", (unsigned long)nrf_spi_cs_hold_us);
+        printf("cs_hold: %lu -> %lu us\n", (unsigned long)old, (unsigned long)nrf_spi_cs_hold_us);
     } else if (strcmp(argv[0], "chunk") == 0) {
         if (val == 0 || val > NRF_VALIDATION_ROWS_MAX) {
             printf("chunk must be 1..%u\n", NRF_VALIDATION_ROWS_MAX);
             return;
         }
+        uint32_t old = nrf_validation_rows_per_chunk;
         nrf_validation_rows_per_chunk = val;
-        printf("rows_per_chunk = %lu\n", (unsigned long)nrf_validation_rows_per_chunk);
+        printf("rows_per_chunk: %lu -> %lu\n", (unsigned long)old, (unsigned long)nrf_validation_rows_per_chunk);
     } else {
         printf("Unknown key '%s'. Use: gap | setup | hold | chunk\n", argv[0]);
     }
@@ -4084,7 +4092,7 @@ static cmd_def_t cmds[] = {
      "\te.g.: cam_mirror 0"},
     {"cam_pll", run_cam_pll,
      "cam_pll <multiplier>:\n"
-     " Set PLL multiplier (4-127 any, 128-252 even only)\n"
+     " Set PLL multiplier. Default 11 (~25 fps at 240x320).\n"
      "\te.g.: cam_pll 11"},
     {"cam_format", run_cam_format,
      "cam_format <rgb565|yuv422>:\n"

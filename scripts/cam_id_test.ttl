@@ -1,0 +1,41 @@
+; ============================================================
+;  cam_id_test.ttl  -  Use Case 6.1: Verify OV5640 Camera Sensor
+;  Shell Interface Reference Rev 1.0, Kaimasys 2025
+;
+;  Sync strategy: 'pause' after each command (no prompt matching).
+;  The shell prompt has no trailing newline so waitln cannot match it.
+;  waitln is only used for the 'cam id' output line which does end
+;  with a newline.
+;
+;  Usage: TeraTerm > Control > Macro  (must already be connected)
+; ============================================================
+
+; ---- Already connected - no connect needed ----
+; connect '/C=3 /BAUD=115200'
+
+timeout = 3
+
+sendln ''
+waitln 'Kaitek> '
+; Step 1 - cam xclk  (takes ~1 s)
+sendln 'cam xclk'
+waitln 'Kaitek> '
+
+; Step 2 - cam i2c  (takes ~1 s)
+sendln 'cam i2c'
+waitln 'Kaitek> '
+
+; Step 3 - cam id
+;   Expected output line:  ID: 22080  (= 0x5640)
+;   waitln matches because this line ends with a newline.
+;   If the ID does not match or camera is absent the timeout fires
+;   and result = 0, giving the FAIL branch.
+sendln 'cam id'
+waitln '[rear] ID: 22080 (0x5640)'
+if result = 1 then
+    messagebox 'PASS: OV5640 detected - ID = 0x5640 (22080).' 'Camera ID Test'
+else
+    messagebox 'FAIL: ID 22080 not received. Check XCLK=GP11 SDA=GP22 SCL=GP23 and 3.3V supply.' 'Camera ID Test'
+endif
+
+end
