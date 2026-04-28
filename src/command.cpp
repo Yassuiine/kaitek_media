@@ -1150,7 +1150,15 @@ static void run_format(const size_t argc, const char *argv[]) {
         printf("Unknown logical drive id: \"%s\"\n", arg);
         return;
     }
-    int ds = sd_card_p->init(sd_card_p);
+    int ds;
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+        if (attempt > 1)
+            sleep_ms(2000);
+        ds = sd_card_p->init(sd_card_p);
+        if (!(STA_NODISK & ds) && !(STA_NOINIT & ds))
+            break;
+        printf("SD init attempt %d failed (0x%02x), retrying...\n", attempt, ds);
+    }
     if (STA_NODISK & ds || STA_NOINIT & ds) {
         printf("SD card initialization failed, status=0x%02x\n", ds);
         return;
@@ -1194,14 +1202,36 @@ static void run_format(const size_t argc, const char *argv[]) {
     };
     /* Format the drive */
     printf("Formatting %s (this may take a while)...\n", arg);
-    FRESULT fr = f_mkfs(arg, &opt, 0, 32 * 1024);  // 32 KB: ~32x fewer disk_write calls vs FF_MAX_SS*2    if (FR_OK != fr) printf("f_mkfs error: %s (%d)\n", FRESULT_str(fr), fr);
+    FRESULT fr = f_mkfs(arg, &opt, 0, 32 * 1024);  // 32 KB: ~32x fewer disk_write calls vs FF_MAX_SS*2
+    if (FR_OK != fr) {
+        printf("f_mkfs error: %s (%d)\n", FRESULT_str(fr), fr);
+        return;
+    }
 
-    /* This only works if the drive is mounted: */
+    /* Re-init the card — f_mkfs leaves it in a post-write idle state that
+     * confuses a subsequent cold init in run_mount. */
+    sd_card_p->state.m_Status |= STA_NOINIT;
+    sd_card_p->state.mounted = false;
+    ds = sd_card_p->init(sd_card_p);
+    if (STA_NODISK & ds || STA_NOINIT & ds) {
+        printf("Re-init after format failed (0x%02x)\n", ds);
+        return;
+    }
+
+    FATFS *fs_p = &sd_card_p->state.fatfs;
+    fr = f_mount(fs_p, arg, 1);
+    if (FR_OK != fr) {
+        printf("Mount after format failed: %s (%d)\n", FRESULT_str(fr), fr);
+        return;
+    }
+    sd_card_p->state.mounted = true;
+
 #if FF_USE_LABEL
     TCHAR label[32];
     snprintf(label, sizeof(label), "%sFatFS", arg);
-    fr = f_setlabel(label);
+    f_setlabel(label);
 #endif
+    printf("Format and mount complete.\n");
 }
 /**
  * @brief Initialise an SD card and mount its FatFS volume, making it accessible for file commands.

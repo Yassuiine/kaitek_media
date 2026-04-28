@@ -58,10 +58,12 @@ DSTATUS disk_initialize(
         return RES_PARERR;
     }
     DSTATUS ds = disk_status(pdrv);
-    if (STA_NODISK & ds) 
+    if (STA_NODISK & ds)
         return ds;
+    if (!(STA_NOINIT & ds))
+        return ds;  /* Already initialized — skip re-init */
     DSTATUS result = sd_card_p->init(sd_card_p);
-    return result;  
+    return result;
 }
 
 static int sdrc2dresult(int sd_rc) {
@@ -144,15 +146,8 @@ DRESULT disk_ioctl(BYTE pdrv, /* Physical drive number (0..) */
         return RES_PARERR;
     }
     switch (cmd) {
-        case GET_SECTOR_COUNT: {  // Retrieves number of available sectors, the
-                                  // largest allowable LBA + 1, on the drive
-                                  // into the LBA_t variable pointed by buff.
-                                  // This command is used by f_mkfs and f_fdisk
-                                  // function to determine the size of
-                                  // volume/partition to be created. It is
-                                  // required when FF_USE_MKFS == 1.
-            static LBA_t n;
-            n = sd_card_p->get_num_sectors(sd_card_p);
+        case GET_SECTOR_COUNT: {
+            LBA_t n = sd_card_p->state.sectors;
             *(LBA_t *)buff = n;
             if (!n) return RES_ERROR;
             return RES_OK;

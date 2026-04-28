@@ -8,7 +8,7 @@
  * Dedicated HSSPI pins (nRF54LM20 PS §6.25):
  *   P2.06 SCK  →  Pico GPIO18
  *   P2.09 MOSI →  Pico GPIO19   (SDI on nRF side)
- *   P2.07 MISO →  Pico GPIO20   (board variant uses P2.07; P2.08 not routed)
+ *   P2.02 MISO →  Pico GPIO20   (board variant uses P2.02; P2.08 not routed)
  *   P2.10 CSN  →  Pico GPIO22
  */
 
