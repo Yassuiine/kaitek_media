@@ -3652,7 +3652,7 @@ static void run_nrf_spi_xfer(const size_t argc, const char *argv[]) {
     print_hex_bytes(tx, n);
     printf("\nRX: ");
     print_hex_bytes(rx, n);
-    printf("\nPASSED\n");
+    printf("\n%s\n", memcmp(rx, tx, n) == 0 ? "PASSED" : "FAILED");
 }
 
 /**

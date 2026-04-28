@@ -1,68 +1,128 @@
-/*
- * nRF54LM20 DK CPUAPP SPI-slave overlay.
- *
- * ┌─────────────────────────────────────────────────────────────────────┐
- * │  To switch between Port 1 (current) and Port 2, change these 4     │
- * │  things:                                                            │
- * │                                                                     │
- * │  1. alias:      spis = &spi21   ←→   spis = &spi00                 │
- * │  2. pinctrl:    NRF_PSEL(..., 1, x)  ←→  NRF_PSEL(..., 2, x)      │
- * │     (also rename the node labels to match, e.g. spi21_* / spi00_*) │
- * │  3. gpio bank:  &gpio1  ←→  &gpio2                                 │
- * │  4. SPI node:   &spi21  ←→  &spi00                                 │
- * │                                                                     │
- * │  Port 1 uses spi21 (LSSPI, max ~8 MHz in practice).                │
- * │  Port 2 uses spi00 (HSSPI, higher ceiling but same limit on wires). │
- * │  P2 pins are fixed to HSSPI: SCK=P2.06 MOSI=P2.09 MISO=P2.02      │
- * │  CSN=P2.10. P1 pins are flexible — any P1.xx works with spi21.     │
- * └─────────────────────────────────────────────────────────────────────┘
- *
- * Current config — Port 1 / spi21:
- *   P1.07 SCK  →  Pico GPIO18
- *   P1.09 MOSI →  Pico GPIO19
- *   P1.00 MISO →  Pico GPIO20
- *   P1.06 CSN  →  Pico GPIO22
- */
+// /*
+//  * nRF54LM20 DK CPUAPP SPI-slave overlay.
+//  *
+//  * Two complete configurations are provided below.  Only ONE may be active
+//  * at a time.
+//  *
+//  * HOW TO SWITCH PORTS
+//  * ────────────────────
+//  *   Activate Port 1 (current):  the PORT 1 block is uncommented.
+//  *                                Make sure the PORT 2 block stays inside
+//  *                                its comment markers.
+//  *
+//  *   Activate Port 2:            wrap the entire PORT 1 block in  /* ... */
+//  *                                then remove the opening and closing
+//  *                                comment markers from the PORT 2 block.
+//  *
+//  * Pin mapping (Pico-side GPIO numbers are the same for both ports):
+//  *
+//  *              PORT 1  (spi21 / LSSPI)     PORT 2  (spi00 / HSSPI)
+//  *   SCK        P1.07  →  Pico GPIO18       P2.06  →  Pico GPIO18
+//  *   MOSI       P1.09  →  Pico GPIO19       P2.09  →  Pico GPIO19
+//  *   MISO       P1.00  →  Pico GPIO20       P2.02  →  Pico GPIO20
+//  *   CSN        P1.10  →  Pico GPIO22       P2.10  →  Pico GPIO22
+//  *
+//  * spi21 = LSSPI  — max ~8 MHz in practice, any P1.xx pin works.
+//  * spi00 = HSSPI  — up to 32 MHz, pins are fixed to the P2 HSSPI block.
+//  */
 
+
+// /* ══════════════════  PORT 1 — spi21 / LSSPI  (ACTIVE)  ═══════════════════════ */
+
+// / {
+// 	aliases {
+// 		led = &led0;
+// 		spis = &spi21;
+// 	};
+// };
+
+// &pinctrl {
+// 	spi21_slave_default: spi21_slave_default {
+// 		group1 {
+// 			psels = <NRF_PSEL(SPIS_SCK,  1, 7)>,
+// 				<NRF_PSEL(SPIS_MOSI, 1, 9)>,
+// 				<NRF_PSEL(SPIS_MISO, 1, 0)>,
+// 				<NRF_PSEL(SPIS_CSN,  1, 10)>;
+// 		};
+// 	};
+
+// 	spi21_slave_sleep: spi21_slave_sleep {
+// 		group1 {
+// 			psels = <NRF_PSEL(SPIS_SCK,  1, 7)>,
+// 				<NRF_PSEL(SPIS_MOSI, 1, 9)>,
+// 				<NRF_PSEL(SPIS_MISO, 1, 0)>,
+// 				<NRF_PSEL(SPIS_CSN,  1, 10)>;
+// 			low-power-enable;
+// 		};
+// 	};
+// };
+
+// &gpio1 {
+// 	status = "okay";
+// };
+
+// &spi21 {
+// 	compatible = "nordic,nrf-spis";
+// 	status = "okay";
+// 	def-char = <0xFF>;
+// 	pinctrl-0 = <&spi21_slave_default>;
+// 	pinctrl-1 = <&spi21_slave_sleep>;
+// 	pinctrl-names = "default", "sleep";
+// 	/delete-property/ rx-delay-supported;
+// 	/delete-property/ rx-delay;
+// };
+
+/* ══════════════════════════════════════════════════════════════════════════════ */
+
+
+/* ══════════════  PORT 2 — spi00 / HSSPI  (COMMENTED OUT)  ════════════════════
+ *
+ * To activate Port 2:
+ *   1. Remove this opening comment marker (the line above).
+ *   2. Remove the closing comment marker at the bottom of this section.
+ *   3. Wrap the entire PORT 1 block above in a comment.
+*/
 / {
 	aliases {
 		led = &led0;
-		spis = &spi21;          /* Port 2: change to &spi00 */
+		spis = &spi00;
 	};
 };
 
 &pinctrl {
-	spi21_slave_default: spi21_slave_default {  /* Port 2: rename to spi00_slave_default */
+	spi00_slave_default: spi00_slave_default {
 		group1 {
-			psels = <NRF_PSEL(SPIS_SCK,  1, 7)>,   /* Port 2: change 1 → 2, pin → 6  */
-				<NRF_PSEL(SPIS_MOSI, 1, 9)>,   /* Port 2: change 1 → 2, pin → 9  */
-				<NRF_PSEL(SPIS_MISO, 1, 0)>,   /* Port 2: change 1 → 2, pin → 2  */
-				<NRF_PSEL(SPIS_CSN,  1, 10)>;   /* Port 2: change 1 → 2, pin → 10 */
+			psels = <NRF_PSEL(SPIS_SCK,  2, 6)>,
+				<NRF_PSEL(SPIS_MOSI, 2, 9)>,
+				<NRF_PSEL(SPIS_MISO, 2, 2)>,
+				<NRF_PSEL(SPIS_CSN,  2, 10)>;
 		};
 	};
 
-	spi21_slave_sleep: spi21_slave_sleep {      /* Port 2: rename to spi00_slave_sleep */
+	spi00_slave_sleep: spi00_slave_sleep {
 		group1 {
-			psels = <NRF_PSEL(SPIS_SCK,  1, 7)>,
-				<NRF_PSEL(SPIS_MOSI, 1, 9)>,
-				<NRF_PSEL(SPIS_MISO, 1, 0)>,
-				<NRF_PSEL(SPIS_CSN,  1, 10)>;
+			psels = <NRF_PSEL(SPIS_SCK,  2, 6)>,
+				<NRF_PSEL(SPIS_MOSI, 2, 9)>,
+				<NRF_PSEL(SPIS_MISO, 2, 2)>,
+				<NRF_PSEL(SPIS_CSN,  2, 10)>;
 			low-power-enable;
 		};
 	};
 };
 
-&gpio1 {                /* Port 2: change to &gpio2 */
+&gpio2 {
 	status = "okay";
 };
 
-&spi21 {                /* Port 2: change to &spi00 */
+&spi00 {
 	compatible = "nordic,nrf-spis";
 	status = "okay";
 	def-char = <0xFF>;
-	pinctrl-0 = <&spi21_slave_default>;     /* Port 2: change to &spi00_slave_default */
-	pinctrl-1 = <&spi21_slave_sleep>;       /* Port 2: change to &spi00_slave_sleep   */
+	pinctrl-0 = <&spi00_slave_default>;
+	pinctrl-1 = <&spi00_slave_sleep>;
 	pinctrl-names = "default", "sleep";
 	/delete-property/ rx-delay-supported;
 	/delete-property/ rx-delay;
 };
+
+//══════════════════════════  END PORT 2  ═══════════════════════════════════════ 
