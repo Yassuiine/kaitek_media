@@ -1,6 +1,7 @@
 ﻿#include <assert.h>
 #include <ctype.h>
 #include <malloc.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,6 +59,15 @@ static absolute_time_t cam_snap_next_step_time; // Earliest time the state machi
 static bool last_input_was_cr;                  // Tracks whether the previous byte was CR to suppress the following LF (CRLF â†' CR)
 
 static bool lcd_initialized = false;               // True after lcd_init succeeds; guards all LCD command handlers
+static bool lcd_con_active = false;                // True while the LCD console output driver is registered
+static uint8_t lcd_con_ansi_state = 0;             // 0=normal, 1=seen ESC, 2=in CSI sequence (strip until final letter)
+static int  lcd_con_x = 0;                        // Cursor column in pixels
+static int  lcd_con_y = 0;                        // Cursor row in pixels
+static uint16_t lcd_con_fg = 0xFFFF;              // Console foreground colour (default white)
+static uint16_t lcd_con_bg = 0x0000;              // Console background colour (default black)
+static const sFONT *lcd_con_font = &Font8;        // Console font (Font8 = 8×8 px → 40 cols × 60 rows at 320×480)
+static int lcd_con_width  = 0;                    // Panel pixel width cached at lcdcon start
+static int lcd_con_height = 0;                    // Panel pixel height cached at lcdcon start
 static uint8_t lcd_backlight = 0;                  // Current PWM backlight level in percent (0 = off, 100 = full)
 static UBYTE lcd_scan_dir = VERTICAL;              // Current panel scan direction: VERTICAL (portrait) or HORIZONTAL (landscape)
 static UWORD *lcd_image = NULL;                    // Heap-allocated framebuffer (WIDTH×HEIGHT RGB565 words); NULL before lcd_init
@@ -139,6 +149,30 @@ static void lcd_copy_raw_rows_to_framebuffer(uint32_t start_row, uint32_t row_co
 static void shared_enter_cam_prog(void);
 static void shared_leave_cam_prog(void);
 static void reset_mode_b_transfer_ctx(void);
+static void lcd_con_putchar(char c);
+
+// Dual-output printf: always writes to UART/USB via vprintf, and also mirrors
+// to the LCD console when lcd_con_active is set. #define below replaces all
+// printf calls in this TU so the LCD terminal sees every shell output line.
+__attribute__((format(printf, 1, 2)))
+static int kaitek_printf(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vprintf(fmt, ap);
+    va_end(ap);
+    if (lcd_con_active) {
+        static char buf[512];
+        va_list ap2;
+        va_start(ap2, fmt);
+        int len = vsnprintf(buf, sizeof(buf), fmt, ap2);
+        va_end(ap2);
+        int limit = (len < (int)sizeof(buf)) ? len : (int)sizeof(buf) - 1;
+        for (int i = 0; i < limit; i++)
+            lcd_con_putchar(buf[i]);
+    }
+    return n;
+}
+#define printf kaitek_printf
 
 
 /**
@@ -2641,6 +2675,156 @@ static void run_lcd_fillrect(const size_t argc, const char *argv[]){
 
 }
 
+/* ── LCD console ─────────────────────────────────────────────────────────────
+ * Adds an LCD output driver to pico stdio so all shell I/O (echo + command
+ * output) is mirrored to the LCD panel as a text terminal.  USB/UART output
+ * stays active, so you can still observe the terminal remotely.
+ *
+ * Uses the same MX-mirror rendering path as run_lcd_text.
+ * Scrolling is "clear & wrap" — no framebuffer redraw needed.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+static void lcd_con_draw_char(char c, int x, int y) {
+    spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    const sFONT *font = lcd_con_font;
+    uint32_t bpr = (font->Width + 7u) / 8u;
+    const uint8_t *cd = font->table + (size_t)((uint8_t)c - ' ') * bpr * font->Height;
+
+    // VERTICAL: physical col 0 = right edge, so mirror the x address and reverse pixels.
+    // HORIZONTAL (MV=1): physical col 0 = left edge, so use direct addressing.
+    bool mirror = (lcd_scan_dir == VERTICAL);
+    uint16_t x_addr = mirror ? (uint16_t)(lcd_con_width - x - (int)font->Width)
+                             : (uint16_t)x;
+    LCD_2IN_SetWindows(x_addr, (uint16_t)y,
+                       (uint16_t)(x_addr + font->Width),
+                       (uint16_t)(y + font->Height));
+    DEV_Digital_Write(LCD_DC_PIN, 1);
+    DEV_Digital_Write(LCD_CS_PIN, 0);
+
+    uint16_t fg_be = (uint16_t)((lcd_con_fg >> 8) | (lcd_con_fg << 8));
+    uint16_t bg_be = (uint16_t)((lcd_con_bg >> 8) | (lcd_con_bg << 8));
+    uint16_t row_buf[20];
+
+    for (uint16_t row = 0; row < font->Height; row++) {
+        for (uint16_t col = 0; col < font->Width; col++) {
+            uint8_t byte = cd[row * bpr + col / 8u];
+            uint16_t dst = mirror ? (uint16_t)(font->Width - 1u - col) : col;
+            row_buf[dst] = (byte & (0x80u >> (col % 8u))) ? fg_be : bg_be;
+        }
+        DEV_SPI_Write_nByte((uint8_t *)row_buf, font->Width * 2u);
+    }
+    DEV_Digital_Write(LCD_CS_PIN, 1);
+}
+
+static void lcd_con_scroll(void) {
+    spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    LCD_2IN_Clear(lcd_con_bg);
+    lcd_con_x = 0;
+    lcd_con_y = 0;
+}
+
+static void lcd_con_putchar(char c) {
+    if (!lcd_con_active || !lcd_initialized || !lcd_con_width) return;
+
+    // Strip ANSI/VT escape sequences so line-editing sequences (erase-to-EOL,
+    // cursor-back, etc.) don't appear as literal '[', 'K', digits on the LCD.
+    if ((unsigned char)c == 0x1b) { lcd_con_ansi_state = 1; return; }
+    if (lcd_con_ansi_state == 1) {
+        lcd_con_ansi_state = (c == '[') ? 2 : 0;  // '[' → CSI sequence; anything else → 2-char seq, consumed
+        return;
+    }
+    if (lcd_con_ansi_state == 2) {
+        if (c == 'K') {
+            // Erase to end of line: fill remaining cells on current row with background.
+            lcd_con_ansi_state = 0;
+            int cw = (int)lcd_con_font->Width;
+            int save_x = lcd_con_x;
+            while (lcd_con_x + cw <= lcd_con_width) {
+                lcd_con_draw_char(' ', lcd_con_x, lcd_con_y);
+                lcd_con_x += cw;
+            }
+            lcd_con_x = save_x;
+            return;
+        }
+        if (isalpha((unsigned char)c) || c == '~') lcd_con_ansi_state = 0;
+        return;
+    }
+
+    const sFONT *font = lcd_con_font;
+    int ch = (int)font->Height;
+    int cw = (int)font->Width;
+
+    if (c == '\n') {
+        lcd_con_x  = 0;
+        lcd_con_y += ch;
+        if (lcd_con_y + ch > lcd_con_height) lcd_con_scroll();
+        return;
+    }
+    if (c == '\r') { lcd_con_x = 0; return; }
+    if (c == '\b') {
+        if (lcd_con_x >= cw) lcd_con_x -= cw;
+        lcd_con_draw_char(' ', lcd_con_x, lcd_con_y);
+        return;
+    }
+    if ((unsigned char)c < 32 || (unsigned char)c > 126) return;
+
+    if (lcd_con_x + cw > lcd_con_width) {
+        lcd_con_x  = 0;
+        lcd_con_y += ch;
+        if (lcd_con_y + ch > lcd_con_height) lcd_con_scroll();
+    }
+    lcd_con_draw_char(c, lcd_con_x, lcd_con_y);
+    lcd_con_x += cw;
+}
+
+static void lcd_con_stop(void) {
+    if (!lcd_con_active) return;
+    lcd_con_active = false;
+}
+
+static void lcd_con_start(uint16_t fg, uint16_t bg, const sFONT *font) {
+    if (!lcd_initialized) { printf("LCD not initialized.\n"); return; }
+    lcd_con_stop();
+    lcd_con_fg     = fg;
+    lcd_con_bg     = bg;
+    lcd_con_font   = font;
+    lcd_con_width  = (lcd_scan_dir == VERTICAL) ? LCD_2IN_WIDTH  : LCD_2IN_HEIGHT;
+    lcd_con_height = (lcd_scan_dir == VERTICAL) ? LCD_2IN_HEIGHT : LCD_2IN_WIDTH;
+    lcd_con_x = 0;
+    lcd_con_y = 0;
+    shared_enter_lcd_active();
+    LCD_2IN_Clear(bg);
+    lcd_con_active = true;
+}
+
+static void run_lcdcon(const size_t argc, const char *argv[]) {
+    if (argc > 0 && strcmp(argv[0], "-s") == 0) {
+        if (!lcd_con_active) { printf("LCD console is not active.\n"); return; }
+        lcd_con_stop();
+        printf("LCD console stopped.\n");
+        return;
+    }
+
+    const sFONT *font = &Font8;
+    uint16_t fg = 0xFFFF, bg = 0x0000;
+
+    if (argc >= 1) {
+        int sz = atoi(argv[0]);
+        switch (sz) {
+            case  8: font = &Font8;  break;
+            case 12: font = &Font12; break;
+            case 16: font = &Font16; break;
+            case 20: font = &Font20; break;
+            case 24: font = &Font24; break;
+            default: printf("Invalid size %d — use 8/12/16/20/24\n", sz); return;
+        }
+    }
+    if (argc >= 2) fg = (uint16_t)strtoul(argv[1], NULL, 16);
+    if (argc >= 3) bg = (uint16_t)strtoul(argv[2], NULL, 16);
+
+    lcd_con_start(fg, bg, font);
+}
+
 /**
  * @brief Render a text string directly to the LCD panel via LCD_2IN_SetWindows + SPI.
  * Bypasses the Paint framebuffer so the coordinate system matches all other drawing commands.
@@ -2722,9 +2906,11 @@ static void run_lcd_text(const size_t argc, const char *argv[]) {
 
         const uint8_t *char_data = font->table + (size_t)(ch - ' ') * bytes_per_row * font->Height;
 
-        /* Column address 0 maps to the physical right edge of the panel (MX=1 effective).
-         * Physical col cur_x → address (lcd_width - cur_x - Width). */
-        uint16_t x_addr = (uint16_t)(lcd_width - (int)cur_x - (int)font->Width);
+        // VERTICAL: physical col 0 = right edge → mirror address and reverse pixels.
+        // HORIZONTAL (MV=1): physical col 0 = left edge → direct address, forward pixels.
+        bool mirror = (lcd_scan_dir == VERTICAL);
+        uint16_t x_addr = mirror ? (uint16_t)(lcd_width - (int)cur_x - (int)font->Width)
+                                 : cur_x;
         LCD_2IN_SetWindows(x_addr, cur_y,
                            (uint16_t)(x_addr + font->Width),
                            (uint16_t)(cur_y + font->Height));
@@ -2734,8 +2920,7 @@ static void run_lcd_text(const size_t argc, const char *argv[]) {
         for (uint16_t row = 0; row < font->Height; row++) {
             for (uint16_t col = 0; col < font->Width; col++) {
                 uint8_t byte = char_data[row * bytes_per_row + col / 8u];
-                /* SPI fills physical right→left within the window, so reverse column order. */
-                uint16_t dst = (uint16_t)(font->Width - 1u - col);
+                uint16_t dst = mirror ? (uint16_t)(font->Width - 1u - col) : col;
                 row_buf[dst] = (byte & (0x80u >> (col % 8u))) ? fg_be : bg_be;
             }
             DEV_SPI_Write_nByte((uint8_t *)row_buf, font->Width * 2u);
@@ -2777,6 +2962,15 @@ static void run_lcd_set_orientation(const size_t argc, const char *argv[]) {
 
     LCD_2IN_SetAttributes(new_scan_dir);
     lcd_scan_dir = new_scan_dir;
+
+    if (lcd_con_active) {
+        lcd_con_width  = (lcd_scan_dir == VERTICAL) ? LCD_2IN_WIDTH  : LCD_2IN_HEIGHT;
+        lcd_con_height = (lcd_scan_dir == VERTICAL) ? LCD_2IN_HEIGHT : LCD_2IN_WIDTH;
+        spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+        LCD_2IN_Clear(lcd_con_bg);
+        lcd_con_x = 0;
+        lcd_con_y = 0;
+    }
 
     printf("LCD orientation set to %s\n",
            lcd_scan_dir == VERTICAL ? "vertical" : "horizontal");
@@ -3059,6 +3253,7 @@ static void finish_lcd_cam_stream(void) {    DEV_Digital_Write(LCD_CS_PIN, 1);  
  */
 static void run_lcd_cam_snap(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
+    lcd_con_stop();
     if (!ensure_lcd_camera_ready("lcd_cam_snap")) return;
     if (cam_snap_pending || lcd_load_pending || lcd_cam_snap_pending || lcd_cam_stream_active) {
         printf("Another camera or LCD operation is already in progress.\n");
@@ -3085,6 +3280,7 @@ static void run_lcd_cam_snap(const size_t argc, const char *argv[]) {
  */
 static void run_lcd_load_image(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
+    lcd_con_stop();
 
     if (!lcd_initialized) {
         printf("LCD not initialized. Run lcd_init first.\n");
@@ -3170,6 +3366,7 @@ static void run_lcd_cam_stream(const size_t argc, const char *argv[]) {
         printf("Stopping LCD camera stream...\n");
         return;
     }
+    lcd_con_stop();
     if (!ensure_lcd_camera_ready("lcd_cam_stream")) return;
     if (cam_snap_pending || lcd_load_pending || lcd_cam_snap_pending || lcd_cam_stream_active) {
         printf("Another camera or LCD operation is already in progress.\n");
@@ -4305,6 +4502,16 @@ static cmd_def_t cmds[] = {
     {"lcd_cam_stream", run_lcd_cam_stream,
      "lcd_cam_stream [stop]:\n"
      " Start or stop continuous camera-to-LCD preview in background."},
+    {"lcdcon", run_lcdcon,
+     "lcdcon [<size>] [<fg_hex>] [<bg_hex>]:\n"
+     " Mirror all shell I/O (typed input + command output) to the LCD as a text terminal.\n"
+     " size: font height in px — 8 (default, 40x60), 12, 16, 20, 24\n"
+     " fg/bg: RGB565 hex colours (default: ffff / 0000  i.e. white on black)\n"
+     " lcdcon -s : stop and return to UART-only output\n"
+     " Auto-stops when lcd_load_image, lcd_cam_snap or lcd_cam_stream is started.\n"
+     "\te.g.: lcdcon\n"
+     "\te.g.: lcdcon 12 07e0 0000   (green on black, Font12)\n"
+     "\te.g.: lcdcon -s"},
     {"lcd_status", run_lcd_status,
      "lcd_status:\n"
      " Display the current status of the LCD."},
