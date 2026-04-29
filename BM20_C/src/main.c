@@ -249,6 +249,7 @@ int main(void)
 #define CMD_STREAM_STOP   0xB1u
 #define CMD_STREAM_FETCH  0xB2u
 #define CMD_SENSOR_SELECT 0xB3u
+#define CMD_SET_MODE      0xB4u  /* payload byte: 0=raw waveform, 1=FFT */
 
 #define SENSOR_TS_MS 40u
 
@@ -263,6 +264,7 @@ static uint8_t sensor_ring_raw[SENSOR_RING_LEN];
 static uint8_t sensor_ring_plot[SENSOR_RING_LEN];
 
 static bool sensor_stream_enabled;
+static bool sensor_fft_enabled = false;
 static uint8_t sensor_sequence;
 static uint8_t selected_sensor;
 static uint16_t sensor_write_index;
@@ -271,6 +273,15 @@ static int64_t sensor_next_fill_ms;
 static float sensor_phase_0;
 static float sensor_phase_1;
 static float sensor_phase_2;
+static float sensor_phase_3;
+static float sensor_phase_4;
+
+#define FFT_SIZE 256u
+#define FFT_BINS (FFT_SIZE / 2u)
+
+static float fft_re[FFT_SIZE];
+static float fft_im[FFT_SIZE];
+static float fft_mag[FFT_BINS];
 
 static uint8_t xor_checksum(const uint8_t *buf, size_t len)
 {
@@ -310,24 +321,24 @@ static int32_t sensor_sim_capture(uint8_t sensor_id, uint32_t sample_index)
 
 	switch (sensor_id) {
 	case 1: {
-		/* 10-bit triangular wave emulation: [-512 .. +511]. */
+		/* 10-bit triangular wave: [-512 .. +511]. */
 		int32_t phase = (int32_t)(sample_index % 160u);
 		int32_t tri = (phase < 80) ? (phase * 13 - 520) : ((159 - phase) * 13 - 520);
 		return clamp_i32(tri, -512, 511);
 	}
 	case 2: {
-		/* 16-bit-like mixed signal emulation: [-32768 .. +32767]. */
+		/* 16-bit-like mixed signal: [-32768 .. +32767]. */
 		float mix =
 			14000.0f * sinf(sensor_phase_2) +
-			9000.0f * sinf(0.13f * t + 0.8f) +
-			5000.0f * cosf(0.07f * t);
+			 9000.0f * sinf(0.13f * t + 0.8f) +
+			 5000.0f * cosf(0.07f * t);
 		sensor_phase_2 += 0.031f;
 		if (sensor_phase_2 >= TWO_PI) sensor_phase_2 -= TWO_PI;
 		return clamp_i32((int32_t)mix, -32768, 32767);
 	}
 	case 0:
 	default: {
-		/* 12-bit sine emulation: [-2048 .. +2047]. */
+		/* 12-bit sine: [-2048 .. +2047]. */
 		float s = 1800.0f * sinf(sensor_phase_0) + 420.0f * sinf(sensor_phase_1);
 		sensor_phase_0 += 0.12f;
 		sensor_phase_1 += 0.049f;
@@ -350,27 +361,97 @@ static void apply_sensor_selection(uint8_t sensor_id)
 	sensor_phase_0 = 0.0f;
 	sensor_phase_1 = 0.0f;
 	sensor_phase_2 = 0.0f;
+	sensor_phase_3 = 0.0f;
+	sensor_phase_4 = 0.0f;
 	memset(sensor_ring_raw, 127, sizeof(sensor_ring_raw));
 	memset(sensor_ring_plot, 120, sizeof(sensor_ring_plot));
 	sensor_write_index = 0;
 	sensor_next_fill_ms = 0;
 }
 
+/* In-place radix-2 Cooley-Tukey DIT FFT.  n must be a power of two. */
+static void fft_radix2(float *re, float *im, uint16_t n)
+{
+	/* Bit-reversal permutation */
+	for (uint16_t i = 1, j = 0; i < n; i++) {
+		uint16_t bit = n >> 1;
+		for (; j & bit; bit >>= 1)
+			j ^= bit;
+		j ^= bit;
+		if (i < j) {
+			float t;
+			t = re[i]; re[i] = re[j]; re[j] = t;
+			t = im[i]; im[i] = im[j]; im[j] = t;
+		}
+	}
+	/* Butterfly stages */
+	for (uint16_t len = 2; len <= n; len <<= 1) {
+		float ang = -TWO_PI / (float)len;
+		float w_re = cosf(ang), w_im = sinf(ang);
+		for (uint16_t i = 0; i < n; i += len) {
+			float tw_re = 1.0f, tw_im = 0.0f;
+			for (uint16_t k = 0; k < (len >> 1u); k++) {
+				uint16_t a = i + k;
+				uint16_t b = i + k + (len >> 1u);
+				float u_re = re[a], u_im = im[a];
+				float v_re = re[b] * tw_re - im[b] * tw_im;
+				float v_im = re[b] * tw_im + im[b] * tw_re;
+				re[a] = u_re + v_re;
+				im[a] = u_im + v_im;
+				re[b] = u_re - v_re;
+				im[b] = u_im - v_im;
+				float new_tw = tw_re * w_re - tw_im * w_im;
+				tw_im = tw_re * w_im + tw_im * w_re;
+				tw_re = new_tw;
+			}
+		}
+	}
+}
+
 static void sensor_fill_ring_once(void)
 {
-	for (uint16_t i = 0; i < SENSOR_RING_LEN; ++i) {
-		int32_t capture = sensor_sim_capture(selected_sensor, sensor_sample_counter++);
-		uint8_t scaled_u8;
-		switch (selected_sensor) {
-		case 1: scaled_u8 = scale_capture_to_u8(capture, -512, 511); break;
-		case 2: scaled_u8 = scale_capture_to_u8(capture, -32768, 32767); break;
-		case 0:
-		default: scaled_u8 = scale_capture_to_u8(capture, -2048, 2047); break;
+	if (sensor_fft_enabled) {
+		/* FFT path: Hanning-windowed 256-point FFT → magnitude spectrum */
+		for (uint16_t i = 0; i < FFT_SIZE; i++) {
+			int32_t raw = sensor_sim_capture(selected_sensor, sensor_sample_counter++);
+			float w = 0.5f * (1.0f - cosf(TWO_PI * (float)i / (float)(FFT_SIZE - 1u)));
+			fft_re[i] = (float)raw * w;
+			fft_im[i] = 0.0f;
 		}
 
-		sensor_ring_raw[sensor_write_index] = scaled_u8;
-		sensor_ring_plot[sensor_write_index] = map_u8_to_plot_x(scaled_u8);
-		sensor_write_index = (uint16_t)((sensor_write_index + 1u) % SENSOR_RING_LEN);
+		fft_radix2(fft_re, fft_im, FFT_SIZE);
+
+		float max_mag = 1.0f;
+		for (uint16_t b = 0; b < FFT_BINS; b++) {
+			float r = fft_re[b + 1u], c = fft_im[b + 1u];
+			fft_mag[b] = sqrtf(r * r + c * c);
+			if (fft_mag[b] > max_mag) {
+				max_mag = fft_mag[b];
+			}
+		}
+
+		for (uint16_t i = 0; i < SENSOR_RING_LEN; i++) {
+			uint16_t bin = (uint16_t)((uint32_t)i * FFT_BINS / SENSOR_RING_LEN);
+			float norm = fft_mag[bin] / max_mag;
+			sensor_ring_raw[i]  = (uint8_t)(norm * 255.0f);
+			sensor_ring_plot[i] = (uint8_t)(norm * 240.0f);
+		}
+		sensor_write_index = 0u;
+	} else {
+		/* Raw waveform path: time-domain samples, centered at 120 */
+		for (uint16_t i = 0; i < SENSOR_RING_LEN; i++) {
+			int32_t capture = sensor_sim_capture(selected_sensor, sensor_sample_counter++);
+			uint8_t scaled_u8;
+			switch (selected_sensor) {
+			case 1: scaled_u8 = scale_capture_to_u8(capture, -512, 511); break;
+			case 2: scaled_u8 = scale_capture_to_u8(capture, -32768, 32767); break;
+			case 0:
+			default: scaled_u8 = scale_capture_to_u8(capture, -2048, 2047); break;
+			}
+			sensor_ring_raw[sensor_write_index]  = scaled_u8;
+			sensor_ring_plot[sensor_write_index] = map_u8_to_plot_x(scaled_u8);
+			sensor_write_index = (uint16_t)((sensor_write_index + 1u) % SENSOR_RING_LEN);
+		}
 	}
 }
 
@@ -405,6 +486,10 @@ static void process_command_frame(const uint8_t *rx, size_t len)
 		if (len >= 2u) {
 			apply_sensor_selection(rx[1]);
 		}
+		break;
+	case CMD_SET_MODE:
+		sensor_fft_enabled = (len >= 2u) ? (rx[1] != 0u) : false;
+		sensor_next_fill_ms = 0;
 		break;
 	default:
 		break;
@@ -474,6 +559,8 @@ int main(void)
 	sensor_phase_0 = 0.0f;
 	sensor_phase_1 = 0.0f;
 	sensor_phase_2 = 0.0f;
+	sensor_phase_3 = 0.0f;
+	sensor_phase_4 = 0.0f;
 	prepare_tx_packet();
 
 	LOG_INF("BM20_C SPIS scope ready (production, packet=%u bytes, samples=%u, Ts=%u ms)",
