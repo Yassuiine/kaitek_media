@@ -3,13 +3,17 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <zephyr/kernel.h>
-#include <zephyr/logging/log.h>
-#include <zephyr/drivers/spi.h>
-#include <zephyr/drivers/gpio.h>
+#include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 
-#define NRF_BENCH_MODE  /* undefine for production build */
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/spi.h>
+#include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
+
+//#define NRF_BENCH_MODE  /* undefine for production build */
 
 #define BUF_SIZE 4096
 
@@ -232,10 +236,221 @@ int main(void)
 
 #else /* production build */
 
-LOG_MODULE_REGISTER(bm20c_spis, LOG_LEVEL_INF);
+#define SENSOR_COUNT 3u
+#define SENSOR_RING_LEN 320u
+#define SENSOR_HEADER_BYTES 13u
+#define SENSOR_PACKET_BYTES (SENSOR_HEADER_BYTES + SENSOR_RING_LEN)
 
-static uint8_t tx_buffer[BUF_SIZE];
-static uint8_t rx_buffer[BUF_SIZE];
+#define SENSOR_MAGIC0 0x53u /* 'S' */
+#define SENSOR_MAGIC1 0x42u /* 'B' */
+#define SENSOR_PROTOCOL_VERSION 1u
+
+#define CMD_STREAM_START  0xB0u
+#define CMD_STREAM_STOP   0xB1u
+#define CMD_STREAM_FETCH  0xB2u
+#define CMD_SENSOR_SELECT 0xB3u
+
+#define SENSOR_TS_MS 40u
+
+#define TWO_PI 6.28318530717958647692f
+
+LOG_MODULE_REGISTER(bm20c_spis_scope, LOG_LEVEL_INF);
+
+static uint8_t tx_buffer[SENSOR_PACKET_BYTES];
+static uint8_t rx_buffer[SENSOR_PACKET_BYTES];
+
+static uint8_t sensor_ring_raw[SENSOR_RING_LEN];
+static uint8_t sensor_ring_plot[SENSOR_RING_LEN];
+
+static bool sensor_stream_enabled;
+static uint8_t sensor_sequence;
+static uint8_t selected_sensor;
+static uint16_t sensor_write_index;
+static uint32_t sensor_sample_counter;
+static int64_t sensor_next_fill_ms;
+static float sensor_phase_0;
+static float sensor_phase_1;
+static float sensor_phase_2;
+
+static uint8_t xor_checksum(const uint8_t *buf, size_t len)
+{
+	uint8_t x = 0;
+	for (size_t i = 0; i < len; ++i) {
+		x ^= buf[i];
+	}
+	return x;
+}
+
+static int32_t clamp_i32(int32_t v, int32_t lo, int32_t hi)
+{
+	if (v < lo) return lo;
+	if (v > hi) return hi;
+	return v;
+}
+
+static uint8_t scale_capture_to_u8(int32_t sample, int32_t min_capture, int32_t max_capture)
+{
+	int32_t clamped = clamp_i32(sample, min_capture, max_capture);
+	int32_t range = max_capture - min_capture;
+	int32_t scaled = (range > 0) ? ((clamped - min_capture) * 255) / range : 127;
+	return (uint8_t)clamp_i32(scaled, 0, 255);
+}
+
+static uint8_t map_u8_to_plot_x(uint8_t u8_value)
+{
+	/* 120 is the zero axis center. 0..119 represent negative, 121..240 positive. */
+	int32_t centered = (int32_t)u8_value - 128;
+	int32_t x = 120 + (centered * 120) / 127;
+	return (uint8_t)clamp_i32(x, 0, 240);
+}
+
+static int32_t sensor_sim_capture(uint8_t sensor_id, uint32_t sample_index)
+{
+	float t = (float)sample_index;
+
+	switch (sensor_id) {
+	case 1: {
+		/* 10-bit triangular wave emulation: [-512 .. +511]. */
+		int32_t phase = (int32_t)(sample_index % 160u);
+		int32_t tri = (phase < 80) ? (phase * 13 - 520) : ((159 - phase) * 13 - 520);
+		return clamp_i32(tri, -512, 511);
+	}
+	case 2: {
+		/* 16-bit-like mixed signal emulation: [-32768 .. +32767]. */
+		float mix =
+			14000.0f * sinf(sensor_phase_2) +
+			9000.0f * sinf(0.13f * t + 0.8f) +
+			5000.0f * cosf(0.07f * t);
+		sensor_phase_2 += 0.031f;
+		if (sensor_phase_2 >= TWO_PI) sensor_phase_2 -= TWO_PI;
+		return clamp_i32((int32_t)mix, -32768, 32767);
+	}
+	case 0:
+	default: {
+		/* 12-bit sine emulation: [-2048 .. +2047]. */
+		float s = 1800.0f * sinf(sensor_phase_0) + 420.0f * sinf(sensor_phase_1);
+		sensor_phase_0 += 0.12f;
+		sensor_phase_1 += 0.049f;
+		if (sensor_phase_0 >= TWO_PI) sensor_phase_0 -= TWO_PI;
+		if (sensor_phase_1 >= TWO_PI) sensor_phase_1 -= TWO_PI;
+		return clamp_i32((int32_t)s, -2048, 2047);
+	}
+	}
+}
+
+static void apply_sensor_selection(uint8_t sensor_id)
+{
+	if (sensor_id >= SENSOR_COUNT || sensor_id == selected_sensor) {
+		return;
+	}
+
+	selected_sensor = sensor_id;
+	/* Re-prime waveform state so the next packet clearly reflects the new source. */
+	sensor_sample_counter = 0;
+	sensor_phase_0 = 0.0f;
+	sensor_phase_1 = 0.0f;
+	sensor_phase_2 = 0.0f;
+	memset(sensor_ring_raw, 127, sizeof(sensor_ring_raw));
+	memset(sensor_ring_plot, 120, sizeof(sensor_ring_plot));
+	sensor_write_index = 0;
+	sensor_next_fill_ms = 0;
+}
+
+static void sensor_fill_ring_once(void)
+{
+	for (uint16_t i = 0; i < SENSOR_RING_LEN; ++i) {
+		int32_t capture = sensor_sim_capture(selected_sensor, sensor_sample_counter++);
+		uint8_t scaled_u8;
+		switch (selected_sensor) {
+		case 1: scaled_u8 = scale_capture_to_u8(capture, -512, 511); break;
+		case 2: scaled_u8 = scale_capture_to_u8(capture, -32768, 32767); break;
+		case 0:
+		default: scaled_u8 = scale_capture_to_u8(capture, -2048, 2047); break;
+		}
+
+		sensor_ring_raw[sensor_write_index] = scaled_u8;
+		sensor_ring_plot[sensor_write_index] = map_u8_to_plot_x(scaled_u8);
+		sensor_write_index = (uint16_t)((sensor_write_index + 1u) % SENSOR_RING_LEN);
+	}
+}
+
+static void process_command_frame(const uint8_t *rx, size_t len)
+{
+	if (!rx || len == 0u) {
+		return;
+	}
+
+	switch (rx[0]) {
+	case CMD_STREAM_START:
+		sensor_stream_enabled = true;
+		if (len >= 2u) {
+			apply_sensor_selection(rx[1]);
+		}
+		sensor_next_fill_ms = 0;
+		break;
+	case CMD_STREAM_STOP:
+		sensor_stream_enabled = false;
+		memset(sensor_ring_raw, 127, sizeof(sensor_ring_raw));
+		memset(sensor_ring_plot, 120, sizeof(sensor_ring_plot));
+		sensor_write_index = 0;
+		sensor_next_fill_ms = 0;
+		break;
+	case CMD_SENSOR_SELECT:
+		if (len >= 2u) {
+			apply_sensor_selection(rx[1]);
+		}
+		break;
+	case CMD_STREAM_FETCH:
+		/* Keep sensor selection sticky during streaming: master can resend desired sensor in every fetch. */
+		if (len >= 2u) {
+			apply_sensor_selection(rx[1]);
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+static void prepare_tx_packet(void)
+{
+	if (sensor_stream_enabled) {
+		int64_t now_ms = k_uptime_get();
+		if (sensor_next_fill_ms == 0) {
+			sensor_fill_ring_once();
+			sensor_sequence++;
+			sensor_next_fill_ms = now_ms + SENSOR_TS_MS;
+		} else {
+			uint8_t fills = 0;
+			while (now_ms >= sensor_next_fill_ms && fills < 4u) {
+				sensor_fill_ring_once();
+				sensor_sequence++;
+				sensor_next_fill_ms += SENSOR_TS_MS;
+				fills++;
+			}
+		}
+	}
+
+	memset(tx_buffer, 0, sizeof(tx_buffer));
+	tx_buffer[0] = SENSOR_MAGIC0;
+	tx_buffer[1] = SENSOR_MAGIC1;
+	tx_buffer[2] = SENSOR_PROTOCOL_VERSION;
+	tx_buffer[3] = sensor_stream_enabled ? 0x01u : 0x00u;
+	tx_buffer[4] = sensor_sequence;
+	tx_buffer[5] = selected_sensor;
+	tx_buffer[6] = (uint8_t)(SENSOR_TS_MS & 0xFFu);
+	tx_buffer[7] = (uint8_t)((SENSOR_TS_MS >> 8) & 0xFFu);
+	tx_buffer[8] = (uint8_t)(SENSOR_RING_LEN & 0xFFu);
+	tx_buffer[9] = (uint8_t)((SENSOR_RING_LEN >> 8) & 0xFFu);
+	tx_buffer[10] = (uint8_t)(sensor_write_index & 0xFFu);
+	tx_buffer[11] = (uint8_t)((sensor_write_index >> 8) & 0xFFu);
+	tx_buffer[12] = 0u; /* checksum */
+
+	for (uint16_t i = 0; i < SENSOR_RING_LEN; ++i) {
+		uint16_t idx = (uint16_t)((sensor_write_index + i) % SENSOR_RING_LEN);
+		tx_buffer[SENSOR_HEADER_BYTES + i] = sensor_ring_plot[idx];
+	}
+	tx_buffer[12] = xor_checksum(tx_buffer, sizeof(tx_buffer));
+}
 
 int main(void)
 {
@@ -246,13 +461,46 @@ int main(void)
 
 	__ASSERT(device_is_ready(spis_dev), "SPI device not ready");
 
-	LOG_INF("BM20C SPIS ready (production build, Mode 1, %u B buffer)", BUF_SIZE);
+	memset(tx_buffer, 0, sizeof(tx_buffer));
+	memset(rx_buffer, 0, sizeof(rx_buffer));
+	memset(sensor_ring_raw, 127, sizeof(sensor_ring_raw));
+	memset(sensor_ring_plot, 120, sizeof(sensor_ring_plot));
+	sensor_stream_enabled = false;
+	sensor_sequence = 0;
+	selected_sensor = 0;
+	sensor_write_index = 0;
+	sensor_sample_counter = 0;
+	sensor_next_fill_ms = 0;
+	sensor_phase_0 = 0.0f;
+	sensor_phase_1 = 0.0f;
+	sensor_phase_2 = 0.0f;
+	prepare_tx_packet();
 
+	LOG_INF("BM20_C SPIS scope ready (production, packet=%u bytes, samples=%u, Ts=%u ms)",
+		(unsigned int)SENSOR_PACKET_BYTES,
+		(unsigned int)SENSOR_RING_LEN,
+		(unsigned int)SENSOR_TS_MS);
+
+	uint32_t transfer_count = 0;
 	while (1) {
 		int ret = spi_transceive(spis_dev, &spis_config, &tx_set, &rx_set);
 		if (ret < 0) {
 			LOG_ERR("spi_transceive failed: %d", ret);
 			k_msleep(10);
+			continue;
+		}
+
+		process_command_frame(rx_buffer, sizeof(rx_buffer));
+		prepare_tx_packet();
+
+		transfer_count++;
+		if ((transfer_count % 500u) == 0u) {
+			LOG_INF("xfer=%u stream=%u seq=%u sensor=%u write=%u",
+				(unsigned int)transfer_count,
+				sensor_stream_enabled ? 1u : 0u,
+				(unsigned int)sensor_sequence,
+				(unsigned int)selected_sensor,
+				(unsigned int)sensor_write_index);
 		}
 	}
 

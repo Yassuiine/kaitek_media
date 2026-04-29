@@ -32,6 +32,9 @@
 #include "GUI_Paint.h"
 
 #define NRF_BENCH_ENABLED  // Compile with this defined to enable the SPI slave test mode that logs transfer stats and button events; undefine for production build without logging and NRF event handling
+#ifndef ENABLE_PATH_AB_LOGIC
+#define ENABLE_PATH_AB_LOGIC 1
+#endif
 
 static char *saveptr;                    // strtok_r re-entrant parse position; shared across all tokenisation in process_cmd
 static volatile bool die;                // Set by chars_available_callback on Enter to abort a running loop command
@@ -101,6 +104,42 @@ static uint32_t nrf_validation_rows_per_chunk = 4;      // Number of camera rows
 static uint8_t nrf_validation_rx_chunk[LCD_2IN_WIDTH * 2 * NRF_VALIDATION_ROWS_MAX];   // Receive buffer for one NRF chunk
 static uint8_t nrf_validation_dummy_chunk[LCD_2IN_WIDTH * 2 * NRF_VALIDATION_ROWS_MAX]; // All-zero payload for the Phase-B flush transfer
 
+#define NRF_SCOPE_SAMPLE_COUNT 320u
+#define NRF_SCOPE_HEADER_BYTES 13u
+#define NRF_SCOPE_PACKET_BYTES (NRF_SCOPE_HEADER_BYTES + NRF_SCOPE_SAMPLE_COUNT)
+#define NRF_SCOPE_MAGIC0 0x53u /* 'S' */
+#define NRF_SCOPE_MAGIC1 0x42u /* 'B' */
+#define NRF_SCOPE_VERSION 1u
+#define NRF_SCOPE_CMD_START  0xB0u
+#define NRF_SCOPE_CMD_STOP   0xB1u
+#define NRF_SCOPE_CMD_FETCH  0xB2u
+#define NRF_SCOPE_CMD_SENSOR 0xB3u
+
+static bool nrf_fft_stream_active = false;                // True while RP master periodically polls scope packets and redraws the LCD graph
+static bool nrf_fft_drop_first_packet = false;            // True immediately after START to ignore one stale pipelined slave response
+static bool nrf_fft_period_override = false;              // True when user forced period via command instead of Ts+1ms
+static uint32_t nrf_fft_poll_period_ms = 41;              // Graph refresh period in ms (defaults to Ts+1)
+static absolute_time_t nrf_fft_next_poll_time;            // Next time a FETCH command should be sent
+static uint8_t nrf_fft_selected_sensor = 0;               // Sensor selected on BM20_C (0..2)
+static uint8_t nrf_fft_last_seq = 0;                      // Last accepted scope packet sequence number
+static uint8_t nrf_fft_last_sensor = 0;                   // Sensor ID reported by the nRF in the latest valid packet
+static uint16_t nrf_fft_last_ts_ms = 0;                   // Last Ts reported by the nRF
+static uint16_t nrf_fft_last_write_index = 0;             // Circular-buffer write index echoed by the nRF
+static uint32_t nrf_fft_frames_ok = 0;                    // Count of valid scope frames received since stream start
+static uint32_t nrf_fft_frames_bad = 0;                   // Count of invalid/corrupt scope frames since stream start
+static uint32_t nrf_fft_bad_magic = 0;                    // Bad frames: magic bytes wrong (byte 0 or 1)
+static uint32_t nrf_fft_bad_version = 0;                  // Bad frames: version byte wrong (byte 2)
+static uint32_t nrf_fft_bad_count = 0;                    // Bad frames: sample_count field wrong (bytes 8-9)
+static uint32_t nrf_fft_bad_cksum = 0;                    // Bad frames: XOR checksum not zero
+static uint32_t nrf_fft_bad_stream_off = 0;               // Bad frames: stream_enabled bit (byte 3 bit0) is 0
+static uint32_t nrf_fft_bad_spi = 0;                      // Bad frames: SPI transfer itself failed
+static uint8_t  nrf_fft_last_bad_hdr[NRF_SCOPE_HEADER_BYTES]; // First 13 bytes of the last failed frame
+static uint32_t nrf_fft_sensor_mismatch_frames = 0;       // Consecutive valid frames whose reported sensor != requested sensor
+static uint32_t nrf_fft_resync_count = 0;                 // Number of automatic START re-sync attempts issued by RP
+static uint8_t nrf_fft_last_bins[NRF_SCOPE_SAMPLE_COUNT]; // Latest mapped X points (0..240), one per LCD row
+static uint8_t nrf_fft_tx_frame[NRF_SCOPE_PACKET_BYTES];  // RP->nRF control frame (START/STOP/FETCH/SENSOR)
+static uint8_t nrf_fft_rx_frame[NRF_SCOPE_PACKET_BYTES];  // nRF->RP scope packet received on each SPI transaction
+
 // Mode-B assembles echoed chunks directly into lcd_image interpreted as bytes.
 // This avoids a second full-frame static buffer and saves ~153 KB of RAM.
 
@@ -150,6 +189,8 @@ static void shared_enter_cam_prog(void);
 static void shared_leave_cam_prog(void);
 static void reset_mode_b_transfer_ctx(void);
 static void lcd_con_putchar(char c);
+static void nrf_fft_stream_task(void);
+static void nrf_fft_stop_internal(bool notify_slave, bool clear_screen);
 
 // Dual-output printf: always writes to UART/USB via vprintf, and also mirrors
 // to the LCD console when lcd_con_active is set. #define below replaces all
@@ -950,6 +991,7 @@ static void touch_handle_mirror_event_if_needed(void) {
 static void nrf_poll_button_event_if_needed(void) {
     if (!nrf_spi_initialized) return;
     if (!lcd_cam_stream_active) return;
+    if (nrf_fft_stream_active) return;
     // Skip standalone NRF polling during Mode-B streaming — events arrive embedded in transfer echoes instead.
     if (pipeline_mode == PIPE_MODE_B_NRF && pipeline_validation_mode_b_enabled) return;
     if (!time_reached(nrf_event_block_until)) return;
@@ -2415,6 +2457,11 @@ static void run_lcd_init(const size_t argc, const char *argv[]) {
         return;
     }
 
+    if (nrf_fft_stream_active) {
+        nrf_fft_stop_internal(true, false);
+        printf("Stopped nrf fft stream before LCD reinitialization.\n");
+    }
+
     if (argc == 1) {
         if (strcmp(argv[0], "vertical") == 0) {
             lcd_scan_dir = VERTICAL;
@@ -3253,6 +3300,10 @@ static void finish_lcd_cam_stream(void) {    DEV_Digital_Write(LCD_CS_PIN, 1);  
  */
 static void run_lcd_cam_snap(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
+    if (nrf_fft_stream_active) {
+        printf("Stop nrf fft stream before lcd snap.\n");
+        return;
+    }
     lcd_con_stop();
     if (!ensure_lcd_camera_ready("lcd_cam_snap")) return;
     if (cam_snap_pending || lcd_load_pending || lcd_cam_snap_pending || lcd_cam_stream_active) {
@@ -3280,6 +3331,10 @@ static void run_lcd_cam_snap(const size_t argc, const char *argv[]) {
  */
 static void run_lcd_load_image(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
+    if (nrf_fft_stream_active) {
+        printf("Stop nrf fft stream before lcd load.\n");
+        return;
+    }
     lcd_con_stop();
 
     if (!lcd_initialized) {
@@ -3364,6 +3419,10 @@ static void run_lcd_cam_stream(const size_t argc, const char *argv[]) {
         }
 
         printf("Stopping LCD camera stream...\n");
+        return;
+    }
+    if (nrf_fft_stream_active) {
+        printf("Stop nrf fft stream before lcd stream.\n");
         return;
     }
     lcd_con_stop();
@@ -3458,6 +3517,10 @@ static bool parse_pipeline_mode_arg(const char *arg, pipeline_mode_t *mode_out) 
  */
 static void run_sm_status(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 0)) return;
+#if !ENABLE_PATH_AB_LOGIC
+    printf("Path A/B logic is disabled at compile time.\n");
+    return;
+#endif
 
     printf("Pipeline mode: %s\n", pipeline_mode_name(pipeline_mode));
     printf("Validation mode-B path enabled: %s\n", pipeline_validation_mode_b_enabled ? "yes" : "no");
@@ -3475,6 +3538,10 @@ static void run_sm_status(const size_t argc, const char *argv[]) {
  */
 static void run_sm_mode(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
+#if !ENABLE_PATH_AB_LOGIC
+    printf("Path A/B logic is disabled at compile time.\n");
+    return;
+#endif
 
     pipeline_mode_t next_mode;
     if (!parse_pipeline_mode_arg(argv[0], &next_mode)) {
@@ -3495,6 +3562,10 @@ static void run_sm_mode(const size_t argc, const char *argv[]) {
  */
 static void run_sm_event(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
+#if !ENABLE_PATH_AB_LOGIC
+    printf("Path A/B logic is disabled at compile time.\n");
+    return;
+#endif
 
     if (strcmp(argv[0], "touch") == 0) {
         pipeline_request_mode(PIPE_MODE_A_TOUCH, PIPE_REQ_TOUCH);
@@ -3517,6 +3588,10 @@ static void run_sm_event(const size_t argc, const char *argv[]) {
  */
 static void run_sm_validation(const size_t argc, const char *argv[]) {
     if (!expect_argc(argc, argv, 1)) return;
+#if !ENABLE_PATH_AB_LOGIC
+    printf("Path A/B logic is disabled at compile time.\n");
+    return;
+#endif
 
     if (strcmp(argv[0], "on") == 0) {
         pipeline_validation_mode_b_enabled = true;
@@ -3590,6 +3665,10 @@ static void run_nrf_spi_init(const size_t argc, const char *argv[]) {
     }
     if (lcd_cam_stream_active) {
         printf("Stop lcd_cam_stream before nrf_spi_init to avoid live SPI reconfiguration.\n");
+        return;
+    }
+    if (nrf_fft_stream_active) {
+        printf("Stop nrf fft stream before nrf_spi_init.\n");
         return;
     }
 
@@ -3959,6 +4038,353 @@ static void run_nrf_spi_diag(const size_t argc, const char *argv[]) {
 }
 #endif /* NRF_BENCH_ENABLED */
 
+static uint8_t nrf_fft_xor_checksum(const uint8_t *buf, size_t len) {
+    uint8_t x = 0;
+    for (size_t i = 0; i < len; ++i) {
+        x ^= buf[i];
+    }
+    return x;
+}
+
+static bool nrf_fft_send_command(uint8_t cmd, uint8_t sensor_id) {
+    if (!nrf_spi_initialized) return false;
+    memset(nrf_fft_tx_frame, 0, sizeof(nrf_fft_tx_frame));
+    memset(nrf_fft_rx_frame, 0, sizeof(nrf_fft_rx_frame));
+    nrf_fft_tx_frame[0] = cmd;
+    nrf_fft_tx_frame[1] = sensor_id;
+    return nrf_spi_transfer_bytes(nrf_fft_tx_frame, nrf_fft_rx_frame, sizeof(nrf_fft_tx_frame));
+}
+
+static inline void nrf_scope_fb_set_pixel(uint16_t x, uint16_t y, uint16_t color) {
+    if (!lcd_image) return;
+    if (x >= LCD_2IN_WIDTH || y >= LCD_2IN_HEIGHT) return;
+
+    /* In vertical scan mode, panel column 0 is physically at the right edge. */
+    uint16_t fb_x = (lcd_scan_dir == VERTICAL) ? (uint16_t)(LCD_2IN_WIDTH - 1u - x) : x;
+    size_t off = ((size_t)y * LCD_2IN_WIDTH + fb_x) * 2u;
+    uint8_t *fb = (uint8_t *)lcd_image;
+    fb[off] = (uint8_t)((color >> 8) & 0xFFu);
+    fb[off + 1u] = (uint8_t)(color & 0xFFu);
+}
+
+static void nrf_fft_render_graph(void) {
+    if (!lcd_initialized || !lcd_image || lcd_scan_dir != VERTICAL) return;
+
+    /* 320 rows map 1:1 to time samples. X is 0..240, with axis center at x=120. */
+    Paint_Clear(BLACK);
+    for (uint16_t y = 0; y < LCD_2IN_HEIGHT; ++y) {
+        nrf_scope_fb_set_pixel(120, y, WHITE);
+    }
+    for (uint16_t x = 0; x < LCD_2IN_WIDTH; x += 2u) {
+        nrf_scope_fb_set_pixel(x, (uint16_t)(LCD_2IN_HEIGHT / 2), GRAY);
+    }
+
+    /* Draw a connected waveform: each row is linked to the previous row. */
+    uint16_t prev_x = 0;
+    bool have_prev = false;
+    for (uint16_t row = 0; row < NRF_SCOPE_SAMPLE_COUNT; ++row) {
+        uint16_t x = nrf_fft_last_bins[row];
+        if (x >= LCD_2IN_WIDTH) x = LCD_2IN_WIDTH - 1;
+
+        if (have_prev) {
+            uint16_t lo = (x < prev_x) ? x : prev_x;
+            uint16_t hi = (x > prev_x) ? x : prev_x;
+            for (uint16_t xx = lo; xx <= hi; ++xx) {
+                nrf_scope_fb_set_pixel(xx, row, CYAN);
+            }
+        } else {
+            nrf_scope_fb_set_pixel(x, row, CYAN);
+            have_prev = true;
+        }
+        prev_x = x;
+    }
+
+    shared_enter_lcd_active();
+    lcd_display_rows_from_framebuffer(0, LCD_2IN.HEIGHT);
+    lcd_note_displayed_frame();
+}
+
+static void nrf_fft_stop_internal(bool notify_slave, bool clear_screen) {
+    if (notify_slave && nrf_spi_initialized) {
+        (void)nrf_fft_send_command(NRF_SCOPE_CMD_STOP, nrf_fft_selected_sensor);
+    }
+
+    nrf_fft_stream_active = false;
+    nrf_fft_drop_first_packet = false;
+    nrf_fft_period_override = false;
+    nrf_fft_last_ts_ms = 0;
+    nrf_fft_last_write_index = 0;
+    nrf_fft_sensor_mismatch_frames = 0;
+    memset(nrf_fft_last_bins, 0, sizeof(nrf_fft_last_bins));
+
+    if (clear_screen && lcd_initialized && lcd_image) {
+        Paint_Clear(BLACK);
+        shared_enter_lcd_active();
+        lcd_display_rows_from_framebuffer(0, LCD_2IN.HEIGHT);
+        lcd_note_displayed_frame();
+    }
+}
+
+static void nrf_fft_stream_task(void) {
+    if (!nrf_fft_stream_active) return;
+    if (!nrf_spi_initialized) {
+        nrf_fft_frames_bad++;
+        return;
+    }
+    if (!lcd_initialized || !lcd_image || lcd_scan_dir != VERTICAL) {
+        nrf_fft_stop_internal(true, false);
+        printf("\nNRF FFT stream stopped: LCD not ready (need lcd_init in vertical mode)\n");
+        print_prompt();
+        return;
+    }
+    if (!time_reached(nrf_fft_next_poll_time)) return;
+    nrf_fft_next_poll_time = delayed_by_ms(get_absolute_time(), nrf_fft_poll_period_ms);
+
+    memset(nrf_fft_tx_frame, 0, sizeof(nrf_fft_tx_frame));
+    memset(nrf_fft_rx_frame, 0, sizeof(nrf_fft_rx_frame));
+    nrf_fft_tx_frame[0] = NRF_SCOPE_CMD_FETCH;
+    nrf_fft_tx_frame[1] = nrf_fft_selected_sensor;
+
+    if (!nrf_spi_transfer_bytes(nrf_fft_tx_frame, nrf_fft_rx_frame, sizeof(nrf_fft_tx_frame))) {
+        nrf_fft_frames_bad++;
+        nrf_fft_bad_spi++;
+        return;
+    }
+
+    if (nrf_fft_drop_first_packet) {
+        nrf_fft_drop_first_packet = false;
+        return;
+    }
+
+    uint16_t sample_count = (uint16_t)nrf_fft_rx_frame[8] | ((uint16_t)nrf_fft_rx_frame[9] << 8);
+    if (nrf_fft_rx_frame[0] != NRF_SCOPE_MAGIC0 ||
+        nrf_fft_rx_frame[1] != NRF_SCOPE_MAGIC1 ||
+        nrf_fft_rx_frame[2] != NRF_SCOPE_VERSION ||
+        sample_count != NRF_SCOPE_SAMPLE_COUNT ||
+        nrf_fft_xor_checksum(nrf_fft_rx_frame, sizeof(nrf_fft_rx_frame)) != 0) {
+        memcpy(nrf_fft_last_bad_hdr, nrf_fft_rx_frame, NRF_SCOPE_HEADER_BYTES);
+        if (nrf_fft_rx_frame[0] != NRF_SCOPE_MAGIC0 || nrf_fft_rx_frame[1] != NRF_SCOPE_MAGIC1)
+            nrf_fft_bad_magic++;
+        else if (nrf_fft_rx_frame[2] != NRF_SCOPE_VERSION)
+            nrf_fft_bad_version++;
+        else if (sample_count != NRF_SCOPE_SAMPLE_COUNT)
+            nrf_fft_bad_count++;
+        else
+            nrf_fft_bad_cksum++;
+        nrf_fft_frames_bad++;
+        return;
+    }
+
+    if ((nrf_fft_rx_frame[3] & 0x01u) == 0u) {
+        memcpy(nrf_fft_last_bad_hdr, nrf_fft_rx_frame, NRF_SCOPE_HEADER_BYTES);
+        nrf_fft_bad_stream_off++;
+        nrf_fft_frames_bad++;
+        return;
+    }
+
+    nrf_fft_last_sensor = nrf_fft_rx_frame[5];
+    if (nrf_fft_last_sensor != nrf_fft_selected_sensor) {
+        // Do not render mismatched data; request a stream re-sync after a few consecutive mismatches.
+        nrf_fft_sensor_mismatch_frames++;
+        if (nrf_fft_sensor_mismatch_frames >= 3u) {
+            if (nrf_fft_send_command(NRF_SCOPE_CMD_START, nrf_fft_selected_sensor)) {
+                nrf_fft_resync_count++;
+                nrf_fft_drop_first_packet = true;
+                nrf_fft_next_poll_time = get_absolute_time();
+            } else {
+                nrf_fft_frames_bad++;
+            }
+            nrf_fft_sensor_mismatch_frames = 0;
+        }
+        return;
+    }
+    nrf_fft_sensor_mismatch_frames = 0;
+    nrf_fft_last_ts_ms = (uint16_t)nrf_fft_rx_frame[6] | ((uint16_t)nrf_fft_rx_frame[7] << 8);
+    nrf_fft_last_write_index = (uint16_t)nrf_fft_rx_frame[10] | ((uint16_t)nrf_fft_rx_frame[11] << 8);
+    if (!nrf_fft_period_override && nrf_fft_last_ts_ms > 0) {
+        nrf_fft_poll_period_ms = (uint32_t)nrf_fft_last_ts_ms + 1u;
+    }
+
+    memcpy(nrf_fft_last_bins, &nrf_fft_rx_frame[NRF_SCOPE_HEADER_BYTES], NRF_SCOPE_SAMPLE_COUNT);
+    nrf_fft_last_seq = nrf_fft_rx_frame[4];
+    nrf_fft_frames_ok++;
+    nrf_fft_render_graph();
+}
+
+static void run_nrf_fft(const size_t argc, const char *argv[]) {
+    if (argc == 0 || strcmp(argv[0], "help") == 0) {
+        printf("Usage: nrf fft start [period_ms]\n");
+        printf("       nrf fft stop\n");
+        printf("       nrf fft status\n");
+        printf("       nrf fft sensor <0|1|2>\n");
+        printf("       nrf fft period <20..1000>\n");
+        return;
+    }
+
+    const char *sub = argv[0];
+    if (strcmp(sub, "start") == 0) {
+        uint32_t period_ms = 0;
+        if (argc > 2) {
+            printf("Usage: nrf fft start [period_ms]\n");
+            return;
+        }
+        if (argc == 2) {
+            if (!parse_u32_arg(argv[1], &period_ms) || period_ms < 20 || period_ms > 1000) {
+                printf("Invalid period: %s (use 20..1000 ms)\n", argv[1]);
+                return;
+            }
+            nrf_fft_poll_period_ms = period_ms;
+            nrf_fft_period_override = true;
+        } else {
+            nrf_fft_period_override = false;
+        }
+        if (!lcd_initialized || !lcd_image) {
+            printf("LCD not initialized. Run lcd init first.\n");
+            return;
+        }
+        if (lcd_scan_dir != VERTICAL) {
+            printf("nrf fft requires vertical orientation. Run: lcd orient vertical\n");
+            return;
+        }
+        if (cam_snap_pending || lcd_load_pending || lcd_cam_snap_pending || lcd_cam_stream_active) {
+            printf("Stop current camera/LCD background activity before starting nrf fft.\n");
+            return;
+        }
+        lcd_con_stop();
+        const uint32_t nrf_fft_stream_safe_hz = 8000000;
+        if (!nrf_spi_initialized || nrf_spi_actual_hz > nrf_fft_stream_safe_hz) {
+            nrf_spi_prepare_bus(nrf_fft_stream_safe_hz);
+        }
+
+        nrf_fft_frames_ok = 0;
+        nrf_fft_frames_bad = 0;
+        nrf_fft_bad_magic = 0;
+        nrf_fft_bad_version = 0;
+        nrf_fft_bad_count = 0;
+        nrf_fft_bad_cksum = 0;
+        nrf_fft_bad_stream_off = 0;
+        nrf_fft_bad_spi = 0;
+        memset(nrf_fft_last_bad_hdr, 0, sizeof(nrf_fft_last_bad_hdr));
+        nrf_fft_sensor_mismatch_frames = 0;
+        nrf_fft_resync_count = 0;
+        nrf_fft_last_seq = 0;
+        nrf_fft_last_sensor = nrf_fft_selected_sensor;
+        nrf_fft_last_ts_ms = 0;
+        nrf_fft_last_write_index = 0;
+        memset(nrf_fft_last_bins, 0, sizeof(nrf_fft_last_bins));
+
+        if (!nrf_fft_send_command(NRF_SCOPE_CMD_START, nrf_fft_selected_sensor)) {
+            printf("Failed to start NRF stream (SPI transfer failed)\n");
+            return;
+        }
+
+        nrf_fft_drop_first_packet = true;
+        nrf_fft_stream_active = true;
+        nrf_fft_next_poll_time = get_absolute_time();
+        if (nrf_fft_period_override) {
+            printf("NRF stream started: sensor=%u, period=%lu ms (override)\n",
+                   nrf_fft_selected_sensor, (unsigned long)nrf_fft_poll_period_ms);
+        } else {
+            printf("NRF stream started: sensor=%u, period=Ts+1ms (auto)\n",
+                   nrf_fft_selected_sensor);
+        }
+        return;
+    }
+
+    if (strcmp(sub, "stop") == 0) {
+        if (!nrf_fft_stream_active) {
+            printf("NRF FFT stream is not running.\n");
+            return;
+        }
+        nrf_fft_stop_internal(true, true);
+        printf("NRF FFT stream stopped.\n");
+        return;
+    }
+
+    if (strcmp(sub, "status") == 0) {
+        printf("NRF stream: %s\n", nrf_fft_stream_active ? "running" : "stopped");
+        printf("Selected sensor: %u\n", nrf_fft_selected_sensor);
+        printf("Last sensor: %u\n", nrf_fft_last_sensor);
+        printf("Ts (last): %u ms\n", (unsigned)nrf_fft_last_ts_ms);
+        printf("Period: %lu ms\n", (unsigned long)nrf_fft_poll_period_ms);
+        printf("Period mode: %s\n", nrf_fft_period_override ? "manual override" : "Ts+1ms auto");
+        printf("Write index (last): %u\n", nrf_fft_last_write_index);
+        printf("Frames: ok=%lu bad=%lu\n",
+               (unsigned long)nrf_fft_frames_ok,
+               (unsigned long)nrf_fft_frames_bad);
+        if (nrf_fft_frames_bad > 0) {
+            printf("  bad breakdown: magic=%lu ver=%lu count=%lu cksum=%lu stream_off=%lu spi=%lu\n",
+                   (unsigned long)nrf_fft_bad_magic,
+                   (unsigned long)nrf_fft_bad_version,
+                   (unsigned long)nrf_fft_bad_count,
+                   (unsigned long)nrf_fft_bad_cksum,
+                   (unsigned long)nrf_fft_bad_stream_off,
+                   (unsigned long)nrf_fft_bad_spi);
+            printf("  last bad hdr: ");
+            for (int _i = 0; _i < (int)NRF_SCOPE_HEADER_BYTES; _i++) {
+                printf("%02X ", nrf_fft_last_bad_hdr[_i]);
+            }
+            printf("\n");
+            printf("  expect hdr:   %02X %02X %02X xx xx xx xx xx %02X %02X xx xx xx\n",
+                   NRF_SCOPE_MAGIC0, NRF_SCOPE_MAGIC1, NRF_SCOPE_VERSION,
+                   (unsigned)(NRF_SCOPE_SAMPLE_COUNT & 0xFF),
+                   (unsigned)(NRF_SCOPE_SAMPLE_COUNT >> 8));
+        }
+        printf("Sensor mismatches (consecutive current): %lu\n",
+               (unsigned long)nrf_fft_sensor_mismatch_frames);
+        printf("Automatic stream resync count: %lu\n",
+               (unsigned long)nrf_fft_resync_count);
+        printf("Last seq=%u\n", nrf_fft_last_seq);
+        return;
+    }
+
+    if (strcmp(sub, "sensor") == 0) {
+        if (argc != 2) {
+            printf("Usage: nrf fft sensor <0|1|2>\n");
+            return;
+        }
+        uint32_t sid = 0;
+        if (!parse_u32_arg(argv[1], &sid) || sid > 2u) {
+            printf("Invalid sensor: %s (use 0..2)\n", argv[1]);
+            return;
+        }
+        nrf_fft_selected_sensor = (uint8_t)sid;
+        if (nrf_spi_initialized) {
+            uint8_t cmd = nrf_fft_stream_active ? NRF_SCOPE_CMD_START : NRF_SCOPE_CMD_SENSOR;
+            if (!nrf_fft_send_command(cmd, nrf_fft_selected_sensor)) {
+                printf("Warning: failed to send sensor update over SPI.\n");
+            }
+        }
+        if (nrf_fft_stream_active) {
+            // Apply the new sensor selection immediately and drop one stale pipelined response.
+            nrf_fft_drop_first_packet = true;
+            nrf_fft_sensor_mismatch_frames = 0;
+            nrf_fft_next_poll_time = get_absolute_time();
+        }
+        printf("NRF sensor selection set to %u\n", nrf_fft_selected_sensor);
+        return;
+    }
+
+    if (strcmp(sub, "period") == 0) {
+        if (argc != 2) {
+            printf("Usage: nrf fft period <20..1000>\n");
+            return;
+        }
+        uint32_t ms = 0;
+        if (!parse_u32_arg(argv[1], &ms) || ms < 20 || ms > 1000) {
+            printf("Invalid period: %s (use 20..1000 ms)\n", argv[1]);
+            return;
+        }
+        nrf_fft_poll_period_ms = ms;
+        nrf_fft_period_override = true;
+        printf("NRF stream period override set to %lu ms\n", (unsigned long)nrf_fft_poll_period_ms);
+        return;
+    }
+
+    printf("Unknown nrf fft subcommand: %s\n", sub);
+    printf("Try: nrf fft help\n");
+}
+
 /**
  * @brief Show or tune Mode-B SPI timing: displays current CS setup/hold/gap/chunk values and an FPS estimate, or sets one parameter.
  */
@@ -4057,6 +4483,10 @@ static void print_lcd_group_help(void) {
  *
  */
 static void print_sm_group_help(void) {
+#if !ENABLE_PATH_AB_LOGIC
+    printf("sm: Path A/B logic disabled at compile time.\n");
+    return;
+#endif
     printf("sm <subcommand> [args]\n");
     printf("Subcommands: status, mode, event, validation\n");
 }
@@ -4068,10 +4498,11 @@ static void print_sm_group_help(void) {
 static void print_nrf_group_help(void) {
     printf("nrf <subcommand> [args]\n");
 #ifdef NRF_BENCH_ENABLED
-    printf("Subcommands: init, status, xfer, sweep, bench, diag, timing\n");
+    printf("Subcommands: init, status, xfer, sweep, bench, diag, timing, fft\n");
 #else
-    printf("Subcommands: init, status, xfer, timing\n");
+    printf("Subcommands: init, status, xfer, timing, fft\n");
 #endif
+    printf("For realtime sensor graph control: nrf fft help\n");
 }
 
 static const char *const cam_group_subcmds[] = {
@@ -4091,7 +4522,7 @@ static const char *const nrf_group_subcmds[] = {
 #ifdef NRF_BENCH_ENABLED
     "bench", "diag",
 #endif
-    "timing",
+    "timing", "fft",
 };
 
 static bool get_group_subcommands(const char *group,
@@ -4172,6 +4603,12 @@ static void run_lcd_group(const size_t argc, const char *argv[]) {
  * @brief Dispatch the "sm <subcommand>" group: routes argv[0] to the corresponding run_sm_* handler.
  */
 static void run_sm_group(const size_t argc, const char *argv[]) {
+#if !ENABLE_PATH_AB_LOGIC
+    (void)argc;
+    (void)argv;
+    printf("sm: Path A/B logic disabled at compile time.\n");
+    return;
+#else
     if (argc == 0 || strcmp(argv[0], "help") == 0) {
         print_sm_group_help();
         return;
@@ -4188,6 +4625,7 @@ static void run_sm_group(const size_t argc, const char *argv[]) {
         printf("Unknown sm subcommand: %s\n", sub);
         print_sm_group_help();
     }
+#endif
 }
 
 /**
@@ -4202,6 +4640,18 @@ static void run_nrf_group(const size_t argc, const char *argv[]) {
     const char *sub = argv[0];
     size_t sub_argc = argc - 1;
     const char **sub_argv = argv + 1;
+    if (nrf_fft_stream_active &&
+        (strcmp(sub, "init") == 0 ||
+         strcmp(sub, "xfer") == 0 ||
+         strcmp(sub, "sweep") == 0
+#ifdef NRF_BENCH_ENABLED
+         || strcmp(sub, "bench") == 0 ||
+         strcmp(sub, "diag") == 0
+#endif
+        )) {
+        printf("Stop nrf fft stream before running nrf %s.\n", sub);
+        return;
+    }
     if (strcmp(sub, "init") == 0) run_nrf_spi_init(sub_argc, sub_argv);
     else if (strcmp(sub, "status") == 0) run_nrf_spi_status(sub_argc, sub_argv);
     else if (strcmp(sub, "xfer") == 0) run_nrf_spi_xfer(sub_argc, sub_argv);
@@ -4211,6 +4661,7 @@ static void run_nrf_group(const size_t argc, const char *argv[]) {
     else if (strcmp(sub, "diag") == 0) run_nrf_spi_diag(sub_argc, sub_argv);
 #endif
     else if (strcmp(sub, "timing") == 0) run_nrf_timing(sub_argc, sub_argv);
+    else if (strcmp(sub, "fft") == 0) run_nrf_fft(sub_argc, sub_argv);
     else {
         printf("Unknown nrf subcommand: %s\n", sub);
         print_nrf_group_help();
@@ -4401,6 +4852,14 @@ static cmd_def_t cmds[] = {
      " nrf_timing setup <us>   - CS setup before SCK (default 15,  HSSPI: try 2)\n"
      " nrf_timing hold  <us>   - CS hold after SCK   (default 4,   HSSPI: try 2)\n"
      " nrf_timing chunk <rows> - rows per transfer   (default 4,   HSSPI: try 8)"},
+    {"nrf_fft", run_nrf_fft,
+     "nrf_fft <start|stop|status|sensor|period> [args]:\n"
+     " Command-driven sensor waveform streaming from BM20_C to RP2350 over SPI.\n"
+     " start [period_ms] starts realtime 320-point graph rendering on the LCD.\n"
+     " stop halts polling and sends STOP to the slave.\n"
+     " status prints counters/Ts/sequence.\n"
+     " sensor <0|1|2> selects simulated sensor source.\n"
+     " period <20..1000> sets refresh period override (default: Ts+1 ms)."},
     {"cam_xclk", run_cam_xclk,
      "cam_xclk [<freq_khz>]:\n"
      " Set camera XCLK frequency. Default 24000\n"
@@ -5018,13 +5477,19 @@ bool command_input_in_progress(void) {
  *   2. lcd_cam_snap    — single-frame capture to LCD display
  *   3. lcd_cam_stream  — continuous camera-to-LCD preview (Mode A or Mode B)
  *   4. lcd_load        — raw image file load from SD to LCD
+ * Plus a periodic SPI poll task for nrf fft stream mode (command-driven FFT graph).
  */
 void process_background_tasks(void) {
     // Run lightweight per-frame housekeeping before the heavier state machines.
-    // These are cheap: pipeline_apply checks a flag, touch/nrf poll check timestamps.
+#if ENABLE_PATH_AB_LOGIC
+    // Path-A/B mode arbitration + event sources.
     pipeline_apply_pending_mode_if_safe();
     touch_handle_mirror_event_if_needed();
+#endif
+    nrf_fft_stream_task();
+#if ENABLE_PATH_AB_LOGIC
     nrf_poll_button_event_if_needed();
+#endif
 
     // --- State machine 1: cam_snap (single frame -> SD file) ---
     // Phases: WAIT_FRAME -> OPEN_FILE -> WRITE_FILE (repeated) -> CLOSE_FILE
@@ -5225,6 +5690,7 @@ void process_background_tasks(void) {
                 row_count = lcd_display_row_chunk;
             }
 
+            #if ENABLE_PATH_AB_LOGIC
             if (pipeline_mode == PIPE_MODE_B_NRF && pipeline_validation_mode_b_enabled) {
                 // Mode B: relay the frame through the NRF loopback path one chunk at a time.
                 // Lock cam_display_ptr at the start of each new frame transfer.
@@ -5256,6 +5722,7 @@ void process_background_tasks(void) {
                 // st == 1: Mode-B frame fully validated and displayed; fall through to advance row counter.
                 mode_b_stream_locked_frame = NULL;
             } else {
+            #endif
                 // Mode A: direct DMA push of camera data to LCD (no NRF relay).
                 // If a stale Mode-B context exists (e.g. from a mid-stream mode switch), discard it.
                 if (mode_b_ctx.active) {
@@ -5265,7 +5732,9 @@ void process_background_tasks(void) {
                 lcd_display_raw_rows(lcd_cam_stream_row,
                                      row_count,
                                      cam_display_ptr + (lcd_cam_stream_row * cam_width * 2));
+            #if ENABLE_PATH_AB_LOGIC
             }
+            #endif
             // lcd_display_raw_rows() sends the full frame on row 0 via DMA; mark all rows done.
             lcd_cam_stream_row = cam_height;
             lcd_cam_stream_next_step_time = get_absolute_time();
