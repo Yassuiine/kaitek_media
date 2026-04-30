@@ -7,6 +7,7 @@
 #include "pico/stdlib.h"
 //
 #include "command.h"
+#include "cmd_sd.h"
 #include "crash.h"
 #include "f_util.h"
 #include "hw_config.h"

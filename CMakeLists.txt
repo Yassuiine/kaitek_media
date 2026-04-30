@@ -38,6 +38,10 @@ set(APP_SOURCES
     main.cpp
     config/hw_config.c
     src/command.cpp
+    src/cmd_sd.cpp
+    src/cmd_cam.cpp
+    src/cmd_lcd.cpp
+    src/cmd_nrf.cpp
     src/data_log_demo.c
     tests/app4-IO_module_function_checker.c
     tests/big_file_test.c
@@ -94,6 +98,7 @@ target_compile_options(03-FatFs PUBLIC
 target_include_directories(03-FatFs PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/include
+    ${CMAKE_CURRENT_LIST_DIR}/src
     ${CMAKE_CURRENT_LIST_DIR}/src/include
     ${CMAKE_CURRENT_LIST_DIR}/lib/CAM
     ${CMAKE_CURRENT_LIST_DIR}/lib/LCD
