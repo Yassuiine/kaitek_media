@@ -1116,9 +1116,9 @@ static void print_sm_group_help(void) {
 static void print_nrf_group_help(void) {
     printf("nrf <subcommand> [args]\n");
 #ifdef NRF_BENCH_ENABLED
-    printf("Subcommands: init, status, xfer, sweep, bench, diag, timing, fft\n");
+    printf("Subcommands: init, status, loopback, xfer, sweep, bench, diag, timing, fft\n");
 #else
-    printf("Subcommands: init, status, xfer, timing, fft\n");
+    printf("Subcommands: init, status, loopback, xfer, timing, fft\n");
 #endif
     printf("For realtime sensor graph control: nrf stream help\n");
 }
@@ -1136,7 +1136,7 @@ static const char *const sm_group_subcmds[] = {
     "status", "mode", "event", "validation",
 };
 static const char *const nrf_group_subcmds[] = {
-    "init", "status", "xfer", "sweep",
+    "init", "status", "loopback", "xfer", "sweep",
 #ifdef NRF_BENCH_ENABLED
     "bench", "diag",
 #endif
@@ -1260,6 +1260,7 @@ static void run_nrf_group(const size_t argc, const char *argv[]) {
     const char **sub_argv = argv + 1;
     if (nrf_fft_stream_is_active() &&
         (strcmp(sub, "init") == 0 ||
+         strcmp(sub, "loopback") == 0 ||
          strcmp(sub, "xfer") == 0 ||
          strcmp(sub, "sweep") == 0
 #ifdef NRF_BENCH_ENABLED
@@ -1272,6 +1273,7 @@ static void run_nrf_group(const size_t argc, const char *argv[]) {
     }
     if (strcmp(sub, "init") == 0) run_nrf_spi_init(sub_argc, sub_argv);
     else if (strcmp(sub, "status") == 0) run_nrf_spi_status(sub_argc, sub_argv);
+    else if (strcmp(sub, "loopback") == 0) run_nrf_loopback(sub_argc, sub_argv);
     else if (strcmp(sub, "xfer") == 0) run_nrf_spi_xfer(sub_argc, sub_argv);
     else if (strcmp(sub, "sweep") == 0) run_nrf_spi_sweep(sub_argc, sub_argv);
 #ifdef NRF_BENCH_ENABLED
@@ -1781,6 +1783,10 @@ static cmd_def_t cmds[] = {
     {"nrf_spi_status", run_nrf_spi_status,
      "nrf_spi_status:\n"
      " Show NRF SPI pin mapping and current baud rate."},
+    {"nrf_loopback", run_nrf_loopback,
+     "nrf_loopback <start|stop>:\n"
+     " Switch BM20_C production firmware between scope packets and previous-frame SPI echo.\n"
+     " Mostly for manual debugging; nrf_spi_sweep/nrf_spi_bench/nrf_spi_xfer enable it automatically."},
     {"nrf_spi_xfer", run_nrf_spi_xfer,
      "nrf_spi_xfer <byte_hex...>:\n"
      " Perform one SPI transaction and print TX/RX bytes.\n"

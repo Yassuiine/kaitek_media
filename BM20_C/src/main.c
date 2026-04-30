@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/i2s.h>
 #include <zephyr/drivers/spi.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -250,21 +251,39 @@ int main(void)
 #define CMD_STREAM_FETCH  0xB2u
 #define CMD_SENSOR_SELECT 0xB3u
 #define CMD_SET_MODE      0xB4u  /* payload byte: 0=raw waveform, 1=FFT */
+#define CMD_LOOPBACK_MODE 0xB5u  /* payload byte: 0=scope packets, 1=previous-frame echo */
 
 #define SENSOR_TS_MS 40u
 
 #define TWO_PI 6.28318530717958647692f
 
+#define MIC_TDM_DEV DEVICE_DT_GET(DT_NODELABEL(tdm))
+#define MIC_SAMPLE_RATE 48000u
+#define MIC_BIT_DEPTH 32u
+#define MIC_CHANNELS 2u
+#define MIC_BLOCK_SIZE (MIC_SAMPLE_RATE / 100u * MIC_CHANNELS * (MIC_BIT_DEPTH / 8u))
+#define MIC_BLOCK_COUNT 3u
+#define MIC_THREAD_STACK_SIZE 2048u
+#define MIC_THREAD_PRIORITY 5
+
 LOG_MODULE_REGISTER(bm20c_spis_scope, LOG_LEVEL_INF);
+
+K_MEM_SLAB_DEFINE(mic_rx_slab, MIC_BLOCK_SIZE, MIC_BLOCK_COUNT, 4);
+K_MUTEX_DEFINE(mic_ring_lock);
 
 static uint8_t tx_buffer[SENSOR_PACKET_BYTES];
 static uint8_t rx_buffer[SENSOR_PACKET_BYTES];
 
 static uint8_t sensor_ring_raw[SENSOR_RING_LEN];
 static uint8_t sensor_ring_plot[SENSOR_RING_LEN];
+static int32_t mic_ring_capture[SENSOR_RING_LEN];
+static uint8_t mic_ring_raw[SENSOR_RING_LEN];
+static uint8_t mic_ring_plot[SENSOR_RING_LEN];
+static uint16_t mic_write_index;
 
 static bool sensor_stream_enabled;
 static bool sensor_fft_enabled = false;
+static bool loopback_enabled;
 static uint8_t sensor_sequence;
 static uint8_t selected_sensor;
 static uint16_t sensor_write_index;
@@ -302,8 +321,8 @@ static int32_t clamp_i32(int32_t v, int32_t lo, int32_t hi)
 static uint8_t scale_capture_to_u8(int32_t sample, int32_t min_capture, int32_t max_capture)
 {
 	int32_t clamped = clamp_i32(sample, min_capture, max_capture);
-	int32_t range = max_capture - min_capture;
-	int32_t scaled = (range > 0) ? ((clamped - min_capture) * 255) / range : 127;
+	int64_t range = (int64_t)max_capture - (int64_t)min_capture;
+	int64_t scaled = (range > 0) ? (((int64_t)clamped - (int64_t)min_capture) * 255) / range : 127;
 	return (uint8_t)clamp_i32(scaled, 0, 255);
 }
 
@@ -314,6 +333,126 @@ static uint8_t map_u8_to_plot_x(uint8_t u8_value)
 	int32_t x = 120 + (centered * 120) / 127;
 	return (uint8_t)clamp_i32(x, 0, 240);
 }
+
+static uint8_t scale_capture_to_plot(int32_t sample, int32_t min_capture, int32_t max_capture)
+{
+	int64_t range = (int64_t)max_capture - (int64_t)min_capture;
+	int64_t scaled = (range > 0) ? (((int64_t)sample - (int64_t)min_capture) * 240) / range : 120;
+	return (uint8_t)clamp_i32((int32_t)scaled, 0, 240);
+}
+
+static void mic_store_sample_locked(int32_t sample)
+{
+	mic_ring_capture[mic_write_index] = sample;
+	mic_write_index = (uint16_t)((mic_write_index + 1u) % SENSOR_RING_LEN);
+}
+
+static void mic_init_ring_centered(void)
+{
+	k_mutex_lock(&mic_ring_lock, K_FOREVER);
+	memset(mic_ring_capture, 0, sizeof(mic_ring_capture));
+	memset(mic_ring_raw, 127, sizeof(mic_ring_raw));
+	memset(mic_ring_plot, 120, sizeof(mic_ring_plot));
+	mic_write_index = 0;
+	k_mutex_unlock(&mic_ring_lock);
+}
+
+static void mic_copy_ring_snapshot(uint8_t *raw, uint8_t *plot, uint16_t *write_index)
+{
+	k_mutex_lock(&mic_ring_lock, K_FOREVER);
+	int32_t min_capture = mic_ring_capture[0];
+	int32_t max_capture = mic_ring_capture[0];
+
+	for (uint16_t i = 1; i < SENSOR_RING_LEN; i++) {
+		if (mic_ring_capture[i] < min_capture) {
+			min_capture = mic_ring_capture[i];
+		}
+		if (mic_ring_capture[i] > max_capture) {
+			max_capture = mic_ring_capture[i];
+		}
+	}
+
+	for (uint16_t i = 0; i < SENSOR_RING_LEN; i++) {
+		mic_ring_raw[i] = scale_capture_to_u8(mic_ring_capture[i], min_capture, max_capture);
+		mic_ring_plot[i] = scale_capture_to_plot(mic_ring_capture[i], min_capture, max_capture);
+	}
+
+	memcpy(raw, mic_ring_raw, SENSOR_RING_LEN);
+	memcpy(plot, mic_ring_plot, SENSOR_RING_LEN);
+	*write_index = mic_write_index;
+	k_mutex_unlock(&mic_ring_lock);
+}
+
+static void mic_capture_thread(void *arg1, void *arg2, void *arg3)
+{
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
+
+	const struct device *tdm_dev = MIC_TDM_DEV;
+
+	mic_init_ring_centered();
+
+	if (!device_is_ready(tdm_dev)) {
+		LOG_ERR("TDM device not ready; sensor 0 will stay centered");
+		return;
+	}
+
+	struct i2s_config cfg = {
+		.word_size = MIC_BIT_DEPTH,
+		.channels = MIC_CHANNELS,
+		.format = I2S_FMT_DATA_FORMAT_I2S,
+		.options = I2S_OPT_BIT_CLK_MASTER | I2S_OPT_FRAME_CLK_MASTER,
+		.frame_clk_freq = MIC_SAMPLE_RATE,
+		.mem_slab = &mic_rx_slab,
+		.block_size = MIC_BLOCK_SIZE,
+		.timeout = 2000,
+	};
+
+	int ret = i2s_configure(tdm_dev, I2S_DIR_RX, &cfg);
+	if (ret < 0) {
+		LOG_ERR("i2s_configure RX failed: %d", ret);
+		return;
+	}
+
+	ret = i2s_trigger(tdm_dev, I2S_DIR_RX, I2S_TRIGGER_START);
+	if (ret < 0) {
+		LOG_ERR("i2s_trigger START failed: %d", ret);
+		return;
+	}
+
+	LOG_INF("ICS43434 capture started: %u Hz, %u-bit, %u channels, block=%u bytes",
+		(unsigned int)MIC_SAMPLE_RATE,
+		(unsigned int)MIC_BIT_DEPTH,
+		(unsigned int)MIC_CHANNELS,
+		(unsigned int)MIC_BLOCK_SIZE);
+
+	while (1) {
+		void *rx_block;
+		size_t rx_size;
+
+		ret = i2s_read(tdm_dev, &rx_block, &rx_size);
+		if (ret < 0) {
+			LOG_ERR("i2s_read error: %d", ret);
+			k_msleep(10);
+			continue;
+		}
+
+		int32_t *samples = (int32_t *)rx_block;
+		uint32_t sample_count = (uint32_t)(rx_size / sizeof(int32_t));
+
+		k_mutex_lock(&mic_ring_lock, K_FOREVER);
+		for (uint32_t i = 0; i < sample_count; i += MIC_CHANNELS) {
+			mic_store_sample_locked(samples[i] >> 8);
+		}
+		k_mutex_unlock(&mic_ring_lock);
+
+		k_mem_slab_free(&mic_rx_slab, rx_block);
+	}
+}
+
+K_THREAD_DEFINE(mic_capture_tid, MIC_THREAD_STACK_SIZE, mic_capture_thread,
+	NULL, NULL, NULL, MIC_THREAD_PRIORITY, 0, 0);
 
 static int32_t sensor_sim_capture(uint8_t sensor_id, uint32_t sample_index)
 {
@@ -410,13 +549,30 @@ static void fft_radix2(float *re, float *im, uint16_t n)
 
 static void sensor_fill_ring_once(void)
 {
+	if (selected_sensor == 0u && !sensor_fft_enabled) {
+		mic_copy_ring_snapshot(sensor_ring_raw, sensor_ring_plot, &sensor_write_index);
+		return;
+	}
+
 	if (sensor_fft_enabled) {
 		/* FFT path: Hanning-windowed 256-point FFT → magnitude spectrum */
-		for (uint16_t i = 0; i < FFT_SIZE; i++) {
-			int32_t raw = sensor_sim_capture(selected_sensor, sensor_sample_counter++);
-			float w = 0.5f * (1.0f - cosf(TWO_PI * (float)i / (float)(FFT_SIZE - 1u)));
-			fft_re[i] = (float)raw * w;
-			fft_im[i] = 0.0f;
+		if (selected_sensor == 0u) {
+			uint16_t write_index;
+			mic_copy_ring_snapshot(sensor_ring_raw, sensor_ring_plot, &write_index);
+			for (uint16_t i = 0; i < FFT_SIZE; i++) {
+				uint16_t idx = (uint16_t)((write_index + i) % SENSOR_RING_LEN);
+				int32_t raw = ((int32_t)sensor_ring_raw[idx] - 128) * 256;
+				float w = 0.5f * (1.0f - cosf(TWO_PI * (float)i / (float)(FFT_SIZE - 1u)));
+				fft_re[i] = (float)raw * w;
+				fft_im[i] = 0.0f;
+			}
+		} else {
+			for (uint16_t i = 0; i < FFT_SIZE; i++) {
+				int32_t raw = sensor_sim_capture(selected_sensor, sensor_sample_counter++);
+				float w = 0.5f * (1.0f - cosf(TWO_PI * (float)i / (float)(FFT_SIZE - 1u)));
+				fft_re[i] = (float)raw * w;
+				fft_im[i] = 0.0f;
+			}
 		}
 
 		fft_radix2(fft_re, fft_im, FFT_SIZE);
@@ -460,9 +616,19 @@ static void process_command_frame(const uint8_t *rx, size_t len)
 	if (!rx || len == 0u) {
 		return;
 	}
+	if (loopback_enabled && rx[0] != CMD_LOOPBACK_MODE) {
+		return;
+	}
 
 	switch (rx[0]) {
+	case CMD_LOOPBACK_MODE:
+		loopback_enabled = (len >= 2u) ? (rx[1] != 0u) : false;
+		if (loopback_enabled) {
+			sensor_stream_enabled = false;
+		}
+		break;
 	case CMD_STREAM_START:
+		loopback_enabled = false;
 		sensor_stream_enabled = true;
 		if (len >= 2u) {
 			apply_sensor_selection(rx[1]);
@@ -477,23 +643,31 @@ static void process_command_frame(const uint8_t *rx, size_t len)
 		sensor_next_fill_ms = 0;
 		break;
 	case CMD_SENSOR_SELECT:
+		loopback_enabled = false;
 		if (len >= 2u) {
 			apply_sensor_selection(rx[1]);
 		}
 		break;
 	case CMD_STREAM_FETCH:
+		loopback_enabled = false;
 		/* Keep sensor selection sticky during streaming: master can resend desired sensor in every fetch. */
 		if (len >= 2u) {
 			apply_sensor_selection(rx[1]);
 		}
 		break;
 	case CMD_SET_MODE:
+		loopback_enabled = false;
 		sensor_fft_enabled = (len >= 2u) ? (rx[1] != 0u) : false;
 		sensor_next_fill_ms = 0;
 		break;
 	default:
 		break;
 	}
+}
+
+static void prepare_loopback_response(void)
+{
+	memcpy(tx_buffer, rx_buffer, sizeof(tx_buffer));
 }
 
 static void prepare_tx_packet(void)
@@ -551,6 +725,7 @@ int main(void)
 	memset(sensor_ring_raw, 127, sizeof(sensor_ring_raw));
 	memset(sensor_ring_plot, 120, sizeof(sensor_ring_plot));
 	sensor_stream_enabled = false;
+	loopback_enabled = false;
 	sensor_sequence = 0;
 	selected_sensor = 0;
 	sensor_write_index = 0;
@@ -563,10 +738,11 @@ int main(void)
 	sensor_phase_4 = 0.0f;
 	prepare_tx_packet();
 
-	LOG_INF("BM20_C SPIS scope ready (production, packet=%u bytes, samples=%u, Ts=%u ms)",
+	LOG_INF("BM20_C SPIS scope ready (production, packet=%u bytes, samples=%u, Ts=%u ms, loopback cmd=0x%02X)",
 		(unsigned int)SENSOR_PACKET_BYTES,
 		(unsigned int)SENSOR_RING_LEN,
-		(unsigned int)SENSOR_TS_MS);
+		(unsigned int)SENSOR_TS_MS,
+		(unsigned int)CMD_LOOPBACK_MODE);
 
 	uint32_t transfer_count = 0;
 	while (1) {
@@ -578,12 +754,17 @@ int main(void)
 		}
 
 		process_command_frame(rx_buffer, sizeof(rx_buffer));
-		prepare_tx_packet();
+		if (loopback_enabled) {
+			prepare_loopback_response();
+		} else {
+			prepare_tx_packet();
+		}
 
 		transfer_count++;
 		if ((transfer_count % 500u) == 0u) {
-			LOG_INF("xfer=%u stream=%u seq=%u sensor=%u write=%u",
+			LOG_INF("xfer=%u mode=%s stream=%u seq=%u sensor=%u write=%u",
 				(unsigned int)transfer_count,
+				loopback_enabled ? "loopback" : "scope",
 				sensor_stream_enabled ? 1u : 0u,
 				(unsigned int)sensor_sequence,
 				(unsigned int)selected_sensor,

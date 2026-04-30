@@ -28,6 +28,7 @@ extern "C" {
 #define NRF_SCOPE_CMD_FETCH    0xB2u
 #define NRF_SCOPE_CMD_SENSOR   0xB3u
 #define NRF_SCOPE_CMD_SET_MODE 0xB4u  /* payload byte: 0=raw waveform, 1=FFT */
+#define NRF_SCOPE_CMD_LOOPBACK 0xB5u  /* payload byte: 0=scope packets, 1=previous-frame echo */
 
 // Per-frame transfer context for the Mode-B NRF relay path.
 // Because Mode-B sends one chunk per scheduler tick, this struct persists transfer
@@ -80,6 +81,7 @@ void run_nrf_spi_init(size_t argc, const char *argv[]);
 void run_nrf_spi_status(size_t argc, const char *argv[]);
 void run_nrf_spi_xfer(size_t argc, const char *argv[]);
 void run_nrf_spi_sweep(size_t argc, const char *argv[]);
+void run_nrf_loopback(size_t argc, const char *argv[]);
 #ifdef NRF_BENCH_ENABLED
 void run_nrf_spi_bench(size_t argc, const char *argv[]);
 void run_nrf_spi_diag(size_t argc, const char *argv[]);

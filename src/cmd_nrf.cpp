@@ -7,6 +7,7 @@
 #include <stdlib.h>
 //
 #include "pico/stdlib.h"
+#include "pico/stdio.h"
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
 //
@@ -247,6 +248,48 @@ void run_nrf_spi_status(size_t argc, const char *argv[]) {
     printf("Actual baud: %lu Hz\n", (unsigned long)nrf_spi_actual_hz);
 }
 
+static bool nrf_set_slave_loopback(bool enable) {
+    if (!nrf_spi_initialized) {
+        nrf_spi_prepare_bus(15000000);
+    }
+
+    uint8_t tx[2] = {0};
+    uint8_t rx[2] = {0};
+	tx[0] = NRF_SCOPE_CMD_LOOPBACK;
+	tx[1] = enable ? 1u : 0u;
+
+	return nrf_spi_transfer_bytes(tx, rx, sizeof(tx));
+}
+
+void run_nrf_loopback(size_t argc, const char *argv[]) {
+    if (argc != 1 ||
+        (strcmp(argv[0], "start") != 0 && strcmp(argv[0], "stop") != 0 &&
+         strcmp(argv[0], "on") != 0 && strcmp(argv[0], "off") != 0)) {
+        printf("Usage: nrf loopback <start|stop>\n");
+        printf("  start: BM20_C echoes each received frame on the next SPI transaction\n");
+        printf("  stop:  BM20_C returns to production scope packets for nrf stream\n");
+        return;
+    }
+    if (!nrf_spi_initialized) {
+        nrf_spi_prepare_bus(15000000);
+    }
+    if (nrf_fft_stream_active) {
+        printf("Stop nrf stream before changing loopback mode.\n");
+        return;
+    }
+
+    bool enable = (strcmp(argv[0], "start") == 0 || strcmp(argv[0], "on") == 0);
+
+    if (!nrf_set_slave_loopback(enable)) {
+        printf("Failed to send BM20_C loopback command.\n");
+        return;
+    }
+
+    printf("BM20_C loopback %s. %s\n",
+           enable ? "enabled" : "disabled",
+           enable ? "Diagnostic SPI commands will echo previous frames until stopped." : "nrf stream can be used again.");
+}
+
 /**
  * @brief Perform one manual full-duplex SPI transfer with hex byte arguments and print the TX and RX bytes.
  */
@@ -267,13 +310,30 @@ void run_nrf_spi_xfer(size_t argc, const char *argv[]) {
         return;
     }
 
+    if (!nrf_set_slave_loopback(true)) {
+        printf("Failed to enable BM20_C loopback mode. Is the updated BM20_C firmware flashed?\n");
+        return;
+    }
+
+    /* Zephyr SPIS replies with the buffer prepared before this CS assertion.
+     * Prime once so production loopback mode can echo tx on the checked transfer. */
     nrf_spi_drain_rx_fifo();
     gpio_put(nrf_spi_cs_pin, 0);
     busy_wait_us_32(nrf_spi_cs_setup_us);  // Give slave CS setup time before first SCK edge.
+    (void)spi_write_read_blocking(SPI_PORT, tx, rx, (size_t)n);
+    busy_wait_us_32(nrf_spi_cs_hold_us);  // Hold CS a moment after last edge.
+    gpio_put(nrf_spi_cs_pin, 1);
+    busy_wait_us_32(nrf_spi_frame_gap_us);  // Small gap between frames.
+
+    nrf_spi_drain_rx_fifo();
+    gpio_put(nrf_spi_cs_pin, 0);
+    busy_wait_us_32(nrf_spi_cs_setup_us);
     int ret = spi_write_read_blocking(SPI_PORT, tx, rx, (size_t)n);
     busy_wait_us_32(nrf_spi_cs_hold_us);  // Hold CS a moment after last edge.
     gpio_put(nrf_spi_cs_pin, 1);
     busy_wait_us_32(nrf_spi_frame_gap_us);  // Small gap between frames.
+
+    (void)nrf_set_slave_loopback(false);
 
     if (ret < 0 || (size_t)ret != n) {
         printf("SPI transfer failed (%d)\n", ret);
@@ -292,6 +352,10 @@ void run_nrf_spi_xfer(size_t argc, const char *argv[]) {
  * @brief Sweep SPI baud rates from start_hz to stop_hz, measuring pass rate and throughput at each step against an expected echo pattern.
  */
 void run_nrf_spi_sweep(size_t argc, const char *argv[]) {
+    bool loopback_active = false;
+    bool aborted = false;
+    uint32_t restore_hz = nrf_spi_actual_hz;
+
     if (argc != 6) {
         printf("Usage: nrf_spi_sweep <start_hz> <stop_hz> <step_hz> <loops> <tx_hex> <expect_hex>\n");
         printf("Example: nrf_spi_sweep 1000000 32000000 1000000 200 A55A010203 5AA5AABBCC\n");
@@ -326,7 +390,6 @@ void run_nrf_spi_sweep(size_t argc, const char *argv[]) {
         printf("tx_hex and expect_hex must have same byte length\n");
         return;
     }
-
     printf("Sweeping SPI speed from %lu to %lu Hz step %lu, loops=%lu, frame=%u bytes\n",
            (unsigned long)start_hz, (unsigned long)stop_hz, (unsigned long)step_hz,
            (unsigned long)loops, (unsigned)tx_len);
@@ -334,44 +397,51 @@ void run_nrf_spi_sweep(size_t argc, const char *argv[]) {
            (unsigned long)nrf_spi_cs_setup_us,
            (unsigned long)nrf_spi_cs_hold_us,
            (unsigned long)nrf_spi_frame_gap_us);
-    uint32_t restore_hz = nrf_spi_actual_hz;
+    stdio_flush();
+    printf("Enabling BM20_C loopback...\n");
+    stdio_flush();
+    if (!nrf_set_slave_loopback(true)) {
+        printf("Failed to enable BM20_C loopback mode. Is the updated BM20_C firmware flashed?\n");
+        return;
+    }
+    loopback_active = true;
     if (restore_hz == 0) {
         restore_hz = start_hz;
     }
+    printf("Press Enter to abort sweep.\n");
 
     // Iterate over each requested baud point.
     for (uint32_t hz = start_hz; hz <= stop_hz; hz += step_hz) {
         nrf_spi_prepare_bus(hz);
+        printf("req=%lu actual=%lu ... ", (unsigned long)hz, (unsigned long)nrf_spi_actual_hz);
+        stdio_flush();
         // One warm-up transfer discarded before measurement: ensures the SPI FIFO and slave
         // state are stable after the baud-rate change so the first timed frame is representative.
-        nrf_spi_drain_rx_fifo();
-        gpio_put(nrf_spi_cs_pin, 0);
-        busy_wait_us_32(nrf_spi_cs_setup_us);
-        (void)spi_write_read_blocking(SPI_PORT, tx, rx, tx_len);
-        busy_wait_us_32(nrf_spi_cs_hold_us);
-        gpio_put(nrf_spi_cs_pin, 1);
-        busy_wait_us_32(nrf_spi_frame_gap_us);
+        (void)nrf_spi_transfer_bytes(tx, rx, tx_len);
 
         uint32_t ok = 0;   // Transfers whose RX exactly matched expect[]
         uint32_t fail = 0; // Transfers that returned a wrong length or wrong data
         uint64_t t0 = time_us_64();
         // Timed measurement loop: send 'loops' frames and count pass/fail.
         for (uint32_t i = 0; i < loops; ++i) {
-            nrf_spi_drain_rx_fifo();
-            gpio_put(nrf_spi_cs_pin, 0);
-            busy_wait_us_32(nrf_spi_cs_setup_us);
-            int ret = spi_write_read_blocking(SPI_PORT, tx, rx, tx_len);
-            busy_wait_us_32(nrf_spi_cs_hold_us);
-            gpio_put(nrf_spi_cs_pin, 1);
-            busy_wait_us_32(nrf_spi_frame_gap_us);
-
-            if (ret >= 0 && (size_t)ret == tx_len && memcmp(rx, expect, tx_len) == 0) {
+            if (die) {
+                aborted = true;
+                break;
+            }
+            if (nrf_spi_transfer_bytes(tx, rx, tx_len) && memcmp(rx, expect, tx_len) == 0) {
                 ok++;
             } else {
                 fail++;
             }
+            if ((loops >= 1000u) && ((i + 1u) % 1000u == 0u)) {
+                printf(".");
+                stdio_flush();
+            }
         }
         uint64_t dt = time_us_64() - t0;
+        if (loops >= 1000u) {
+            printf("\n");
+        }
         // Compute throughput: total bytes / elapsed seconds, cast to uint32.
         // The cast is safe because tx_len * loops can't overflow uint64 for practical sweep sizes.
         uint32_t throughput_bps = 0;
@@ -379,16 +449,26 @@ void run_nrf_spi_sweep(size_t argc, const char *argv[]) {
             throughput_bps = (uint32_t)(((uint64_t)tx_len * loops * 1000000ULL) / dt);
         }
 
-        printf("req=%lu actual=%lu ok=%lu fail=%lu throughput=%lu B/s\n",
-               (unsigned long)hz, (unsigned long)nrf_spi_actual_hz,
+        printf("ok=%lu fail=%lu throughput=%lu B/s\n",
                (unsigned long)ok, (unsigned long)fail, (unsigned long)throughput_bps);
 
+        if (aborted) {
+            break;
+        }
         // Guard against uint32 overflow: if incrementing hz would wrap past stop_hz, stop now.
         if (hz > stop_hz - step_hz) break;
     }
 
     nrf_spi_prepare_bus(restore_hz);
-    printf("Sweep done. Restored SPI baud to actual=%lu Hz\n", (unsigned long)nrf_spi_actual_hz);
+    if (loopback_active) {
+        (void)nrf_set_slave_loopback(false);
+    }
+    if (aborted) {
+        die = false;
+        printf("Sweep aborted. Restored SPI baud to actual=%lu Hz\n", (unsigned long)nrf_spi_actual_hz);
+    } else {
+        printf("Sweep done. Restored SPI baud to actual=%lu Hz\n", (unsigned long)nrf_spi_actual_hz);
+    }
 }
 
 #ifdef NRF_BENCH_ENABLED
@@ -423,6 +503,10 @@ void run_nrf_spi_bench(size_t argc, const char *argv[]) {
     }
     if (!nrf_spi_initialized) {
         nrf_spi_prepare_bus(15000000);
+    }
+    if (!nrf_set_slave_loopback(true)) {
+        printf("Failed to enable BM20_C loopback mode. Is the updated BM20_C firmware flashed?\n");
+        return;
     }
 
     /* For large frames the nRF SPIS driver needs more re-arm time.
@@ -501,6 +585,7 @@ void run_nrf_spi_bench(size_t argc, const char *argv[]) {
     printf("ok=%lu fail=%lu throughput=%lu B/s (%lu KB/s)\n",
            (unsigned long)ok, (unsigned long)fail,
            (unsigned long)throughput, (unsigned long)(throughput / 1024));
+    (void)nrf_set_slave_loopback(false);
 }
 #endif /* NRF_BENCH_ENABLED */
 
