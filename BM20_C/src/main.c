@@ -8,9 +8,11 @@
 #include <stdint.h>
 #include <string.h>
 
+#include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/i2s.h>
 #include <zephyr/drivers/spi.h>
+#include <zephyr/dt-bindings/adc/nrf-saadc.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
@@ -266,10 +268,18 @@ int main(void)
 #define MIC_THREAD_STACK_SIZE 2048u
 #define MIC_THREAD_PRIORITY 5
 
+#define PIEZO_ADC_DEV DEVICE_DT_GET(DT_NODELABEL(adc))
+#define PIEZO_ADC_CHANNEL 0u
+#define PIEZO_ADC_RESOLUTION 12u
+#define PIEZO_ADC_SAMPLE_PERIOD_MS 10u
+#define PIEZO_ADC_THREAD_STACK_SIZE 1024u
+#define PIEZO_ADC_THREAD_PRIORITY 6
+
 LOG_MODULE_REGISTER(bm20c_spis_scope, LOG_LEVEL_INF);
 
 K_MEM_SLAB_DEFINE(mic_rx_slab, MIC_BLOCK_SIZE, MIC_BLOCK_COUNT, 4);
 K_MUTEX_DEFINE(mic_ring_lock);
+K_MUTEX_DEFINE(piezo_ring_lock);
 
 static uint8_t tx_buffer[SENSOR_PACKET_BYTES];
 static uint8_t rx_buffer[SENSOR_PACKET_BYTES];
@@ -280,6 +290,11 @@ static int32_t mic_ring_capture[SENSOR_RING_LEN];
 static uint8_t mic_ring_raw[SENSOR_RING_LEN];
 static uint8_t mic_ring_plot[SENSOR_RING_LEN];
 static uint16_t mic_write_index;
+static int32_t piezo_ring_capture[SENSOR_RING_LEN];
+static uint8_t piezo_ring_raw[SENSOR_RING_LEN];
+static uint8_t piezo_ring_plot[SENSOR_RING_LEN];
+static uint16_t piezo_write_index;
+static int16_t piezo_sample_buffer;
 
 static bool sensor_stream_enabled;
 static bool sensor_fft_enabled = false;
@@ -341,6 +356,33 @@ static uint8_t scale_capture_to_plot(int32_t sample, int32_t min_capture, int32_
 	return (uint8_t)clamp_i32((int32_t)scaled, 0, 240);
 }
 
+static void scale_capture_ring_snapshot(const int32_t *capture,
+					uint8_t *cached_raw,
+					uint8_t *cached_plot,
+					uint8_t *raw,
+					uint8_t *plot)
+{
+	int32_t min_capture = capture[0];
+	int32_t max_capture = capture[0];
+
+	for (uint16_t i = 1; i < SENSOR_RING_LEN; i++) {
+		if (capture[i] < min_capture) {
+			min_capture = capture[i];
+		}
+		if (capture[i] > max_capture) {
+			max_capture = capture[i];
+		}
+	}
+
+	for (uint16_t i = 0; i < SENSOR_RING_LEN; i++) {
+		cached_raw[i] = scale_capture_to_u8(capture[i], min_capture, max_capture);
+		cached_plot[i] = scale_capture_to_plot(capture[i], min_capture, max_capture);
+	}
+
+	memcpy(raw, cached_raw, SENSOR_RING_LEN);
+	memcpy(plot, cached_plot, SENSOR_RING_LEN);
+}
+
 static void mic_store_sample_locked(int32_t sample)
 {
 	mic_ring_capture[mic_write_index] = sample;
@@ -360,25 +402,7 @@ static void mic_init_ring_centered(void)
 static void mic_copy_ring_snapshot(uint8_t *raw, uint8_t *plot, uint16_t *write_index)
 {
 	k_mutex_lock(&mic_ring_lock, K_FOREVER);
-	int32_t min_capture = mic_ring_capture[0];
-	int32_t max_capture = mic_ring_capture[0];
-
-	for (uint16_t i = 1; i < SENSOR_RING_LEN; i++) {
-		if (mic_ring_capture[i] < min_capture) {
-			min_capture = mic_ring_capture[i];
-		}
-		if (mic_ring_capture[i] > max_capture) {
-			max_capture = mic_ring_capture[i];
-		}
-	}
-
-	for (uint16_t i = 0; i < SENSOR_RING_LEN; i++) {
-		mic_ring_raw[i] = scale_capture_to_u8(mic_ring_capture[i], min_capture, max_capture);
-		mic_ring_plot[i] = scale_capture_to_plot(mic_ring_capture[i], min_capture, max_capture);
-	}
-
-	memcpy(raw, mic_ring_raw, SENSOR_RING_LEN);
-	memcpy(plot, mic_ring_plot, SENSOR_RING_LEN);
+	scale_capture_ring_snapshot(mic_ring_capture, mic_ring_raw, mic_ring_plot, raw, plot);
 	*write_index = mic_write_index;
 	k_mutex_unlock(&mic_ring_lock);
 }
@@ -453,6 +477,89 @@ static void mic_capture_thread(void *arg1, void *arg2, void *arg3)
 
 K_THREAD_DEFINE(mic_capture_tid, MIC_THREAD_STACK_SIZE, mic_capture_thread,
 	NULL, NULL, NULL, MIC_THREAD_PRIORITY, 0, 0);
+
+static void piezo_store_sample_locked(int32_t sample)
+{
+	piezo_ring_capture[piezo_write_index] = sample;
+	piezo_write_index = (uint16_t)((piezo_write_index + 1u) % SENSOR_RING_LEN);
+}
+
+static void piezo_init_ring_centered(void)
+{
+	k_mutex_lock(&piezo_ring_lock, K_FOREVER);
+	memset(piezo_ring_capture, 0, sizeof(piezo_ring_capture));
+	memset(piezo_ring_raw, 127, sizeof(piezo_ring_raw));
+	memset(piezo_ring_plot, 120, sizeof(piezo_ring_plot));
+	piezo_write_index = 0;
+	k_mutex_unlock(&piezo_ring_lock);
+}
+
+static void piezo_copy_ring_snapshot(uint8_t *raw, uint8_t *plot, uint16_t *write_index)
+{
+	k_mutex_lock(&piezo_ring_lock, K_FOREVER);
+	scale_capture_ring_snapshot(piezo_ring_capture, piezo_ring_raw, piezo_ring_plot, raw, plot);
+	*write_index = piezo_write_index;
+	k_mutex_unlock(&piezo_ring_lock);
+}
+
+static void piezo_adc_thread(void *arg1, void *arg2, void *arg3)
+{
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
+
+	const struct device *adc_dev = PIEZO_ADC_DEV;
+
+	piezo_init_ring_centered();
+
+	if (!device_is_ready(adc_dev)) {
+		LOG_ERR("ADC device not ready; sensor 1 will stay centered");
+		return;
+	}
+
+	struct adc_channel_cfg ch_cfg = {
+		.gain = ADC_GAIN_1_4,
+		.reference = ADC_REF_INTERNAL,
+		.acquisition_time = ADC_ACQ_TIME_DEFAULT,
+		.channel_id = PIEZO_ADC_CHANNEL,
+		.input_positive = NRF_SAADC_AIN6,
+	};
+	struct adc_sequence sequence = {
+		.channels = BIT(PIEZO_ADC_CHANNEL),
+		.buffer = &piezo_sample_buffer,
+		.buffer_size = sizeof(piezo_sample_buffer),
+		.resolution = PIEZO_ADC_RESOLUTION,
+	};
+
+	int ret = adc_channel_setup(adc_dev, &ch_cfg);
+	if (ret < 0) {
+		LOG_ERR("adc_channel_setup failed: %d", ret);
+		return;
+	}
+
+	LOG_INF("Piezo ADC capture started: channel=%u input=AIN6/P1.04 resolution=%u period=%u ms",
+		(unsigned int)PIEZO_ADC_CHANNEL,
+		(unsigned int)PIEZO_ADC_RESOLUTION,
+		(unsigned int)PIEZO_ADC_SAMPLE_PERIOD_MS);
+
+	while (1) {
+		ret = adc_read(adc_dev, &sequence);
+		if (ret < 0) {
+			LOG_ERR("adc_read failed: %d", ret);
+			k_msleep(PIEZO_ADC_SAMPLE_PERIOD_MS);
+			continue;
+		}
+
+		k_mutex_lock(&piezo_ring_lock, K_FOREVER);
+		piezo_store_sample_locked((int32_t)piezo_sample_buffer);
+		k_mutex_unlock(&piezo_ring_lock);
+
+		k_msleep(PIEZO_ADC_SAMPLE_PERIOD_MS);
+	}
+}
+
+K_THREAD_DEFINE(piezo_adc_tid, PIEZO_ADC_THREAD_STACK_SIZE, piezo_adc_thread,
+	NULL, NULL, NULL, PIEZO_ADC_THREAD_PRIORITY, 0, 0);
 
 static int32_t sensor_sim_capture(uint8_t sensor_id, uint32_t sample_index)
 {
@@ -553,12 +660,20 @@ static void sensor_fill_ring_once(void)
 		mic_copy_ring_snapshot(sensor_ring_raw, sensor_ring_plot, &sensor_write_index);
 		return;
 	}
+	if (selected_sensor == 1u && !sensor_fft_enabled) {
+		piezo_copy_ring_snapshot(sensor_ring_raw, sensor_ring_plot, &sensor_write_index);
+		return;
+	}
 
 	if (sensor_fft_enabled) {
 		/* FFT path: Hanning-windowed 256-point FFT → magnitude spectrum */
-		if (selected_sensor == 0u) {
+		if (selected_sensor == 0u || selected_sensor == 1u) {
 			uint16_t write_index;
-			mic_copy_ring_snapshot(sensor_ring_raw, sensor_ring_plot, &write_index);
+			if (selected_sensor == 0u) {
+				mic_copy_ring_snapshot(sensor_ring_raw, sensor_ring_plot, &write_index);
+			} else {
+				piezo_copy_ring_snapshot(sensor_ring_raw, sensor_ring_plot, &write_index);
+			}
 			for (uint16_t i = 0; i < FFT_SIZE; i++) {
 				uint16_t idx = (uint16_t)((write_index + i) % SENSOR_RING_LEN);
 				int32_t raw = ((int32_t)sensor_ring_raw[idx] - 128) * 256;

@@ -1,0 +1,39 @@
+&pinctrl {
+    tdm_default: tdm_default {
+        group1 {
+            psels = <NRF_PSEL(TDM_SCK_M, 1, 3)>,
+                    <NRF_PSEL(TDM_FSYNC_M, 1, 0)>,
+                    <NRF_PSEL(TDM_SDIN, 1, 10)>;
+        };
+    };
+    tdm_sleep: tdm_sleep {
+        group1 {
+            psels = <NRF_PSEL(TDM_SCK_M, 1, 3)>,
+                    <NRF_PSEL(TDM_FSYNC_M, 1, 0)>,
+                    <NRF_PSEL(TDM_SDIN, 1, 10)>;
+            low-power-enable;
+        };
+    };
+};
+
+&tdm {
+    status = "okay";
+    pinctrl-0 = <&tdm_default>;
+    pinctrl-1 = <&tdm_sleep>;
+    pinctrl-names = "default", "sleep";
+};
+
+&adc {
+    status = "okay";
+    #address-cells = <1>;
+    #size-cells = <0>;
+
+    channel@0 {
+        reg = <0>;
+        zephyr,gain = "ADC_GAIN_1_4";
+        zephyr,reference = "ADC_REF_INTERNAL";
+        zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+        zephyr,input-positive = <NRF_SAADC_AIN6>;  /* P1.04 */
+        zephyr,resolution = <12>;
+    };
+};
