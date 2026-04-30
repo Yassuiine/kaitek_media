@@ -29,6 +29,7 @@ extern "C" {
 #define NRF_SCOPE_CMD_SENSOR   0xB3u
 #define NRF_SCOPE_CMD_SET_MODE 0xB4u  /* payload byte: 0=raw waveform, 1=FFT */
 #define NRF_SCOPE_CMD_LOOPBACK 0xB5u  /* payload byte: 0=scope packets, 1=previous-frame echo */
+#define NRF_SCOPE_CMD_AUTOSCALE 0xB6u /* payload byte: 0=fixed hardware range, 1=window min/max */
 
 // Per-frame transfer context for the Mode-B NRF relay path.
 // Because Mode-B sends one chunk per scheduler tick, this struct persists transfer

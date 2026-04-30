@@ -1816,13 +1816,14 @@ static cmd_def_t cmds[] = {
      " nrf_timing hold  <us>   - CS hold after SCK   (default 4,   HSSPI: try 2)\n"
      " nrf_timing chunk <rows> - rows per transfer   (default 4,   HSSPI: try 8)"},
     {"nrf_stream", run_nrf_stream_public,
-     "nrf_stream <start|stop|status|sensor|period|fft> [args]:\n"
+     "nrf_stream <start|stop|status|sensor|period|autoscale|fft> [args]:\n"
      " Realtime sensor streaming from BM20_C to RP2350 over SPI with LCD graph.\n"
      " start [period_ms] starts 320-point spectrum/waveform rendering on the LCD.\n"
      " stop  halts polling and sends STOP to the slave.\n"
      " status prints counters/Ts/sequence and FFT state.\n"
-     " sensor <0|1|2> selects simulated sensor source.\n"
+     " sensor <0|1|2> selects sensor source.\n"
      " period <20..1000> sets refresh period override (default: Ts+1 ms).\n"
+     " autoscale <on|off|status> toggles per-window hardware sensor scaling.\n"
      " fft   toggles FFT on/off (FFT=on: frequency spectrum; FFT=off: waveform)."},
     {"cam_xclk", run_cam_xclk,
      "cam_xclk [<freq_khz>]:\n"

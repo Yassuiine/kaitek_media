@@ -70,6 +70,7 @@ static uint8_t  nrf_fft_last_bad_hdr[NRF_SCOPE_HEADER_BYTES]; // First 13 bytes 
 static uint32_t nrf_fft_sensor_mismatch_frames = 0;       // Consecutive valid frames whose reported sensor != requested sensor
 static uint32_t nrf_fft_resync_count = 0;                 // Number of automatic START re-sync attempts issued by RP
 static bool nrf_stream_fft_enabled = false;               // When false, nRF sends raw waveform; when true, nRF computes FFT
+static bool nrf_stream_auto_scale_enabled = true;          // When true, hardware sensors scale each 320-sample window by min/max
 static uint8_t nrf_fft_last_bins[NRF_SCOPE_SAMPLE_COUNT]; // Latest mapped X points (0..240), one per LCD row
 static uint8_t nrf_fft_tx_frame[NRF_SCOPE_PACKET_BYTES];  // RP->nRF control frame (START/STOP/FETCH/SENSOR)
 static uint8_t nrf_fft_rx_frame[NRF_SCOPE_PACKET_BYTES];  // nRF->RP scope packet received on each SPI transaction
@@ -688,11 +689,20 @@ uint8_t nrf_fft_xor_checksum(const uint8_t *buf, size_t len) {
 }
 
 bool nrf_fft_send_command(uint8_t cmd, uint8_t sensor_id) {
+	if (!nrf_spi_initialized) return false;
+	memset(nrf_fft_tx_frame, 0, sizeof(nrf_fft_tx_frame));
+    memset(nrf_fft_rx_frame, 0, sizeof(nrf_fft_rx_frame));
+    nrf_fft_tx_frame[0] = cmd;
+	nrf_fft_tx_frame[1] = sensor_id;
+	return nrf_spi_transfer_bytes(nrf_fft_tx_frame, nrf_fft_rx_frame, sizeof(nrf_fft_tx_frame));
+}
+
+static bool nrf_stream_send_autoscale(void) {
     if (!nrf_spi_initialized) return false;
     memset(nrf_fft_tx_frame, 0, sizeof(nrf_fft_tx_frame));
     memset(nrf_fft_rx_frame, 0, sizeof(nrf_fft_rx_frame));
-    nrf_fft_tx_frame[0] = cmd;
-    nrf_fft_tx_frame[1] = sensor_id;
+    nrf_fft_tx_frame[0] = NRF_SCOPE_CMD_AUTOSCALE;
+    nrf_fft_tx_frame[1] = nrf_stream_auto_scale_enabled ? 1u : 0u;
     return nrf_spi_transfer_bytes(nrf_fft_tx_frame, nrf_fft_rx_frame, sizeof(nrf_fft_tx_frame));
 }
 
@@ -863,11 +873,13 @@ static void run_nrf_stream(size_t argc, const char *argv[]) {
         printf("Usage: nrf stream start [period_ms]\n");
         printf("       nrf stream stop\n");
         printf("       nrf stream status\n");
-        printf("       nrf stream sensor <0|1|2>\n");
-        printf("       nrf stream period <20..1000>\n");
-        printf("       nrf stream fft           - toggle FFT on/off (currently %s)\n",
-               nrf_stream_fft_enabled ? "on" : "off");
-        return;
+		printf("       nrf stream sensor <0|1|2>\n");
+		printf("       nrf stream period <20..1000>\n");
+		printf("       nrf stream autoscale <on|off|status> - hardware sensor scaling (currently %s)\n",
+		       nrf_stream_auto_scale_enabled ? "on" : "off");
+		printf("       nrf stream fft           - toggle FFT on/off (currently %s)\n",
+		       nrf_stream_fft_enabled ? "on" : "off");
+		return;
     }
 
     const char *sub = argv[0];
@@ -922,24 +934,31 @@ static void run_nrf_stream(size_t argc, const char *argv[]) {
         nrf_fft_last_write_index = 0;
         memset(nrf_fft_last_bins, 0, sizeof(nrf_fft_last_bins));
 
-        if (!nrf_fft_send_command(NRF_SCOPE_CMD_START, nrf_fft_selected_sensor)) {
-            printf("Failed to start NRF stream (SPI transfer failed)\n");
-            return;
-        }
+		if (!nrf_stream_send_autoscale()) {
+			printf("Warning: failed to send autoscale mode to nRF.\n");
+		}
+
+		if (!nrf_fft_send_command(NRF_SCOPE_CMD_START, nrf_fft_selected_sensor)) {
+			printf("Failed to start NRF stream (SPI transfer failed)\n");
+			return;
+		}
 
         nrf_fft_drop_first_packet = true;
         nrf_fft_stream_active = true;
         nrf_fft_next_poll_time = get_absolute_time();
         if (nrf_fft_period_override) {
-            printf("NRF stream started: sensor=%u period=%lu ms (override) fft=%s\n",
-                   nrf_fft_selected_sensor, (unsigned long)nrf_fft_poll_period_ms,
-                   nrf_stream_fft_enabled ? "on" : "off");
-        } else {
-            printf("NRF stream started: sensor=%u period=Ts+1ms (auto) fft=%s\n",
-                   nrf_fft_selected_sensor, nrf_stream_fft_enabled ? "on" : "off");
-        }
-        return;
-    }
+			printf("NRF stream started: sensor=%u period=%lu ms (override) fft=%s autoscale=%s\n",
+			       nrf_fft_selected_sensor, (unsigned long)nrf_fft_poll_period_ms,
+			       nrf_stream_fft_enabled ? "on" : "off",
+			       nrf_stream_auto_scale_enabled ? "on" : "off");
+		} else {
+			printf("NRF stream started: sensor=%u period=Ts+1ms (auto) fft=%s autoscale=%s\n",
+			       nrf_fft_selected_sensor,
+			       nrf_stream_fft_enabled ? "on" : "off",
+			       nrf_stream_auto_scale_enabled ? "on" : "off");
+		}
+		return;
+	}
 
     if (strcmp(sub, "stop") == 0) {
         if (!nrf_fft_stream_active) {
@@ -952,9 +971,10 @@ static void run_nrf_stream(size_t argc, const char *argv[]) {
     }
 
     if (strcmp(sub, "status") == 0) {
-        printf("NRF stream: %s\n", nrf_fft_stream_active ? "running" : "stopped");
-        printf("FFT: %s\n", nrf_stream_fft_enabled ? "on" : "off");
-        printf("Selected sensor: %u\n", nrf_fft_selected_sensor);
+		printf("NRF stream: %s\n", nrf_fft_stream_active ? "running" : "stopped");
+		printf("FFT: %s\n", nrf_stream_fft_enabled ? "on" : "off");
+		printf("Autoscale: %s\n", nrf_stream_auto_scale_enabled ? "on" : "off");
+		printf("Selected sensor: %u\n", nrf_fft_selected_sensor);
         printf("Last sensor: %u\n", nrf_fft_last_sensor);
         printf("Ts (last): %u ms\n", (unsigned)nrf_fft_last_ts_ms);
         printf("Period: %lu ms\n", (unsigned long)nrf_fft_poll_period_ms);
@@ -1031,8 +1051,8 @@ static void run_nrf_stream(size_t argc, const char *argv[]) {
         return;
     }
 
-    if (strcmp(sub, "fft") == 0) {
-        nrf_stream_fft_enabled = !nrf_stream_fft_enabled;
+	if (strcmp(sub, "fft") == 0) {
+		nrf_stream_fft_enabled = !nrf_stream_fft_enabled;
         if (nrf_spi_initialized) {
             memset(nrf_fft_tx_frame, 0, sizeof(nrf_fft_tx_frame));
             memset(nrf_fft_rx_frame, 0, sizeof(nrf_fft_rx_frame));
@@ -1046,11 +1066,35 @@ static void run_nrf_stream(size_t argc, const char *argv[]) {
                 nrf_fft_next_poll_time = get_absolute_time();
             }
         }
-        printf("FFT %s\n", nrf_stream_fft_enabled ? "on" : "off");
-        return;
-    }
+		printf("FFT %s\n", nrf_stream_fft_enabled ? "on" : "off");
+		return;
+	}
 
-    printf("Unknown nrf stream subcommand: %s\n", sub);
+	if (strcmp(sub, "autoscale") == 0) {
+		if (argc != 2 ||
+		    (strcmp(argv[1], "on") != 0 && strcmp(argv[1], "off") != 0 && strcmp(argv[1], "status") != 0)) {
+			printf("Usage: nrf stream autoscale <on|off|status>\n");
+			return;
+		}
+		if (strcmp(argv[1], "status") == 0) {
+			printf("Autoscale %s\n", nrf_stream_auto_scale_enabled ? "on" : "off");
+			return;
+		}
+		nrf_stream_auto_scale_enabled = (strcmp(argv[1], "on") == 0);
+		if (nrf_spi_initialized) {
+			if (!nrf_stream_send_autoscale()) {
+				printf("Warning: failed to send autoscale mode to nRF.\n");
+			}
+			if (nrf_fft_stream_active) {
+				nrf_fft_drop_first_packet = true;
+				nrf_fft_next_poll_time = get_absolute_time();
+			}
+		}
+		printf("Autoscale %s\n", nrf_stream_auto_scale_enabled ? "on" : "off");
+		return;
+	}
+
+	printf("Unknown nrf stream subcommand: %s\n", sub);
     printf("Try: nrf stream help\n");
 }
 

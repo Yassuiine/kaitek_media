@@ -254,6 +254,7 @@ int main(void)
 #define CMD_SENSOR_SELECT 0xB3u
 #define CMD_SET_MODE      0xB4u  /* payload byte: 0=raw waveform, 1=FFT */
 #define CMD_LOOPBACK_MODE 0xB5u  /* payload byte: 0=scope packets, 1=previous-frame echo */
+#define CMD_AUTO_SCALE    0xB6u  /* payload byte: 0=fixed hardware range, 1=window min/max */
 
 #define SENSOR_TS_MS 40u
 
@@ -299,6 +300,7 @@ static int16_t piezo_sample_buffer;
 static bool sensor_stream_enabled;
 static bool sensor_fft_enabled = false;
 static bool loopback_enabled;
+static bool sensor_auto_scale_enabled = true;
 static uint8_t sensor_sequence;
 static uint8_t selected_sensor;
 static uint16_t sensor_write_index;
@@ -360,17 +362,23 @@ static void scale_capture_ring_snapshot(const int32_t *capture,
 					uint8_t *cached_raw,
 					uint8_t *cached_plot,
 					uint8_t *raw,
-					uint8_t *plot)
+					uint8_t *plot,
+					int32_t fixed_min,
+					int32_t fixed_max)
 {
-	int32_t min_capture = capture[0];
-	int32_t max_capture = capture[0];
+	int32_t min_capture = fixed_min;
+	int32_t max_capture = fixed_max;
 
-	for (uint16_t i = 1; i < SENSOR_RING_LEN; i++) {
-		if (capture[i] < min_capture) {
-			min_capture = capture[i];
-		}
-		if (capture[i] > max_capture) {
-			max_capture = capture[i];
+	if (sensor_auto_scale_enabled) {
+		min_capture = capture[0];
+		max_capture = capture[0];
+		for (uint16_t i = 1; i < SENSOR_RING_LEN; i++) {
+			if (capture[i] < min_capture) {
+				min_capture = capture[i];
+			}
+			if (capture[i] > max_capture) {
+				max_capture = capture[i];
+			}
 		}
 	}
 
@@ -402,7 +410,8 @@ static void mic_init_ring_centered(void)
 static void mic_copy_ring_snapshot(uint8_t *raw, uint8_t *plot, uint16_t *write_index)
 {
 	k_mutex_lock(&mic_ring_lock, K_FOREVER);
-	scale_capture_ring_snapshot(mic_ring_capture, mic_ring_raw, mic_ring_plot, raw, plot);
+	scale_capture_ring_snapshot(mic_ring_capture, mic_ring_raw, mic_ring_plot, raw, plot,
+				    -8388608, 8388607);
 	*write_index = mic_write_index;
 	k_mutex_unlock(&mic_ring_lock);
 }
@@ -497,7 +506,8 @@ static void piezo_init_ring_centered(void)
 static void piezo_copy_ring_snapshot(uint8_t *raw, uint8_t *plot, uint16_t *write_index)
 {
 	k_mutex_lock(&piezo_ring_lock, K_FOREVER);
-	scale_capture_ring_snapshot(piezo_ring_capture, piezo_ring_raw, piezo_ring_plot, raw, plot);
+	scale_capture_ring_snapshot(piezo_ring_capture, piezo_ring_raw, piezo_ring_plot, raw, plot,
+				    0, (1 << PIEZO_ADC_RESOLUTION) - 1);
 	*write_index = piezo_write_index;
 	k_mutex_unlock(&piezo_ring_lock);
 }
@@ -775,6 +785,11 @@ static void process_command_frame(const uint8_t *rx, size_t len)
 		sensor_fft_enabled = (len >= 2u) ? (rx[1] != 0u) : false;
 		sensor_next_fill_ms = 0;
 		break;
+	case CMD_AUTO_SCALE:
+		loopback_enabled = false;
+		sensor_auto_scale_enabled = (len >= 2u) ? (rx[1] != 0u) : true;
+		sensor_next_fill_ms = 0;
+		break;
 	default:
 		break;
 	}
@@ -841,6 +856,7 @@ int main(void)
 	memset(sensor_ring_plot, 120, sizeof(sensor_ring_plot));
 	sensor_stream_enabled = false;
 	loopback_enabled = false;
+	sensor_auto_scale_enabled = true;
 	sensor_sequence = 0;
 	selected_sensor = 0;
 	sensor_write_index = 0;
@@ -853,11 +869,12 @@ int main(void)
 	sensor_phase_4 = 0.0f;
 	prepare_tx_packet();
 
-	LOG_INF("BM20_C SPIS scope ready (production, packet=%u bytes, samples=%u, Ts=%u ms, loopback cmd=0x%02X)",
+	LOG_INF("BM20_C SPIS scope ready (production, packet=%u bytes, samples=%u, Ts=%u ms, loopback cmd=0x%02X, autoscale cmd=0x%02X)",
 		(unsigned int)SENSOR_PACKET_BYTES,
 		(unsigned int)SENSOR_RING_LEN,
 		(unsigned int)SENSOR_TS_MS,
-		(unsigned int)CMD_LOOPBACK_MODE);
+		(unsigned int)CMD_LOOPBACK_MODE,
+		(unsigned int)CMD_AUTO_SCALE);
 
 	uint32_t transfer_count = 0;
 	while (1) {
@@ -877,10 +894,11 @@ int main(void)
 
 		transfer_count++;
 		if ((transfer_count % 500u) == 0u) {
-			LOG_INF("xfer=%u mode=%s stream=%u seq=%u sensor=%u write=%u",
+			LOG_INF("xfer=%u mode=%s stream=%u autoscale=%u seq=%u sensor=%u write=%u",
 				(unsigned int)transfer_count,
 				loopback_enabled ? "loopback" : "scope",
 				sensor_stream_enabled ? 1u : 0u,
+				sensor_auto_scale_enabled ? 1u : 0u,
 				(unsigned int)sensor_sequence,
 				(unsigned int)selected_sensor,
 				(unsigned int)sensor_write_index);
