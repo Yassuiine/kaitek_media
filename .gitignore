@@ -6,4 +6,4 @@ _cmp_lcd/
 docs/
 .tmp_kicad/
 ToDo.txt
-# audio_pwm/
+audio_pwm/

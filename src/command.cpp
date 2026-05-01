@@ -1116,10 +1116,11 @@ static void print_sm_group_help(void) {
 static void print_nrf_group_help(void) {
     printf("nrf <subcommand> [args]\n");
 #ifdef NRF_BENCH_ENABLED
-    printf("Subcommands: init, status, loopback, xfer, sweep, bench, diag, timing, fft\n");
+    printf("Subcommands: init, status, loopback, xfer, sweep, bench, diag, timing, stream");
 #else
-    printf("Subcommands: init, status, loopback, xfer, timing, fft\n");
+    printf("Subcommands: init, status, loopback, xfer, timing, stream");
 #endif
+    printf("\n");
     printf("For realtime sensor graph control: nrf stream help\n");
 }
 
