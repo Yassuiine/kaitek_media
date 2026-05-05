@@ -31,7 +31,7 @@ uint8_t lcd_backlight = 0;                 // Current PWM backlight level in per
 UBYTE lcd_scan_dir = VERTICAL;             // Current panel scan direction: VERTICAL (portrait) or HORIZONTAL (landscape)
 UWORD *lcd_image = NULL;                   // Heap-allocated framebuffer (WIDTH×HEIGHT RGB565 words); NULL before lcd_init
 size_t lcd_image_bytes = 0;                // Size of lcd_image in bytes (= WIDTH × HEIGHT × 2)
-const uint32_t lcd_spi_hz = 62500000;      // Requested SPI baud for the LCD; actual rate set by spi_init()
+const uint32_t lcd_spi_hz = 150000000;      // Requested SPI baud for the LCD; actual rate set by spi_init()
 uint32_t lcd_display_fps = 0;              // Rolling one-second display frame rate (frames per second)
 uint32_t lcd_display_frames_total = 0;     // Total frames pushed to the LCD panel since last lcd_init
 uint32_t lcd_display_frames_window = 0;    // Frame count in the current FPS measurement window

@@ -12,11 +12,13 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/i2s.h>
 #include <zephyr/drivers/spi.h>
+#include <zephyr/drivers/uart.h>
 #include <zephyr/dt-bindings/adc/nrf-saadc.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
 //#define NRF_BENCH_MODE  /* undefine for production build */
+#define KAIMA_DEBUG_CARD  /* enable extension connector LED/UART/ANA debug card */
 
 #define BUF_SIZE 4096
 
@@ -275,12 +277,30 @@ int main(void)
 #define PIEZO_ADC_SAMPLE_PERIOD_MS 10u
 #define PIEZO_ADC_THREAD_STACK_SIZE 1024u
 #define PIEZO_ADC_THREAD_PRIORITY 6
+#define ANA31_ADC_CHANNEL 2u
+#define ANA31_ADC_RESOLUTION 12u
+#define ANA31_ADC_SAMPLE_PERIOD_MS 10u
+#define ANA31_ADC_THREAD_STACK_SIZE 1024u
+#define ANA31_ADC_THREAD_PRIORITY 6
+#define ADC_12BIT_MAX_RAW ((1u << 12u) - 1u)
+#define ADC_GAIN_1_4_FULL_SCALE_MV 2400u
+#define ANA31_ELECTRET_FIXED_MIN_MV 1150u
+#define ANA31_ELECTRET_FIXED_MAX_MV 2150u
+#define ANA31_ELECTRET_AUTOSCALE_MIN_SPAN_MV 250u
+#define ANA31_ELECTRET_FIXED_MIN_RAW \
+	((ANA31_ELECTRET_FIXED_MIN_MV * ADC_12BIT_MAX_RAW) / ADC_GAIN_1_4_FULL_SCALE_MV)
+#define ANA31_ELECTRET_FIXED_MAX_RAW \
+	((ANA31_ELECTRET_FIXED_MAX_MV * ADC_12BIT_MAX_RAW) / ADC_GAIN_1_4_FULL_SCALE_MV)
+#define ANA31_ELECTRET_AUTOSCALE_MIN_SPAN_RAW \
+	((ANA31_ELECTRET_AUTOSCALE_MIN_SPAN_MV * ADC_12BIT_MAX_RAW) / ADC_GAIN_1_4_FULL_SCALE_MV)
 
 LOG_MODULE_REGISTER(bm20c_spis_scope, LOG_LEVEL_INF);
 
 K_MEM_SLAB_DEFINE(mic_rx_slab, MIC_BLOCK_SIZE, MIC_BLOCK_COUNT, 4);
 K_MUTEX_DEFINE(mic_ring_lock);
 K_MUTEX_DEFINE(piezo_ring_lock);
+K_MUTEX_DEFINE(ana31_ring_lock);
+K_MUTEX_DEFINE(adc_lock);
 
 static uint8_t tx_buffer[SENSOR_PACKET_BYTES];
 static uint8_t rx_buffer[SENSOR_PACKET_BYTES];
@@ -296,6 +316,11 @@ static uint8_t piezo_ring_raw[SENSOR_RING_LEN];
 static uint8_t piezo_ring_plot[SENSOR_RING_LEN];
 static uint16_t piezo_write_index;
 static int16_t piezo_sample_buffer;
+static int32_t ana31_ring_capture[SENSOR_RING_LEN];
+static uint8_t ana31_ring_raw[SENSOR_RING_LEN];
+static uint8_t ana31_ring_plot[SENSOR_RING_LEN];
+static uint16_t ana31_write_index;
+static int16_t ana31_sample_buffer;
 
 static bool sensor_stream_enabled;
 static bool sensor_fft_enabled = false;
@@ -311,6 +336,316 @@ static float sensor_phase_1;
 static float sensor_phase_2;
 static float sensor_phase_3;
 static float sensor_phase_4;
+
+#ifdef KAIMA_DEBUG_CARD
+
+#define KAIMA_CARD_LED_COUNT 12u
+#define KAIMA_CARD_STACK_SIZE 2048u
+#define KAIMA_CARD_PRIORITY 8
+#define KAIMA_CARD_BOOT_STEP_MS 500u
+#define KAIMA_CARD_PULSE_MS 80u
+#define KAIMA_CARD_UART_PERIOD_MS 1000u
+#define KAIMA_CARD_ADC_PERIOD_MS 250u
+#define KAIMA_CARD_HEARTBEAT_MS 500u
+#define KAIMA_CARD_ADC_CHANNEL 0u
+#define KAIMA_CARD_ADC_RESOLUTION 12u
+#define KAIMA_CARD_UART_GAP_MS 20u
+#define KAIMA_CARD_UART_PREAMBLE "XXXXXXXXXXXXXXXX\r\n"
+#define KAIMA_CARD_ADC_REF_MV 600u
+#define KAIMA_CARD_ADC_GAIN_DEN 4u
+#define KAIMA_CARD_ANA_LOW_MV 1150u
+#define KAIMA_CARD_ANA_HIGH_MV 2150u
+#define KAIMA_CARD_ANA_LOW_RAW ((KAIMA_CARD_ANA_LOW_MV * ((1u << KAIMA_CARD_ADC_RESOLUTION) - 1u)) / \
+				(KAIMA_CARD_ADC_REF_MV * KAIMA_CARD_ADC_GAIN_DEN))
+#define KAIMA_CARD_ANA_HIGH_RAW ((KAIMA_CARD_ANA_HIGH_MV * ((1u << KAIMA_CARD_ADC_RESOLUTION) - 1u)) / \
+				 (KAIMA_CARD_ADC_REF_MV * KAIMA_CARD_ADC_GAIN_DEN))
+
+enum kaima_card_led {
+	KAIMA_LED_SYSTEM = 0,    /* P1.27 */
+	KAIMA_LED_SPI_TX,        /* P3.12 */
+	KAIMA_LED_SPI_RX,        /* P1.24 */
+	KAIMA_LED_STREAM,        /* P3.05 */
+	KAIMA_LED_LOOPBACK,      /* P3.02 */
+	KAIMA_LED_MIC,           /* P3.04 */
+	KAIMA_LED_PIEZO,         /* P3.11 */
+	KAIMA_LED_ANA10,         /* P3.00, ANA10 > 2.15 V */
+	KAIMA_LED_ANA14,         /* P1.28, ANA14 > 2.15 V */
+	KAIMA_LED_UART_TX,       /* P3.09 */
+	KAIMA_LED_BLE0,          /* P1.22, ANA10 < 1.15 V */
+	KAIMA_LED_BLE1,          /* P1.23, ANA14 < 1.15 V */
+};
+
+struct kaima_card_gpio {
+	const struct device *port;
+	gpio_pin_t pin;
+	const char *name;
+};
+
+static const struct device *kaima_card_uart_dev = DEVICE_DT_GET(DT_ALIAS(kaima_uart));
+static const struct device *kaima_card_adc_dev = PIEZO_ADC_DEV;
+
+static const struct kaima_card_gpio kaima_card_leds[KAIMA_CARD_LED_COUNT] = {
+	{DEVICE_DT_GET(DT_NODELABEL(gpio1)), 27, "P1.27"},
+	{DEVICE_DT_GET(DT_NODELABEL(gpio3)), 12, "P3.12"},
+	{DEVICE_DT_GET(DT_NODELABEL(gpio1)), 24, "P1.24"},
+	{DEVICE_DT_GET(DT_NODELABEL(gpio3)), 5, "P3.05"},
+	{DEVICE_DT_GET(DT_NODELABEL(gpio3)), 2, "P3.02"},
+	{DEVICE_DT_GET(DT_NODELABEL(gpio3)), 4, "P3.04"},
+	{DEVICE_DT_GET(DT_NODELABEL(gpio3)), 11, "P3.11"},
+	{DEVICE_DT_GET(DT_NODELABEL(gpio3)), 0, "P3.00"},
+	{DEVICE_DT_GET(DT_NODELABEL(gpio1)), 28, "P1.28"},
+	{DEVICE_DT_GET(DT_NODELABEL(gpio3)), 9, "P3.09"},
+	{DEVICE_DT_GET(DT_NODELABEL(gpio1)), 22, "P1.22"},
+	{DEVICE_DT_GET(DT_NODELABEL(gpio1)), 23, "P1.23"},
+};
+
+static bool kaima_card_led_ok[KAIMA_CARD_LED_COUNT];
+static int64_t kaima_card_pulse_until[KAIMA_CARD_LED_COUNT];
+static bool kaima_card_mic_ok;
+static bool kaima_card_piezo_ok;
+static bool kaima_card_ana10_ok;
+static bool kaima_card_ana14_ok;
+static bool kaima_card_ana10_low;
+static bool kaima_card_ana10_high;
+static bool kaima_card_ana14_low;
+static bool kaima_card_ana14_high;
+static int16_t kaima_card_ana10_sample;
+static int16_t kaima_card_ana14_sample;
+static bool kaima_card_uart_ready;
+static uint32_t kaima_card_uart_tx_count;
+static uint32_t kaima_card_uart_drop_count;
+static uint32_t kaima_card_uart_rx_count;
+K_SEM_DEFINE(kaima_card_uart_tx_done, 0, 1);
+
+static void kaima_card_set_led(enum kaima_card_led led, bool on)
+{
+	if (led >= KAIMA_CARD_LED_COUNT || !kaima_card_led_ok[led]) {
+		return;
+	}
+	(void)gpio_pin_set(kaima_card_leds[led].port, kaima_card_leds[led].pin, on ? 1 : 0);
+}
+
+static void kaima_card_pulse(enum kaima_card_led led)
+{
+	if (led < KAIMA_CARD_LED_COUNT) {
+		kaima_card_pulse_until[led] = k_uptime_get() + KAIMA_CARD_PULSE_MS;
+	}
+}
+
+static void kaima_card_uart_cb(const struct device *dev, struct uart_event *evt, void *user_data)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(user_data);
+
+	if (evt->type == UART_TX_DONE || evt->type == UART_TX_ABORTED) {
+		k_sem_give(&kaima_card_uart_tx_done);
+	}
+}
+
+static void kaima_card_uart_write(const char *text)
+{
+	if (!kaima_card_uart_ready) {
+		kaima_card_uart_drop_count++;
+		return;
+	}
+
+	while (k_sem_take(&kaima_card_uart_tx_done, K_NO_WAIT) == 0) {
+	}
+
+	int ret = uart_tx(kaima_card_uart_dev, (const uint8_t *)text, strlen(text), 200000);
+	if (ret < 0) {
+		kaima_card_uart_drop_count++;
+		LOG_ERR("Kaima UART tx failed: %d", ret);
+		return;
+	}
+
+	if (k_sem_take(&kaima_card_uart_tx_done, K_MSEC(200)) < 0) {
+		kaima_card_uart_drop_count++;
+		(void)uart_tx_abort(kaima_card_uart_dev);
+		LOG_ERR("Kaima UART tx timeout");
+		return;
+	}
+
+	kaima_card_uart_tx_count++;
+	kaima_card_pulse(KAIMA_LED_UART_TX);
+	k_msleep(KAIMA_CARD_UART_GAP_MS);
+}
+
+static void kaima_card_uart_write_framed(const char *text)
+{
+	kaima_card_uart_write(KAIMA_CARD_UART_PREAMBLE);
+	kaima_card_uart_write(text);
+}
+
+static int kaima_card_adc_read(uint8_t input_positive, int16_t *sample)
+{
+	struct adc_channel_cfg ch_cfg = {
+		.gain = ADC_GAIN_1_4,
+		.reference = ADC_REF_INTERNAL,
+		.acquisition_time = ADC_ACQ_TIME_DEFAULT,
+		.channel_id = KAIMA_CARD_ADC_CHANNEL,
+		.input_positive = input_positive,
+	};
+	struct adc_sequence sequence = {
+		.channels = BIT(KAIMA_CARD_ADC_CHANNEL),
+		.buffer = sample,
+		.buffer_size = sizeof(*sample),
+		.resolution = KAIMA_CARD_ADC_RESOLUTION,
+	};
+
+	int ret = adc_channel_setup(kaima_card_adc_dev, &ch_cfg);
+	if (ret < 0) {
+		return ret;
+	}
+
+	return adc_read(kaima_card_adc_dev, &sequence);
+}
+
+static void kaima_card_restore_piezo_adc(void)
+{
+	struct adc_channel_cfg ch_cfg = {
+		.gain = ADC_GAIN_1_4,
+		.reference = ADC_REF_INTERNAL,
+		.acquisition_time = ADC_ACQ_TIME_DEFAULT,
+		.channel_id = PIEZO_ADC_CHANNEL,
+		.input_positive = NRF_SAADC_AIN6,
+	};
+
+	(void)adc_channel_setup(kaima_card_adc_dev, &ch_cfg);
+}
+
+static void kaima_card_thread(void *arg1, void *arg2, void *arg3)
+{
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
+
+	int64_t next_uart_ms = 0;
+	int64_t next_adc_ms = 0;
+	int64_t next_heartbeat_ms = 0;
+	bool heartbeat_on = false;
+	uint32_t uart_counter = 0;
+	char uart_line[128];
+
+	kaima_card_uart_ready = device_is_ready(kaima_card_uart_dev);
+	LOG_INF("Kaima debug card enabled");
+	LOG_INF("Kaima UART %s: TX=P3.01 RX=P3.10 baud=115200 8N1",
+		kaima_card_uart_ready ? "ready" : "not ready");
+	if (kaima_card_uart_ready) {
+		int ret = uart_callback_set(kaima_card_uart_dev, kaima_card_uart_cb, NULL);
+
+		if (ret < 0) {
+			LOG_ERR("Kaima UART callback setup failed: %d", ret);
+			kaima_card_uart_ready = false;
+		}
+	}
+
+	for (uint8_t i = 0; i < KAIMA_CARD_LED_COUNT; i++) {
+		const struct kaima_card_gpio *led = &kaima_card_leds[i];
+
+		if (!device_is_ready(led->port)) {
+			LOG_ERR("Kaima LED %s GPIO not ready", kaima_card_leds[i].name);
+			continue;
+		}
+
+		if (gpio_pin_configure(led->port, led->pin, GPIO_OUTPUT_INACTIVE) < 0) {
+			LOG_ERR("Kaima LED %s configure failed", kaima_card_leds[i].name);
+			continue;
+		}
+
+		kaima_card_led_ok[i] = true;
+	}
+
+	kaima_card_uart_write_framed("0123456789abcdefghijklmnopqrstuvwxyz\r\n");
+	kaima_card_uart_write_framed("KAIMA_HWUART_V5_BOOT\r\n");
+
+	for (uint8_t i = 0; i < KAIMA_CARD_LED_COUNT; i++) {
+		kaima_card_set_led((enum kaima_card_led)i, true);
+		k_msleep(KAIMA_CARD_BOOT_STEP_MS);
+		kaima_card_set_led((enum kaima_card_led)i, false);
+	}
+
+	while (1) {
+		int64_t now_ms = k_uptime_get();
+
+		if (now_ms >= next_adc_ms && device_is_ready(kaima_card_adc_dev)) {
+			int ret10;
+			int ret14;
+
+			k_mutex_lock(&adc_lock, K_FOREVER);
+			ret10 = kaima_card_adc_read(NRF_SAADC_AIN3, &kaima_card_ana10_sample);
+			ret14 = kaima_card_adc_read(NRF_SAADC_AIN1, &kaima_card_ana14_sample);
+			kaima_card_restore_piezo_adc();
+			k_mutex_unlock(&adc_lock);
+
+			kaima_card_ana10_ok = (ret10 == 0);
+			kaima_card_ana14_ok = (ret14 == 0);
+			kaima_card_ana10_low = kaima_card_ana10_ok &&
+				(kaima_card_ana10_sample < (int16_t)KAIMA_CARD_ANA_LOW_RAW);
+			kaima_card_ana10_high = kaima_card_ana10_ok &&
+				(kaima_card_ana10_sample > (int16_t)KAIMA_CARD_ANA_HIGH_RAW);
+			kaima_card_ana14_low = kaima_card_ana14_ok &&
+				(kaima_card_ana14_sample < (int16_t)KAIMA_CARD_ANA_LOW_RAW);
+			kaima_card_ana14_high = kaima_card_ana14_ok &&
+				(kaima_card_ana14_sample > (int16_t)KAIMA_CARD_ANA_HIGH_RAW);
+			next_adc_ms = now_ms + KAIMA_CARD_ADC_PERIOD_MS;
+		}
+
+		if (now_ms >= next_uart_ms) {
+			unsigned char rx_char;
+
+			while (device_is_ready(kaima_card_uart_dev) &&
+			       uart_poll_in(kaima_card_uart_dev, &rx_char) == 0) {
+				kaima_card_uart_rx_count++;
+				kaima_card_pulse(KAIMA_LED_UART_TX);
+			}
+
+			snprintk(uart_line, sizeof(uart_line),
+				"KAIMA_V5 %u A10=%d A14=%d low=%u/%u high=%u/%u TX=%u RX=%u\r\n",
+				(unsigned int)uart_counter++,
+				(int)kaima_card_ana10_sample,
+				(int)kaima_card_ana14_sample,
+				kaima_card_ana10_low ? 1u : 0u,
+				kaima_card_ana14_low ? 1u : 0u,
+				kaima_card_ana10_high ? 1u : 0u,
+				kaima_card_ana14_high ? 1u : 0u,
+				(unsigned int)kaima_card_uart_tx_count,
+				(unsigned int)kaima_card_uart_rx_count);
+			kaima_card_uart_write_framed(uart_line);
+			LOG_INF("Kaima UART status: ready=%u tx=%u drop=%u rx=%u",
+				kaima_card_uart_ready ? 1u : 0u,
+				(unsigned int)kaima_card_uart_tx_count,
+				(unsigned int)kaima_card_uart_drop_count,
+				(unsigned int)kaima_card_uart_rx_count);
+			next_uart_ms = now_ms + KAIMA_CARD_UART_PERIOD_MS;
+		}
+
+		if (now_ms >= next_heartbeat_ms) {
+			heartbeat_on = !heartbeat_on;
+			next_heartbeat_ms = now_ms + KAIMA_CARD_HEARTBEAT_MS;
+		}
+
+		kaima_card_set_led(KAIMA_LED_SYSTEM, heartbeat_on);
+		kaima_card_set_led(KAIMA_LED_SPI_TX, now_ms < kaima_card_pulse_until[KAIMA_LED_SPI_TX]);
+		kaima_card_set_led(KAIMA_LED_SPI_RX, now_ms < kaima_card_pulse_until[KAIMA_LED_SPI_RX]);
+		kaima_card_set_led(KAIMA_LED_STREAM, sensor_stream_enabled);
+		kaima_card_set_led(KAIMA_LED_LOOPBACK, loopback_enabled);
+		kaima_card_set_led(KAIMA_LED_MIC, kaima_card_mic_ok);
+		kaima_card_set_led(KAIMA_LED_PIEZO, kaima_card_piezo_ok);
+		kaima_card_set_led(KAIMA_LED_ANA10, kaima_card_ana10_high);
+		kaima_card_set_led(KAIMA_LED_ANA14, kaima_card_ana14_high);
+		kaima_card_set_led(KAIMA_LED_UART_TX, now_ms < kaima_card_pulse_until[KAIMA_LED_UART_TX]);
+		kaima_card_set_led(KAIMA_LED_BLE0, kaima_card_ana10_low);
+		kaima_card_set_led(KAIMA_LED_BLE1, kaima_card_ana14_low);
+
+		k_msleep(20);
+	}
+}
+
+K_THREAD_DEFINE(kaima_card_tid, KAIMA_CARD_STACK_SIZE, kaima_card_thread,
+	NULL, NULL, NULL, KAIMA_CARD_PRIORITY, 0, 0);
+
+#endif /* KAIMA_DEBUG_CARD */
 
 #define FFT_SIZE 256u
 #define FFT_BINS (FFT_SIZE / 2u)
@@ -364,7 +699,8 @@ static void scale_capture_ring_snapshot(const int32_t *capture,
 					uint8_t *raw,
 					uint8_t *plot,
 					int32_t fixed_min,
-					int32_t fixed_max)
+					int32_t fixed_max,
+					int32_t autoscale_min_span)
 {
 	int32_t min_capture = fixed_min;
 	int32_t max_capture = fixed_max;
@@ -378,6 +714,23 @@ static void scale_capture_ring_snapshot(const int32_t *capture,
 			}
 			if (capture[i] > max_capture) {
 				max_capture = capture[i];
+			}
+		}
+
+		if (autoscale_min_span > 0 && (max_capture - min_capture) < autoscale_min_span) {
+			int32_t center = min_capture + ((max_capture - min_capture) / 2);
+			int32_t half_span = autoscale_min_span / 2;
+
+			min_capture = center - half_span;
+			max_capture = min_capture + autoscale_min_span;
+
+			if (min_capture < fixed_min) {
+				min_capture = fixed_min;
+				max_capture = fixed_min + autoscale_min_span;
+			}
+			if (max_capture > fixed_max) {
+				max_capture = fixed_max;
+				min_capture = fixed_max - autoscale_min_span;
 			}
 		}
 	}
@@ -411,7 +764,7 @@ static void mic_copy_ring_snapshot(uint8_t *raw, uint8_t *plot, uint16_t *write_
 {
 	k_mutex_lock(&mic_ring_lock, K_FOREVER);
 	scale_capture_ring_snapshot(mic_ring_capture, mic_ring_raw, mic_ring_plot, raw, plot,
-				    -8388608, 8388607);
+				    -8388608, 8388607, 0);
 	*write_index = mic_write_index;
 	k_mutex_unlock(&mic_ring_lock);
 }
@@ -445,14 +798,24 @@ static void mic_capture_thread(void *arg1, void *arg2, void *arg3)
 	int ret = i2s_configure(tdm_dev, I2S_DIR_RX, &cfg);
 	if (ret < 0) {
 		LOG_ERR("i2s_configure RX failed: %d", ret);
+#ifdef KAIMA_DEBUG_CARD
+		kaima_card_mic_ok = false;
+#endif
 		return;
 	}
 
 	ret = i2s_trigger(tdm_dev, I2S_DIR_RX, I2S_TRIGGER_START);
 	if (ret < 0) {
 		LOG_ERR("i2s_trigger START failed: %d", ret);
+#ifdef KAIMA_DEBUG_CARD
+		kaima_card_mic_ok = false;
+#endif
 		return;
 	}
+
+#ifdef KAIMA_DEBUG_CARD
+	kaima_card_mic_ok = true;
+#endif
 
 	LOG_INF("ICS43434 capture started: %u Hz, %u-bit, %u channels, block=%u bytes",
 		(unsigned int)MIC_SAMPLE_RATE,
@@ -467,9 +830,15 @@ static void mic_capture_thread(void *arg1, void *arg2, void *arg3)
 		ret = i2s_read(tdm_dev, &rx_block, &rx_size);
 		if (ret < 0) {
 			LOG_ERR("i2s_read error: %d", ret);
+#ifdef KAIMA_DEBUG_CARD
+			kaima_card_mic_ok = false;
+#endif
 			k_msleep(10);
 			continue;
 		}
+#ifdef KAIMA_DEBUG_CARD
+		kaima_card_mic_ok = true;
+#endif
 
 		int32_t *samples = (int32_t *)rx_block;
 		uint32_t sample_count = (uint32_t)(rx_size / sizeof(int32_t));
@@ -507,7 +876,7 @@ static void piezo_copy_ring_snapshot(uint8_t *raw, uint8_t *plot, uint16_t *writ
 {
 	k_mutex_lock(&piezo_ring_lock, K_FOREVER);
 	scale_capture_ring_snapshot(piezo_ring_capture, piezo_ring_raw, piezo_ring_plot, raw, plot,
-				    0, (1 << PIEZO_ADC_RESOLUTION) - 1);
+				    0, (1 << PIEZO_ADC_RESOLUTION) - 1, 0);
 	*write_index = piezo_write_index;
 	k_mutex_unlock(&piezo_ring_lock);
 }
@@ -544,6 +913,9 @@ static void piezo_adc_thread(void *arg1, void *arg2, void *arg3)
 	int ret = adc_channel_setup(adc_dev, &ch_cfg);
 	if (ret < 0) {
 		LOG_ERR("adc_channel_setup failed: %d", ret);
+#ifdef KAIMA_DEBUG_CARD
+		kaima_card_piezo_ok = false;
+#endif
 		return;
 	}
 
@@ -553,12 +925,20 @@ static void piezo_adc_thread(void *arg1, void *arg2, void *arg3)
 		(unsigned int)PIEZO_ADC_SAMPLE_PERIOD_MS);
 
 	while (1) {
+		k_mutex_lock(&adc_lock, K_FOREVER);
 		ret = adc_read(adc_dev, &sequence);
+		k_mutex_unlock(&adc_lock);
 		if (ret < 0) {
 			LOG_ERR("adc_read failed: %d", ret);
+#ifdef KAIMA_DEBUG_CARD
+			kaima_card_piezo_ok = false;
+#endif
 			k_msleep(PIEZO_ADC_SAMPLE_PERIOD_MS);
 			continue;
 		}
+#ifdef KAIMA_DEBUG_CARD
+		kaima_card_piezo_ok = true;
+#endif
 
 		k_mutex_lock(&piezo_ring_lock, K_FOREVER);
 		piezo_store_sample_locked((int32_t)piezo_sample_buffer);
@@ -570,6 +950,95 @@ static void piezo_adc_thread(void *arg1, void *arg2, void *arg3)
 
 K_THREAD_DEFINE(piezo_adc_tid, PIEZO_ADC_THREAD_STACK_SIZE, piezo_adc_thread,
 	NULL, NULL, NULL, PIEZO_ADC_THREAD_PRIORITY, 0, 0);
+
+static void ana31_store_sample_locked(int32_t sample)
+{
+	ana31_ring_capture[ana31_write_index] = sample;
+	ana31_write_index = (uint16_t)((ana31_write_index + 1u) % SENSOR_RING_LEN);
+}
+
+static void ana31_init_ring_centered(void)
+{
+	k_mutex_lock(&ana31_ring_lock, K_FOREVER);
+	memset(ana31_ring_capture, 0, sizeof(ana31_ring_capture));
+	memset(ana31_ring_raw, 127, sizeof(ana31_ring_raw));
+	memset(ana31_ring_plot, 120, sizeof(ana31_ring_plot));
+	ana31_write_index = 0;
+	k_mutex_unlock(&ana31_ring_lock);
+}
+
+static void ana31_copy_ring_snapshot(uint8_t *raw, uint8_t *plot, uint16_t *write_index)
+{
+	k_mutex_lock(&ana31_ring_lock, K_FOREVER);
+	scale_capture_ring_snapshot(ana31_ring_capture, ana31_ring_raw, ana31_ring_plot, raw, plot,
+				    ANA31_ELECTRET_FIXED_MIN_RAW, ANA31_ELECTRET_FIXED_MAX_RAW,
+				    ANA31_ELECTRET_AUTOSCALE_MIN_SPAN_RAW);
+	*write_index = ana31_write_index;
+	k_mutex_unlock(&ana31_ring_lock);
+}
+
+static void ana31_adc_thread(void *arg1, void *arg2, void *arg3)
+{
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
+
+	const struct device *adc_dev = PIEZO_ADC_DEV;
+
+	ana31_init_ring_centered();
+
+	if (!device_is_ready(adc_dev)) {
+		LOG_ERR("ADC device not ready; sensor 2 will stay centered");
+		return;
+	}
+
+	struct adc_channel_cfg ch_cfg = {
+		.gain = ADC_GAIN_1_4,
+		.reference = ADC_REF_INTERNAL,
+		.acquisition_time = ADC_ACQ_TIME_DEFAULT,
+		.channel_id = ANA31_ADC_CHANNEL,
+		.input_positive = NRF_SAADC_AIN1,
+	};
+	struct adc_sequence sequence = {
+		.channels = BIT(ANA31_ADC_CHANNEL),
+		.buffer = &ana31_sample_buffer,
+		.buffer_size = sizeof(ana31_sample_buffer),
+		.resolution = ANA31_ADC_RESOLUTION,
+	};
+
+	k_mutex_lock(&adc_lock, K_FOREVER);
+	int ret = adc_channel_setup(adc_dev, &ch_cfg);
+	k_mutex_unlock(&adc_lock);
+	if (ret < 0) {
+		LOG_ERR("ana31 adc_channel_setup failed: %d", ret);
+		return;
+	}
+
+	LOG_INF("ANA31 ADC capture started: channel=%u input=AIN1/P1.31 resolution=%u period=%u ms",
+		(unsigned int)ANA31_ADC_CHANNEL,
+		(unsigned int)ANA31_ADC_RESOLUTION,
+		(unsigned int)ANA31_ADC_SAMPLE_PERIOD_MS);
+
+	while (1) {
+		k_mutex_lock(&adc_lock, K_FOREVER);
+		ret = adc_read(adc_dev, &sequence);
+		k_mutex_unlock(&adc_lock);
+		if (ret < 0) {
+			LOG_ERR("ana31 adc_read failed: %d", ret);
+			k_msleep(ANA31_ADC_SAMPLE_PERIOD_MS);
+			continue;
+		}
+
+		k_mutex_lock(&ana31_ring_lock, K_FOREVER);
+		ana31_store_sample_locked((int32_t)ana31_sample_buffer);
+		k_mutex_unlock(&ana31_ring_lock);
+
+		k_msleep(ANA31_ADC_SAMPLE_PERIOD_MS);
+	}
+}
+
+K_THREAD_DEFINE(ana31_adc_tid, ANA31_ADC_THREAD_STACK_SIZE, ana31_adc_thread,
+	NULL, NULL, NULL, ANA31_ADC_THREAD_PRIORITY, 0, 0);
 
 static int32_t sensor_sim_capture(uint8_t sensor_id, uint32_t sample_index)
 {
@@ -674,15 +1143,21 @@ static void sensor_fill_ring_once(void)
 		piezo_copy_ring_snapshot(sensor_ring_raw, sensor_ring_plot, &sensor_write_index);
 		return;
 	}
+	if (selected_sensor == 2u && !sensor_fft_enabled) {
+		ana31_copy_ring_snapshot(sensor_ring_raw, sensor_ring_plot, &sensor_write_index);
+		return;
+	}
 
 	if (sensor_fft_enabled) {
 		/* FFT path: Hanning-windowed 256-point FFT → magnitude spectrum */
-		if (selected_sensor == 0u || selected_sensor == 1u) {
+		if (selected_sensor == 0u || selected_sensor == 1u || selected_sensor == 2u) {
 			uint16_t write_index;
 			if (selected_sensor == 0u) {
 				mic_copy_ring_snapshot(sensor_ring_raw, sensor_ring_plot, &write_index);
-			} else {
+			} else if (selected_sensor == 1u) {
 				piezo_copy_ring_snapshot(sensor_ring_raw, sensor_ring_plot, &write_index);
+			} else {
+				ana31_copy_ring_snapshot(sensor_ring_raw, sensor_ring_plot, &write_index);
 			}
 			for (uint16_t i = 0; i < FFT_SIZE; i++) {
 				uint16_t idx = (uint16_t)((write_index + i) % SENSOR_RING_LEN);
@@ -884,6 +1359,9 @@ int main(void)
 			k_msleep(10);
 			continue;
 		}
+#ifdef KAIMA_DEBUG_CARD
+		kaima_card_pulse(KAIMA_LED_SPI_RX);
+#endif
 
 		process_command_frame(rx_buffer, sizeof(rx_buffer));
 		if (loopback_enabled) {
@@ -891,6 +1369,9 @@ int main(void)
 		} else {
 			prepare_tx_packet();
 		}
+#ifdef KAIMA_DEBUG_CARD
+		kaima_card_pulse(KAIMA_LED_SPI_TX);
+#endif
 
 		transfer_count++;
 		if ((transfer_count % 500u) == 0u) {

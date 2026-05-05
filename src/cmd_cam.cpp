@@ -144,7 +144,7 @@ void run_cam_xclk(const size_t argc, const char *argv[]){
         return;
     }
 
-    uint32_t requested_khz = 24000;
+    uint32_t requested_khz = 37000;
     if (argc == 1) {
         requested_khz = (uint32_t)atoi(argv[0]);
     }

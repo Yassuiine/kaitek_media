@@ -89,6 +89,7 @@
 		kaima-uart = &uart20;
 		kaima-gpio-01 = &kaima_gpio_01;
 		kaima-gpio-07 = &kaima_gpio_07;
+		kaima-gpio-08 = &kaima_gpio_08;
 		kaima-gpio-09 = &kaima_gpio_09;
 		kaima-gpio-11 = &kaima_gpio_11;
 		kaima-gpio-12 = &kaima_gpio_12;
@@ -109,6 +110,10 @@
 
 		kaima_gpio_07: pin_07_gpio {
 			gpios = <&gpio3 12 GPIO_ACTIVE_HIGH>; /* P3.12 */
+		};
+
+		kaima_gpio_08: pin_08_gpio {
+			gpios = <&gpio1 24 GPIO_ACTIVE_HIGH>; /* P1.24 */
 		};
 
 		kaima_gpio_09: pin_09_gpio {

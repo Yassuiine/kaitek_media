@@ -74,6 +74,7 @@ static bool nrf_stream_auto_scale_enabled = true;          // When true, hardwar
 static uint8_t nrf_fft_last_bins[NRF_SCOPE_SAMPLE_COUNT]; // Latest mapped X points (0..240), one per LCD row
 static uint8_t nrf_fft_tx_frame[NRF_SCOPE_PACKET_BYTES];  // RP->nRF control frame (START/STOP/FETCH/SENSOR)
 static uint8_t nrf_fft_rx_frame[NRF_SCOPE_PACKET_BYTES];  // nRF->RP scope packet received on each SPI transaction
+static uint32_t nrf_fft_consecutive_bad = 0;       // Count of consecutive bad frames; triggers auto re-sync if too high
 
 // ─── Forward declarations ─────────────────────────────────────────────────────
 
@@ -525,9 +526,14 @@ void run_nrf_spi_bench(size_t argc, const char *argv[]) {
                (unsigned long)nrf_spi_frame_gap_us, (unsigned long)effective_gap);
     }
 
-    /* Static to avoid blowing the stack with 4 KB frames. */
-    static uint8_t bench_tx[4096];
-    static uint8_t bench_rx[4096];
+    uint8_t *bench_tx = (uint8_t *)malloc(frame_bytes);
+    uint8_t *bench_rx = (uint8_t *)malloc(frame_bytes);
+    if (!bench_tx || !bench_rx) {
+        printf("malloc failed for bench buffers (%lu bytes)\n", (unsigned long)frame_bytes);
+        free(bench_tx);
+        free(bench_rx);
+        return;
+    }
 
     for (uint32_t i = 0; i < frame_bytes; i++) {
         bench_tx[i] = (uint8_t)(i & 0xFF);
@@ -587,6 +593,8 @@ void run_nrf_spi_bench(size_t argc, const char *argv[]) {
            (unsigned long)ok, (unsigned long)fail,
            (unsigned long)throughput, (unsigned long)(throughput / 1024));
     (void)nrf_set_slave_loopback(false);
+    free(bench_tx);
+    free(bench_rx);
 }
 #endif /* NRF_BENCH_ENABLED */
 
@@ -782,6 +790,22 @@ static void nrf_fft_stop_internal(bool notify_slave, bool clear_screen) {
     }
 }
 
+static void nrf_fft_note_bad_frame_and_maybe_resync(void) {
+    nrf_fft_consecutive_bad++;
+
+    if (nrf_fft_consecutive_bad >= 10u) {
+        if (nrf_fft_send_command(NRF_SCOPE_CMD_START, nrf_fft_selected_sensor)) {
+            nrf_fft_resync_count++;
+            nrf_fft_drop_first_packet = true;
+            nrf_fft_next_poll_time = get_absolute_time();
+        } else {
+            nrf_fft_frames_bad++;
+        }
+
+        nrf_fft_consecutive_bad = 0;
+    }
+}
+
 static void nrf_fft_stream_task(void) {
     if (!nrf_fft_stream_active) return;
     if (!nrf_spi_initialized) {
@@ -805,6 +829,7 @@ static void nrf_fft_stream_task(void) {
     if (!nrf_spi_transfer_bytes(nrf_fft_tx_frame, nrf_fft_rx_frame, sizeof(nrf_fft_tx_frame))) {
         nrf_fft_frames_bad++;
         nrf_fft_bad_spi++;
+        nrf_fft_note_bad_frame_and_maybe_resync();
         return;
     }
 
@@ -829,6 +854,7 @@ static void nrf_fft_stream_task(void) {
         else
             nrf_fft_bad_cksum++;
         nrf_fft_frames_bad++;
+        nrf_fft_note_bad_frame_and_maybe_resync();
         return;
     }
 
@@ -836,6 +862,7 @@ static void nrf_fft_stream_task(void) {
         memcpy(nrf_fft_last_bad_hdr, nrf_fft_rx_frame, NRF_SCOPE_HEADER_BYTES);
         nrf_fft_bad_stream_off++;
         nrf_fft_frames_bad++;
+        nrf_fft_note_bad_frame_and_maybe_resync();
         return;
     }
 
@@ -865,6 +892,7 @@ static void nrf_fft_stream_task(void) {
     memcpy(nrf_fft_last_bins, &nrf_fft_rx_frame[NRF_SCOPE_HEADER_BYTES], NRF_SCOPE_SAMPLE_COUNT);
     nrf_fft_last_seq = nrf_fft_rx_frame[4];
     nrf_fft_frames_ok++;
+    nrf_fft_consecutive_bad = 0;  // Reset consecutive bad frame count on successful frame
     nrf_fft_render_graph();
 }
 
