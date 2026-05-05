@@ -1,5 +1,5 @@
 ; ============================================================
-;  cam_id_test.ttl  -  Use Case 6.1: Verify OV5640 Camera Sensor
+;  cam_id_test.ttl  -  Use Case View tha captured signal on one of the sensor
 ;  Shell Interface Reference Rev 1.0, Kaimasys 2025
 ;
 ;  Sync strategy: 'pause' after each command (no prompt matching).
@@ -17,25 +17,33 @@ timeout = 3
 
 sendln ''
 waitln 'Kaitek> '
-; Step 1 - cam xclk  (takes ~1 s)
-sendln 'cam xclk'
-waitln 'Kaitek> '
+; Step 1 - lcd init
+sendln 'lcd init'
+waitln 'LCD initialized (vertical)'
 
-; Step 2 - cam i2c  (takes ~1 s)
-sendln 'cam i2c'
-waitln 'Kaitek> '
-
-; Step 3 - cam id
-;   Expected output line:  ID: 22080  (= 0x5640)
-;   waitln matches because this line ends with a newline.
-;   If the ID does not match or camera is absent the timeout fires
-;   and result = 0, giving the FAIL branch.
-sendln 'cam id'
-waitln '[rear] ID: 22080 (0x5640)'
 if result = 1 then
-    messagebox 'PASS: OV5640 detected - ID = 0x5640 (22080).' 'Camera ID Test'
+    waitln 'Kaitek> '
+; Step 2 - lcd bl 100
+    sendln 'lcd bl 100'
+    waitln 'Kaitek> '
+; Step 3 - nrf init
+    sendln 'nrf init 15000000'
+    waitln 'NRF SPI ready: SCK=18 MOSI=19 MISO=20 CS=22 actual=15000000 Hz'
+    if result = 1 then
+        waitln 'Kaitek> '
+; Step 4 - prime slave
+        sendln 'nrf xfer AB AB AB AB'
+        waitln 'Kaitek> '
+; Step 5 - nrf stream start
+        sendln 'nrf stream start'
+        waitln 'Kaitek> '
+    else
+        messagebox 'FAIL: NRF SPI initialization failed. Check connections and power.' 'NRF Test'
+        waitln 'Kaitek> '
+    endif
 else
-    messagebox 'FAIL: ID 22080 not received. Check XCLK=GP11 SDA=GP22 SCL=GP23 and 3.3V supply.' 'Camera ID Test'
+    messagebox 'FAIL: LCD initialization failed. Check connections and power.' 'LCD Test'
+    waitln 'Kaitek> '
 endif
-
 end
+

@@ -7,3 +7,5 @@ docs/
 .tmp_kicad/
 ToDo.txt
 audio_pwm/
+kaitek_shell/
+ble*

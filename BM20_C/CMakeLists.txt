@@ -37,4 +37,5 @@ endif()
 
 target_sources(app PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src/main.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/ble_receiver.c
 )

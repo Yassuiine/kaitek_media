@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "ble_receiver.h"
+
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -16,6 +18,7 @@
 #include <zephyr/dt-bindings/adc/nrf-saadc.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/ring_buffer.h>
 
 //#define NRF_BENCH_MODE  /* undefine for production build */
 #define KAIMA_DEBUG_CARD  /* enable extension connector LED/UART/ANA debug card */
@@ -350,7 +353,7 @@ static float sensor_phase_4;
 #define KAIMA_CARD_ADC_CHANNEL 0u
 #define KAIMA_CARD_ADC_RESOLUTION 12u
 #define KAIMA_CARD_UART_GAP_MS 20u
-#define KAIMA_CARD_UART_PREAMBLE "XXXXXXXXXXXXXXXX\r\n"
+#define KAIMA_CARD_UART_PREAMBLE "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
 #define KAIMA_CARD_ADC_REF_MV 600u
 #define KAIMA_CARD_ADC_GAIN_DEN 4u
 #define KAIMA_CARD_ANA_LOW_MV 1150u
@@ -416,6 +419,12 @@ static uint32_t kaima_card_uart_tx_count;
 static uint32_t kaima_card_uart_drop_count;
 static uint32_t kaima_card_uart_rx_count;
 K_SEM_DEFINE(kaima_card_uart_tx_done, 0, 1);
+K_MUTEX_DEFINE(kaima_card_uart_tx_lock);
+RING_BUF_DECLARE(kaima_uart_rx_ring, 64);
+static uint8_t kaima_uart_rx_bufs[2][16];
+static uint8_t kaima_uart_rx_buf_idx;
+
+void bm20_ext_uart_write_framed(const char *text);
 
 static void kaima_card_set_led(enum kaima_card_led led, bool on)
 {
@@ -434,11 +443,86 @@ static void kaima_card_pulse(enum kaima_card_led led)
 
 static void kaima_card_uart_cb(const struct device *dev, struct uart_event *evt, void *user_data)
 {
-	ARG_UNUSED(dev);
 	ARG_UNUSED(user_data);
 
-	if (evt->type == UART_TX_DONE || evt->type == UART_TX_ABORTED) {
+	switch (evt->type) {
+	case UART_TX_DONE:
+	case UART_TX_ABORTED:
 		k_sem_give(&kaima_card_uart_tx_done);
+		break;
+	case UART_RX_RDY:
+		ring_buf_put(&kaima_uart_rx_ring,
+			     evt->data.rx.buf + evt->data.rx.offset,
+			     evt->data.rx.len);
+		break;
+	case UART_RX_BUF_REQUEST:
+		kaima_uart_rx_buf_idx ^= 1u;
+		uart_rx_buf_rsp(dev, kaima_uart_rx_bufs[kaima_uart_rx_buf_idx],
+				sizeof(kaima_uart_rx_bufs[0]));
+		break;
+	case UART_RX_DISABLED:
+		uart_rx_enable(dev, kaima_uart_rx_bufs[kaima_uart_rx_buf_idx],
+			       sizeof(kaima_uart_rx_bufs[0]), 10000);
+		break;
+	default:
+		break;
+	}
+}
+
+static void kaima_card_uart_command_handle(char *cmd)
+{
+	char response[64];
+
+	for (char *p = cmd; *p != '\0'; p++) {
+		if (*p >= 'A' && *p <= 'Z') {
+			*p = (char)(*p - 'A' + 'a');
+		}
+	}
+
+	if (strcmp(cmd, "ble on") == 0 || strcmp(cmd, "ble logs on") == 0 ||
+	    strcmp(cmd, "logs on") == 0) {
+		bm20_ble_uart_logs_set_enabled(true);
+		bm20_ext_uart_write_framed("BLE UART logs enabled\r\n");
+		return;
+	}
+
+	if (strcmp(cmd, "ble off") == 0 || strcmp(cmd, "ble logs off") == 0 ||
+	    strcmp(cmd, "logs off") == 0) {
+		bm20_ble_uart_logs_set_enabled(false);
+		bm20_ext_uart_write_framed("BLE UART logs disabled\r\n");
+		return;
+	}
+
+	if (strcmp(cmd, "ble status") == 0 || strcmp(cmd, "logs status") == 0) {
+		snprintk(response, sizeof(response), "BLE UART logs %s\r\n",
+			 bm20_ble_uart_logs_enabled() ? "enabled" : "disabled");
+		bm20_ext_uart_write_framed(response);
+	}
+}
+
+static void kaima_card_uart_command_rx_char(char ch)
+{
+	static char cmd_buf[32];
+	static uint8_t cmd_len;
+
+	if (ch == '\r' || ch == '\n') {
+		if (cmd_len > 0u) {
+			cmd_buf[cmd_len] = '\0';
+			kaima_card_uart_command_handle(cmd_buf);
+			cmd_len = 0;
+		}
+		return;
+	}
+
+	if (ch == '\b' || ch == 0x7f) {
+		if (cmd_len > 0u) {
+			cmd_len--;
+		}
+		return;
+	}
+
+	if (cmd_len < (sizeof(cmd_buf) - 1u)) {
+		cmd_buf[cmd_len++] = ch;
 	}
 }
 
@@ -449,6 +533,7 @@ static void kaima_card_uart_write(const char *text)
 		return;
 	}
 
+	k_mutex_lock(&kaima_card_uart_tx_lock, K_FOREVER);
 	while (k_sem_take(&kaima_card_uart_tx_done, K_NO_WAIT) == 0) {
 	}
 
@@ -456,6 +541,7 @@ static void kaima_card_uart_write(const char *text)
 	if (ret < 0) {
 		kaima_card_uart_drop_count++;
 		LOG_ERR("Kaima UART tx failed: %d", ret);
+		k_mutex_unlock(&kaima_card_uart_tx_lock);
 		return;
 	}
 
@@ -463,18 +549,25 @@ static void kaima_card_uart_write(const char *text)
 		kaima_card_uart_drop_count++;
 		(void)uart_tx_abort(kaima_card_uart_dev);
 		LOG_ERR("Kaima UART tx timeout");
+		k_mutex_unlock(&kaima_card_uart_tx_lock);
 		return;
 	}
 
 	kaima_card_uart_tx_count++;
 	kaima_card_pulse(KAIMA_LED_UART_TX);
 	k_msleep(KAIMA_CARD_UART_GAP_MS);
+	k_mutex_unlock(&kaima_card_uart_tx_lock);
 }
 
-static void kaima_card_uart_write_framed(const char *text)
+void bm20_ext_uart_write_framed(const char *text)
 {
-	kaima_card_uart_write(KAIMA_CARD_UART_PREAMBLE);
-	kaima_card_uart_write(text);
+	/* Merge preamble + text into one buffer so only one uart_tx DMA start
+	 * is needed.  Each UARTE EasyDMA restart can emit spurious 0xFF bytes;
+	 * sending both in a single transfer halves those glitch events. */
+	char buf[sizeof(KAIMA_CARD_UART_PREAMBLE) + 212u];
+
+	snprintk(buf, sizeof(buf), "%s%s", KAIMA_CARD_UART_PREAMBLE, text);
+	kaima_card_uart_write(buf);
 }
 
 static int kaima_card_adc_read(uint8_t input_positive, int16_t *sample)
@@ -537,6 +630,14 @@ static void kaima_card_thread(void *arg1, void *arg2, void *arg3)
 		if (ret < 0) {
 			LOG_ERR("Kaima UART callback setup failed: %d", ret);
 			kaima_card_uart_ready = false;
+		} else {
+			ret = uart_rx_enable(kaima_card_uart_dev,
+					     kaima_uart_rx_bufs[0],
+					     sizeof(kaima_uart_rx_bufs[0]),
+					     10000);
+			if (ret < 0) {
+				LOG_ERR("Kaima UART rx enable failed: %d", ret);
+			}
 		}
 	}
 
@@ -556,8 +657,8 @@ static void kaima_card_thread(void *arg1, void *arg2, void *arg3)
 		kaima_card_led_ok[i] = true;
 	}
 
-	kaima_card_uart_write_framed("0123456789abcdefghijklmnopqrstuvwxyz\r\n");
-	kaima_card_uart_write_framed("KAIMA_HWUART_V5_BOOT\r\n");
+	bm20_ext_uart_write_framed("0123456789abcdefghijklmnopqrstuvwxyz\r\n");
+	bm20_ext_uart_write_framed("KAIMA_HWUART_V5_BOOT\r\n");
 
 	for (uint8_t i = 0; i < KAIMA_CARD_LED_COUNT; i++) {
 		kaima_card_set_led((enum kaima_card_led)i, true);
@@ -592,11 +693,11 @@ static void kaima_card_thread(void *arg1, void *arg2, void *arg3)
 		}
 
 		if (now_ms >= next_uart_ms) {
-			unsigned char rx_char;
+			uint8_t rx_char;
 
-			while (device_is_ready(kaima_card_uart_dev) &&
-			       uart_poll_in(kaima_card_uart_dev, &rx_char) == 0) {
+			while (ring_buf_get(&kaima_uart_rx_ring, &rx_char, 1) == 1) {
 				kaima_card_uart_rx_count++;
+				kaima_card_uart_command_rx_char((char)rx_char);
 				kaima_card_pulse(KAIMA_LED_UART_TX);
 			}
 
@@ -611,7 +712,7 @@ static void kaima_card_thread(void *arg1, void *arg2, void *arg3)
 				kaima_card_ana14_high ? 1u : 0u,
 				(unsigned int)kaima_card_uart_tx_count,
 				(unsigned int)kaima_card_uart_rx_count);
-			kaima_card_uart_write_framed(uart_line);
+			bm20_ext_uart_write_framed(uart_line);
 			LOG_INF("Kaima UART status: ready=%u tx=%u drop=%u rx=%u",
 				kaima_card_uart_ready ? 1u : 0u,
 				(unsigned int)kaima_card_uart_tx_count,
@@ -644,6 +745,13 @@ static void kaima_card_thread(void *arg1, void *arg2, void *arg3)
 
 K_THREAD_DEFINE(kaima_card_tid, KAIMA_CARD_STACK_SIZE, kaima_card_thread,
 	NULL, NULL, NULL, KAIMA_CARD_PRIORITY, 0, 0);
+
+#else
+
+void bm20_ext_uart_write_framed(const char *text)
+{
+	ARG_UNUSED(text);
+}
 
 #endif /* KAIMA_DEBUG_CARD */
 
@@ -1350,6 +1458,8 @@ int main(void)
 		(unsigned int)SENSOR_TS_MS,
 		(unsigned int)CMD_LOOPBACK_MODE,
 		(unsigned int)CMD_AUTO_SCALE);
+
+	bm20_ble_receiver_start();
 
 	uint32_t transfer_count = 0;
 	while (1) {
