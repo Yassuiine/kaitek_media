@@ -8,6 +8,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <zephyr/drivers/adc.h>
@@ -18,7 +19,9 @@
 #include <zephyr/dt-bindings/adc/nrf-saadc.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/sys/ring_buffer.h>
+#include <zephyr/shell/shell.h>
+#include <zephyr/shell/shell_uart.h>
+#include <zephyr/sys/reboot.h>
 
 //#define NRF_BENCH_MODE  /* undefine for production build */
 #define KAIMA_DEBUG_CARD  /* enable extension connector LED/UART/ANA debug card */
@@ -347,13 +350,10 @@ static float sensor_phase_4;
 #define KAIMA_CARD_PRIORITY 8
 #define KAIMA_CARD_BOOT_STEP_MS 500u
 #define KAIMA_CARD_PULSE_MS 80u
-#define KAIMA_CARD_UART_PERIOD_MS 1000u
 #define KAIMA_CARD_ADC_PERIOD_MS 250u
 #define KAIMA_CARD_HEARTBEAT_MS 500u
 #define KAIMA_CARD_ADC_CHANNEL 0u
 #define KAIMA_CARD_ADC_RESOLUTION 12u
-#define KAIMA_CARD_UART_GAP_MS 20u
-#define KAIMA_CARD_UART_PREAMBLE "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\n"
 #define KAIMA_CARD_ADC_REF_MV 600u
 #define KAIMA_CARD_ADC_GAIN_DEN 4u
 #define KAIMA_CARD_ANA_LOW_MV 1150u
@@ -384,7 +384,6 @@ struct kaima_card_gpio {
 	const char *name;
 };
 
-static const struct device *kaima_card_uart_dev = DEVICE_DT_GET(DT_ALIAS(kaima_uart));
 static const struct device *kaima_card_adc_dev = PIEZO_ADC_DEV;
 
 static const struct kaima_card_gpio kaima_card_leds[KAIMA_CARD_LED_COUNT] = {
@@ -414,15 +413,9 @@ static bool kaima_card_ana14_low;
 static bool kaima_card_ana14_high;
 static int16_t kaima_card_ana10_sample;
 static int16_t kaima_card_ana14_sample;
-static bool kaima_card_uart_ready;
-static uint32_t kaima_card_uart_tx_count;
-static uint32_t kaima_card_uart_drop_count;
-static uint32_t kaima_card_uart_rx_count;
-K_SEM_DEFINE(kaima_card_uart_tx_done, 0, 1);
-K_MUTEX_DEFINE(kaima_card_uart_tx_lock);
-RING_BUF_DECLARE(kaima_uart_rx_ring, 64);
-static uint8_t kaima_uart_rx_bufs[2][16];
-static uint8_t kaima_uart_rx_buf_idx;
+
+/* Shell prend le controle GPIO -> bloque le state machine LED dans kaima_card_thread. */
+static volatile bool shell_gpio_override = false;
 
 void bm20_ext_uart_write_framed(const char *text);
 
@@ -441,133 +434,18 @@ static void kaima_card_pulse(enum kaima_card_led led)
 	}
 }
 
-static void kaima_card_uart_cb(const struct device *dev, struct uart_event *evt, void *user_data)
-{
-	ARG_UNUSED(user_data);
-
-	switch (evt->type) {
-	case UART_TX_DONE:
-	case UART_TX_ABORTED:
-		k_sem_give(&kaima_card_uart_tx_done);
-		break;
-	case UART_RX_RDY:
-		ring_buf_put(&kaima_uart_rx_ring,
-			     evt->data.rx.buf + evt->data.rx.offset,
-			     evt->data.rx.len);
-		break;
-	case UART_RX_BUF_REQUEST:
-		kaima_uart_rx_buf_idx ^= 1u;
-		uart_rx_buf_rsp(dev, kaima_uart_rx_bufs[kaima_uart_rx_buf_idx],
-				sizeof(kaima_uart_rx_bufs[0]));
-		break;
-	case UART_RX_DISABLED:
-		uart_rx_enable(dev, kaima_uart_rx_bufs[kaima_uart_rx_buf_idx],
-			       sizeof(kaima_uart_rx_bufs[0]), 10000);
-		break;
-	default:
-		break;
-	}
-}
-
-static void kaima_card_uart_command_handle(char *cmd)
-{
-	char response[64];
-
-	for (char *p = cmd; *p != '\0'; p++) {
-		if (*p >= 'A' && *p <= 'Z') {
-			*p = (char)(*p - 'A' + 'a');
-		}
-	}
-
-	if (strcmp(cmd, "ble on") == 0 || strcmp(cmd, "ble logs on") == 0 ||
-	    strcmp(cmd, "logs on") == 0) {
-		bm20_ble_uart_logs_set_enabled(true);
-		bm20_ext_uart_write_framed("BLE UART logs enabled\r\n");
-		return;
-	}
-
-	if (strcmp(cmd, "ble off") == 0 || strcmp(cmd, "ble logs off") == 0 ||
-	    strcmp(cmd, "logs off") == 0) {
-		bm20_ble_uart_logs_set_enabled(false);
-		bm20_ext_uart_write_framed("BLE UART logs disabled\r\n");
-		return;
-	}
-
-	if (strcmp(cmd, "ble status") == 0 || strcmp(cmd, "logs status") == 0) {
-		snprintk(response, sizeof(response), "BLE UART logs %s\r\n",
-			 bm20_ble_uart_logs_enabled() ? "enabled" : "disabled");
-		bm20_ext_uart_write_framed(response);
-	}
-}
-
-static void kaima_card_uart_command_rx_char(char ch)
-{
-	static char cmd_buf[32];
-	static uint8_t cmd_len;
-
-	if (ch == '\r' || ch == '\n') {
-		if (cmd_len > 0u) {
-			cmd_buf[cmd_len] = '\0';
-			kaima_card_uart_command_handle(cmd_buf);
-			cmd_len = 0;
-		}
-		return;
-	}
-
-	if (ch == '\b' || ch == 0x7f) {
-		if (cmd_len > 0u) {
-			cmd_len--;
-		}
-		return;
-	}
-
-	if (cmd_len < (sizeof(cmd_buf) - 1u)) {
-		cmd_buf[cmd_len++] = ch;
-	}
-}
-
-static void kaima_card_uart_write(const char *text)
-{
-	if (!kaima_card_uart_ready) {
-		kaima_card_uart_drop_count++;
-		return;
-	}
-
-	k_mutex_lock(&kaima_card_uart_tx_lock, K_FOREVER);
-	while (k_sem_take(&kaima_card_uart_tx_done, K_NO_WAIT) == 0) {
-	}
-
-	int ret = uart_tx(kaima_card_uart_dev, (const uint8_t *)text, strlen(text), 200000);
-	if (ret < 0) {
-		kaima_card_uart_drop_count++;
-		LOG_ERR("Kaima UART tx failed: %d", ret);
-		k_mutex_unlock(&kaima_card_uart_tx_lock);
-		return;
-	}
-
-	if (k_sem_take(&kaima_card_uart_tx_done, K_MSEC(200)) < 0) {
-		kaima_card_uart_drop_count++;
-		(void)uart_tx_abort(kaima_card_uart_dev);
-		LOG_ERR("Kaima UART tx timeout");
-		k_mutex_unlock(&kaima_card_uart_tx_lock);
-		return;
-	}
-
-	kaima_card_uart_tx_count++;
-	kaima_card_pulse(KAIMA_LED_UART_TX);
-	k_msleep(KAIMA_CARD_UART_GAP_MS);
-	k_mutex_unlock(&kaima_card_uart_tx_lock);
-}
-
+/* UART20 belongs to the Zephyr shell backend.  All BM20 debug output that used
+ * to be pushed via custom uart_tx() DMA now flows through shell_fprintf() so
+ * there is exactly one writer on the wire and the prompt stays clean. */
 void bm20_ext_uart_write_framed(const char *text)
 {
-	/* Merge preamble + text into one buffer so only one uart_tx DMA start
-	 * is needed.  Each UARTE EasyDMA restart can emit spurious 0xFF bytes;
-	 * sending both in a single transfer halves those glitch events. */
-	char buf[sizeof(KAIMA_CARD_UART_PREAMBLE) + 212u];
+	const struct shell *sh = shell_backend_uart_get_ptr();
 
-	snprintk(buf, sizeof(buf), "%s%s", KAIMA_CARD_UART_PREAMBLE, text);
-	kaima_card_uart_write(buf);
+	if (sh != NULL) {
+		shell_fprintf(sh, SHELL_NORMAL, "\r\n%s", text);
+	}
+
+	kaima_card_pulse(KAIMA_LED_UART_TX);
 }
 
 static int kaima_card_adc_read(uint8_t input_positive, int16_t *sample)
@@ -613,33 +491,12 @@ static void kaima_card_thread(void *arg1, void *arg2, void *arg3)
 	ARG_UNUSED(arg2);
 	ARG_UNUSED(arg3);
 
-	int64_t next_uart_ms = 0;
 	int64_t next_adc_ms = 0;
 	int64_t next_heartbeat_ms = 0;
 	bool heartbeat_on = false;
-	uint32_t uart_counter = 0;
-	char uart_line[128];
 
-	kaima_card_uart_ready = device_is_ready(kaima_card_uart_dev);
 	LOG_INF("Kaima debug card enabled");
-	LOG_INF("Kaima UART %s: TX=P3.01 RX=P3.10 baud=115200 8N1",
-		kaima_card_uart_ready ? "ready" : "not ready");
-	if (kaima_card_uart_ready) {
-		int ret = uart_callback_set(kaima_card_uart_dev, kaima_card_uart_cb, NULL);
-
-		if (ret < 0) {
-			LOG_ERR("Kaima UART callback setup failed: %d", ret);
-			kaima_card_uart_ready = false;
-		} else {
-			ret = uart_rx_enable(kaima_card_uart_dev,
-					     kaima_uart_rx_bufs[0],
-					     sizeof(kaima_uart_rx_bufs[0]),
-					     10000);
-			if (ret < 0) {
-				LOG_ERR("Kaima UART rx enable failed: %d", ret);
-			}
-		}
-	}
+	LOG_INF("Kaima UART owned by Zephyr shell: TX=P3.01 RX=P3.10 baud=115200 8N1");
 
 	for (uint8_t i = 0; i < KAIMA_CARD_LED_COUNT; i++) {
 		const struct kaima_card_gpio *led = &kaima_card_leds[i];
@@ -656,9 +513,6 @@ static void kaima_card_thread(void *arg1, void *arg2, void *arg3)
 
 		kaima_card_led_ok[i] = true;
 	}
-
-	bm20_ext_uart_write_framed("0123456789abcdefghijklmnopqrstuvwxyz\r\n");
-	bm20_ext_uart_write_framed("KAIMA_HWUART_V5_BOOT\r\n");
 
 	for (uint8_t i = 0; i < KAIMA_CARD_LED_COUNT; i++) {
 		kaima_card_set_led((enum kaima_card_led)i, true);
@@ -692,52 +546,25 @@ static void kaima_card_thread(void *arg1, void *arg2, void *arg3)
 			next_adc_ms = now_ms + KAIMA_CARD_ADC_PERIOD_MS;
 		}
 
-		if (now_ms >= next_uart_ms) {
-			uint8_t rx_char;
-
-			while (ring_buf_get(&kaima_uart_rx_ring, &rx_char, 1) == 1) {
-				kaima_card_uart_rx_count++;
-				kaima_card_uart_command_rx_char((char)rx_char);
-				kaima_card_pulse(KAIMA_LED_UART_TX);
-			}
-
-			snprintk(uart_line, sizeof(uart_line),
-				"KAIMA_V5 %u A10=%d A14=%d low=%u/%u high=%u/%u TX=%u RX=%u\r\n",
-				(unsigned int)uart_counter++,
-				(int)kaima_card_ana10_sample,
-				(int)kaima_card_ana14_sample,
-				kaima_card_ana10_low ? 1u : 0u,
-				kaima_card_ana14_low ? 1u : 0u,
-				kaima_card_ana10_high ? 1u : 0u,
-				kaima_card_ana14_high ? 1u : 0u,
-				(unsigned int)kaima_card_uart_tx_count,
-				(unsigned int)kaima_card_uart_rx_count);
-			bm20_ext_uart_write_framed(uart_line);
-			LOG_INF("Kaima UART status: ready=%u tx=%u drop=%u rx=%u",
-				kaima_card_uart_ready ? 1u : 0u,
-				(unsigned int)kaima_card_uart_tx_count,
-				(unsigned int)kaima_card_uart_drop_count,
-				(unsigned int)kaima_card_uart_rx_count);
-			next_uart_ms = now_ms + KAIMA_CARD_UART_PERIOD_MS;
-		}
-
 		if (now_ms >= next_heartbeat_ms) {
 			heartbeat_on = !heartbeat_on;
 			next_heartbeat_ms = now_ms + KAIMA_CARD_HEARTBEAT_MS;
 		}
 
-		kaima_card_set_led(KAIMA_LED_SYSTEM, heartbeat_on);
-		kaima_card_set_led(KAIMA_LED_SPI_TX, now_ms < kaima_card_pulse_until[KAIMA_LED_SPI_TX]);
-		kaima_card_set_led(KAIMA_LED_SPI_RX, now_ms < kaima_card_pulse_until[KAIMA_LED_SPI_RX]);
-		kaima_card_set_led(KAIMA_LED_STREAM, sensor_stream_enabled);
-		kaima_card_set_led(KAIMA_LED_LOOPBACK, loopback_enabled);
-		kaima_card_set_led(KAIMA_LED_MIC, kaima_card_mic_ok);
-		kaima_card_set_led(KAIMA_LED_PIEZO, kaima_card_piezo_ok);
-		kaima_card_set_led(KAIMA_LED_ANA10, kaima_card_ana10_high);
-		kaima_card_set_led(KAIMA_LED_ANA14, kaima_card_ana14_high);
-		kaima_card_set_led(KAIMA_LED_UART_TX, now_ms < kaima_card_pulse_until[KAIMA_LED_UART_TX]);
-		kaima_card_set_led(KAIMA_LED_BLE0, kaima_card_ana10_low);
-		kaima_card_set_led(KAIMA_LED_BLE1, kaima_card_ana14_low);
+		if (!shell_gpio_override) {
+			kaima_card_set_led(KAIMA_LED_SYSTEM, heartbeat_on);
+			kaima_card_set_led(KAIMA_LED_SPI_TX, now_ms < kaima_card_pulse_until[KAIMA_LED_SPI_TX]);
+			kaima_card_set_led(KAIMA_LED_SPI_RX, now_ms < kaima_card_pulse_until[KAIMA_LED_SPI_RX]);
+			kaima_card_set_led(KAIMA_LED_STREAM, sensor_stream_enabled);
+			kaima_card_set_led(KAIMA_LED_LOOPBACK, loopback_enabled);
+			kaima_card_set_led(KAIMA_LED_MIC, kaima_card_mic_ok);
+			kaima_card_set_led(KAIMA_LED_PIEZO, kaima_card_piezo_ok);
+			kaima_card_set_led(KAIMA_LED_ANA10, kaima_card_ana10_high);
+			kaima_card_set_led(KAIMA_LED_ANA14, kaima_card_ana14_high);
+			kaima_card_set_led(KAIMA_LED_UART_TX, now_ms < kaima_card_pulse_until[KAIMA_LED_UART_TX]);
+			kaima_card_set_led(KAIMA_LED_BLE0, kaima_card_ana10_low);
+			kaima_card_set_led(KAIMA_LED_BLE1, kaima_card_ana14_low);
+		}
 
 		k_msleep(20);
 	}
@@ -1498,5 +1325,509 @@ int main(void)
 
 	return 0;
 }
+
+#ifdef KAIMA_DEBUG_CARD
+
+/* ============================================================
+ * SHELL UART — debug interactif sur uart20 (P3.01/P3.10)
+ * Backend Zephyr shell — pas de uart_tx() manuel.
+ *
+ *   capz                 scope piezo     AIN6/P1.04   25s
+ *   capl                 scope electret  AIN2/P1.30   25s
+ *   cap <10|14>          scope Kaima ADC Pin10/Pin14  25s
+ *   capd                 scope ICS43434  TDM          25s
+ *   gcap [s] [g]         configurer gain (1=piezo 2=ics 3=electret)
+ *   adc                  lecture instantanee 3 canaux
+ *   gpio <idx> <0|1>     forcer un GPIO Kaima (active shell_gpio_override)
+ *   gpio_test            balayer toutes les LEDs Kaima
+ *   gpio_restore         rendre les LEDs au state-machine kaima_card
+ *   status               etat SPI/ADC/TDM/stream
+ *   ble logs on|off      BLE logs sur shell pendant 25s
+ *   reset                reboot MCU
+ * ============================================================ */
+
+#define SHELL_SCOPE_COLS 64
+#define SHELL_ADC_VREF_MV 3300
+
+static uint8_t shell_gain_piezo    = ADC_GAIN_1_4;
+static uint8_t shell_gain_electret = ADC_GAIN_1_4;
+static int32_t shell_ics_amplify   = 1;
+
+static int shell_adc_to_mv(int raw)
+{
+	if (raw < 0) raw = 0;
+	return (raw * SHELL_ADC_VREF_MV) / 4095;
+}
+
+static int shell_adc_read_locked(uint8_t ain, uint8_t gain, int16_t *sample)
+{
+	struct adc_channel_cfg cfg = {
+		.gain             = gain,
+		.reference        = ADC_REF_INTERNAL,
+		.acquisition_time = ADC_ACQ_TIME_DEFAULT,
+		.channel_id       = PIEZO_ADC_CHANNEL,
+		.input_positive   = ain,
+	};
+	struct adc_sequence seq = {
+		.channels    = BIT(PIEZO_ADC_CHANNEL),
+		.buffer      = sample,
+		.buffer_size = sizeof(*sample),
+		.resolution  = PIEZO_ADC_RESOLUTION,
+	};
+	int ret = adc_channel_setup(PIEZO_ADC_DEV, &cfg);
+	if (ret < 0) return ret;
+	return adc_read(PIEZO_ADC_DEV, &seq);
+}
+
+static int shell_adc_read_avg3(uint8_t ain, uint8_t gain)
+{
+	int16_t s0, s1, s2;
+
+	k_mutex_lock(&adc_lock, K_FOREVER);
+	int r0 = shell_adc_read_locked(ain, gain, &s0);
+	int r1 = shell_adc_read_locked(ain, gain, &s1);
+	int r2 = shell_adc_read_locked(ain, gain, &s2);
+	kaima_card_restore_piezo_adc();
+	k_mutex_unlock(&adc_lock);
+	if (r0 < 0 || r1 < 0 || r2 < 0) return -EIO;
+	return ((int)s0 + (int)s1 + (int)s2) / 3;
+}
+
+static int shell_scope_adc(const struct shell *sh, uint8_t ain, uint8_t gain, const char *name)
+{
+	int64_t bias_sum = 0;
+
+	for (int i = 0; i < 16; i++) {
+		int r = shell_adc_read_avg3(ain, gain);
+		if (r >= 0) bias_sum += shell_adc_to_mv(r);
+		k_usleep(500);
+	}
+	int vbias_mv = (int)(bias_sum / 16);
+
+	shell_print(sh, "\r\n  CAP %s - 25 secondes", name);
+	shell_print(sh, "  Vbias mesure = %dmV (soustrait pour centrer)", vbias_mv);
+	shell_print(sh, "  |<--neg      :=silence      pos-->|  Valeur  Vpp  t(s)");
+	shell_print(sh, "  +%.*s+", SHELL_SCOPE_COLS,
+		    "----------------------------------------------------------------");
+
+	int hist[32];
+	int hist_idx = 0;
+	bool hist_full = false;
+	int frame = 0;
+	for (int i = 0; i < 32; i++) hist[i] = 0;
+
+	int64_t t_start = k_uptime_get();
+	int64_t t_end   = t_start + 25000LL;
+
+	while (k_uptime_get() < t_end) {
+		int raw = shell_adc_read_avg3(ain, gain);
+		if (raw < 0) {
+			shell_print(sh, "  Erreur ADC: %d", raw);
+			break;
+		}
+		int mv = shell_adc_to_mv(raw);
+		int mv_centered = mv - vbias_mv;
+
+		hist[hist_idx] = mv_centered;
+		hist_idx = (hist_idx + 1) % 32;
+		if (hist_idx == 0) hist_full = true;
+		int count = hist_full ? 32 : hist_idx;
+		int mn = hist[0], mx = hist[0];
+		for (int i = 1; i < count; i++) {
+			if (hist[i] < mn) mn = hist[i];
+			if (hist[i] > mx) mx = hist[i];
+		}
+		int vpp = mx - mn;
+
+		int pos      = ((mv_centered + 1650) * (SHELL_SCOPE_COLS - 1)) / 3300;
+		int vref_pos = SHELL_SCOPE_COLS / 2;
+		if (pos < 0) pos = 0;
+		if (pos > SHELL_SCOPE_COLS - 1) pos = SHELL_SCOPE_COLS - 1;
+
+		int t_s = (int)((k_uptime_get() - t_start) / 1000);
+
+		char line[SHELL_SCOPE_COLS + 4];
+		int col = 0;
+		line[col++] = '|';
+		for (int x = 0; x < SHELL_SCOPE_COLS; x++) {
+			if      (x == pos && x == vref_pos) line[col++] = 'O';
+			else if (x == pos)                  line[col++] = '*';
+			else if (x == vref_pos)             line[col++] = ':';
+			else                                line[col++] = ' ';
+		}
+		line[col++] = '|';
+		line[col]   = '\0';
+
+		shell_print(sh, "  %s %+5dmV Vpp=%dmV t=%ds", line, mv_centered, vpp, t_s);
+		frame++;
+		k_msleep(50);
+	}
+
+	int t_reel = (int)((k_uptime_get() - t_start) / 1000);
+	shell_print(sh, "  +%.*s+", SHELL_SCOPE_COLS,
+		    "----------------------------------------------------------------");
+	shell_print(sh, "  [TERMINE] %d lignes - %d sec reelles", frame, t_reel);
+	return 0;
+}
+
+static int cmd_capz(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc); ARG_UNUSED(argv);
+	return shell_scope_adc(sh, NRF_SAADC_AIN6, shell_gain_piezo, "PIEZO AIN6/P1.04");
+}
+
+static int cmd_capl(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc); ARG_UNUSED(argv);
+	return shell_scope_adc(sh, NRF_SAADC_AIN2, shell_gain_electret, "ELECTRET AIN2/P1.30");
+}
+
+static int cmd_cap(const struct shell *sh, size_t argc, char **argv)
+{
+	if (argc < 2) {
+		shell_error(sh, "Usage: cap <10|14>");
+		shell_error(sh, "  10 = Pin10/P1.29/AIN3   14 = Pin14/P1.31/AIN1");
+		return -EINVAL;
+	}
+	int pin = atoi(argv[1]);
+	uint8_t ain;
+	const char *name;
+	if      (pin == 10) { ain = NRF_SAADC_AIN3; name = "Pin10/P1.29/AIN3"; }
+	else if (pin == 14) { ain = NRF_SAADC_AIN1; name = "Pin14/P1.31/AIN1"; }
+	else { shell_error(sh, "Pin invalide: 10 ou 14"); return -EINVAL; }
+	return shell_scope_adc(sh, ain, ADC_GAIN_1_4, name);
+}
+
+static int cmd_capd(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc); ARG_UNUSED(argv);
+
+	shell_print(sh, "\r\n[CAPD] ICS43434 TDM - SD=P1.10 SCK=P1.03 WS=P1.00");
+	shell_print(sh, "  Ring buffer 48kHz - amplif x%d - 25 secondes", (int)shell_ics_amplify);
+	shell_print(sh, "  |<--min        :=silence        max-->|  Sample  Vpp  t(s)");
+	shell_print(sh, "  +%.*s+", SHELL_SCOPE_COLS,
+		    "----------------------------------------------------------------");
+
+	int frame = 0;
+	int64_t t_start = k_uptime_get();
+	int64_t t_end   = t_start + 25000LL;
+
+	while (k_uptime_get() < t_end) {
+		int32_t sample;
+		int32_t mn32, mx32;
+
+		k_mutex_lock(&mic_ring_lock, K_FOREVER);
+		uint16_t idx = (mic_write_index == 0u) ? (uint16_t)(SENSOR_RING_LEN - 1u)
+						       : (uint16_t)(mic_write_index - 1u);
+
+		int64_t sum = 0;
+		for (int i = 0; i < 8; i++) {
+			uint16_t ri = (idx >= (uint16_t)i) ? (uint16_t)(idx - (uint16_t)i)
+							   : (uint16_t)(SENSOR_RING_LEN - ((uint16_t)i - idx));
+			sum += mic_ring_capture[ri];
+		}
+		sample = (int32_t)(sum / 8);
+
+		mn32 = sample;
+		mx32 = sample;
+		for (int i = 1; i < 64 && i < (int)SENSOR_RING_LEN; i++) {
+			uint16_t ri = (idx >= (uint16_t)i) ? (uint16_t)(idx - (uint16_t)i)
+							   : (uint16_t)(SENSOR_RING_LEN - ((uint16_t)i - idx));
+			int32_t s = mic_ring_capture[ri];
+			if (s < mn32) mn32 = s;
+			if (s > mx32) mx32 = s;
+		}
+		k_mutex_unlock(&mic_ring_lock);
+
+		int64_t sample_amp = (int64_t)sample * shell_ics_amplify;
+		if (sample_amp >  8388607LL) sample_amp =  8388607LL;
+		if (sample_amp < -8388608LL) sample_amp = -8388608LL;
+		int32_t vpp = mx32 - mn32;
+
+		int pos = (int)((sample_amp + 8388608LL) * (SHELL_SCOPE_COLS - 1) / 16777215LL);
+		if (pos < 0) pos = 0;
+		if (pos > SHELL_SCOPE_COLS - 1) pos = SHELL_SCOPE_COLS - 1;
+		int vref_pos = SHELL_SCOPE_COLS / 2;
+		int vpp_display = (int)(vpp >> 8);
+		int t_s = (int)((k_uptime_get() - t_start) / 1000);
+
+		char line[SHELL_SCOPE_COLS + 4];
+		int col = 0;
+		line[col++] = '|';
+		for (int x = 0; x < SHELL_SCOPE_COLS; x++) {
+			if      (x == pos && x == vref_pos) line[col++] = 'O';
+			else if (x == pos)                  line[col++] = '*';
+			else if (x == vref_pos)             line[col++] = ':';
+			else                                line[col++] = ' ';
+		}
+		line[col++] = '|';
+		line[col]   = '\0';
+
+		shell_print(sh, "  %s %7d Vpp=%d t=%ds", line, (int)(sample_amp >> 8), vpp_display, t_s);
+		frame++;
+		k_msleep(20);
+	}
+
+	int t_reel = (int)((k_uptime_get() - t_start) / 1000);
+	shell_print(sh, "  +%.*s+", SHELL_SCOPE_COLS,
+		    "----------------------------------------------------------------");
+	shell_print(sh, "  [CAPD TERMINE] %d lignes - %d sec", frame, t_reel);
+	return 0;
+}
+
+static int gcap_decode_gain(int g, uint8_t *out)
+{
+	switch (g) {
+	case 1: *out = ADC_GAIN_1;   return 0;
+	case 2: *out = ADC_GAIN_1_2; return 0;
+	case 3: *out = ADC_GAIN_1_3; return 0;
+	case 4: *out = ADC_GAIN_1_4; return 0;
+	case 5: *out = ADC_GAIN_1_5; return 0;
+	default: return -EINVAL;
+	}
+}
+
+static int cmd_gcap(const struct shell *sh, size_t argc, char **argv)
+{
+	shell_print(sh, "\r\n[GCAP] Configuration du gain ADC");
+	shell_print(sh, "  1 - Piezo    (AIN6/P1.04)  gain actuel: %d", shell_gain_piezo);
+	shell_print(sh, "  2 - ICS43434 (TDM)         amplif numerique x%d", (int)shell_ics_amplify);
+	shell_print(sh, "  3 - Electret (AIN2/P1.30)  gain actuel: %d", shell_gain_electret);
+	shell_print(sh, "  Usage: gcap <1|2|3> <gain>");
+	shell_print(sh, "  Gains: 1=GAIN_1 2=GAIN_1_2 3=GAIN_1_3 4=GAIN_1_4[def] 5=GAIN_1_5");
+
+	if (argc < 3) return 0;
+
+	int capteur = atoi(argv[1]);
+	int g       = atoi(argv[2]);
+
+	switch (capteur) {
+	case 1: {
+		uint8_t gain_val;
+		if (gcap_decode_gain(g, &gain_val) < 0) {
+			shell_error(sh, "Gain invalide (1..5)");
+			return -EINVAL;
+		}
+		shell_gain_piezo = gain_val;
+		shell_print(sh, "  Piezo    -> gain 1/%d", g);
+		break;
+	}
+	case 2: {
+		int amp = g;
+		if (amp < 1 || amp > 32) {
+			shell_error(sh, "Amplif ICS: 1..32");
+			return -EINVAL;
+		}
+		shell_ics_amplify = amp;
+		shell_print(sh, "  ICS43434 -> amplification numerique x%d", amp);
+		break;
+	}
+	case 3: {
+		uint8_t gain_val;
+		if (gcap_decode_gain(g, &gain_val) < 0) {
+			shell_error(sh, "Gain invalide (1..5)");
+			return -EINVAL;
+		}
+		shell_gain_electret = gain_val;
+		shell_print(sh, "  Electret -> gain 1/%d", g);
+		break;
+	}
+	default:
+		shell_error(sh, "Capteur invalide");
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int cmd_adc_read(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc); ARG_UNUSED(argv);
+
+	int16_t s_piezo, s_ain3, s_ain2;
+
+	shell_print(sh, "[ADC] Lecture instantanee (raw * 3300 / 4095):");
+	k_mutex_lock(&adc_lock, K_FOREVER);
+	int r0 = shell_adc_read_locked(NRF_SAADC_AIN6, shell_gain_piezo,    &s_piezo);
+	int r1 = shell_adc_read_locked(NRF_SAADC_AIN3, ADC_GAIN_1_4,        &s_ain3);
+	int r2 = shell_adc_read_locked(NRF_SAADC_AIN2, shell_gain_electret, &s_ain2);
+	kaima_card_restore_piezo_adc();
+	k_mutex_unlock(&adc_lock);
+	if (r0 >= 0) shell_print(sh, "  Piezo    AIN6/P1.04 : raw=%d  %dmV", s_piezo, shell_adc_to_mv(s_piezo));
+	else         shell_print(sh, "  Piezo    AIN6/P1.04 : ERREUR %d", r0);
+	if (r1 >= 0) shell_print(sh, "  Kaima10  AIN3/P1.29 : raw=%d  %dmV", s_ain3,  shell_adc_to_mv(s_ain3));
+	else         shell_print(sh, "  Kaima10  AIN3/P1.29 : ERREUR %d", r1);
+	if (r2 >= 0) shell_print(sh, "  Electret AIN2/P1.30 : raw=%d  %dmV", s_ain2,  shell_adc_to_mv(s_ain2));
+	else         shell_print(sh, "  Electret AIN2/P1.30 : ERREUR %d", r2);
+	return 0;
+}
+
+static int cmd_gpio_set(const struct shell *sh, size_t argc, char **argv)
+{
+	__ASSERT_NO_MSG(sh != NULL);
+	__ASSERT_NO_MSG(argv != NULL);
+
+	if (argc < 3) {
+		shell_error(sh, "Usage: gpio <index 0..%d> <0|1>", KAIMA_CARD_LED_COUNT - 1);
+		for (uint8_t i = 0; i < KAIMA_CARD_LED_COUNT; i++) {
+			shell_print(sh, "  %2d = %s", i, kaima_card_leds[i].name);
+		}
+		return -EINVAL;
+	}
+
+	int idx = atoi(argv[1]);
+	int val = atoi(argv[2]);
+
+	if (idx < 0 || idx >= (int)KAIMA_CARD_LED_COUNT) {
+		shell_error(sh, "Index invalide (0..%d)", KAIMA_CARD_LED_COUNT - 1);
+		return -EINVAL;
+	}
+
+	const struct device *port = kaima_card_leds[idx].port;
+
+	if (!device_is_ready(port)) {
+		shell_error(sh, "Port non pret");
+		return -ENODEV;
+	}
+
+	int ret = gpio_pin_configure(port, kaima_card_leds[idx].pin, GPIO_OUTPUT);
+	if (ret < 0) {
+		shell_error(sh, "configure %s -> %d", kaima_card_leds[idx].name, ret);
+		return ret;
+	}
+	ret = gpio_pin_set(port, kaima_card_leds[idx].pin, val ? 1 : 0);
+	if (ret < 0) {
+		shell_error(sh, "set %s -> %d", kaima_card_leds[idx].name, ret);
+		return ret;
+	}
+
+	shell_gpio_override = true;
+	shell_print(sh, "[GPIO] %s -> %s (gpio_restore pour rendre la main au state-machine)",
+		    kaima_card_leds[idx].name, val ? "HIGH" : "LOW");
+	return 0;
+}
+
+static int cmd_gpio_test(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc); ARG_UNUSED(argv);
+
+	__ASSERT_NO_MSG(sh != NULL);
+	__ASSERT_NO_MSG(KAIMA_CARD_LED_COUNT > 0u);
+
+	shell_gpio_override = true;
+	shell_print(sh, "[GPIO TEST] %d pins - 400ms chacune", KAIMA_CARD_LED_COUNT);
+	for (uint8_t i = 0; i < KAIMA_CARD_LED_COUNT; i++) {
+		const struct device *port = kaima_card_leds[i].port;
+
+		if (!device_is_ready(port)) {
+			continue;
+		}
+		if (gpio_pin_configure(port, kaima_card_leds[i].pin, GPIO_OUTPUT) < 0) {
+			shell_error(sh, "  %s configure failed", kaima_card_leds[i].name);
+			continue;
+		}
+		(void)gpio_pin_set(port, kaima_card_leds[i].pin, 1);
+		shell_print(sh, "  %s ON", kaima_card_leds[i].name);
+		k_msleep(400);
+		(void)gpio_pin_set(port, kaima_card_leds[i].pin, 0);
+	}
+	shell_print(sh, "[GPIO TEST] Termine - utilisez 'gpio_restore' pour reactiver les LEDs");
+	return 0;
+}
+
+static int cmd_gpio_restore(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc); ARG_UNUSED(argv);
+
+	__ASSERT_NO_MSG(sh != NULL);
+
+	if (!shell_gpio_override) {
+		shell_print(sh, "[GPIO RESTORE] state-machine deja actif");
+		return 0;
+	}
+
+	shell_gpio_override = false;
+	shell_print(sh, "[GPIO RESTORE] LEDs rendues au state-machine kaima_card");
+	return 0;
+}
+
+static int cmd_status(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc); ARG_UNUSED(argv);
+	shell_print(sh, "\r\n+-- BM20C STATUS --+");
+	shell_print(sh, "  SPI  : %s", device_is_ready(spis_dev) ? "OK" : "FAIL");
+	shell_print(sh, "  ADC  : %s", device_is_ready(PIEZO_ADC_DEV) ? "OK" : "FAIL");
+	shell_print(sh, "  TDM  : %s", device_is_ready(MIC_TDM_DEV) ? "OK" : "FAIL");
+	shell_print(sh, "  Stream: %s  Sensor: %u  Seq: %u",
+		    sensor_stream_enabled ? "ON" : "OFF",
+		    (unsigned)selected_sensor, (unsigned)sensor_sequence);
+	shell_print(sh, "  Loopback: %s   Autoscale: %s   FFT: %s",
+		    loopback_enabled ? "ON" : "OFF",
+		    sensor_auto_scale_enabled ? "ON" : "OFF",
+		    sensor_fft_enabled ? "ON" : "OFF");
+	shell_print(sh, "  BLE logs (UART): %s", bm20_ble_uart_logs_enabled() ? "ON" : "OFF");
+	shell_print(sh, "  Gain : piezo=%d electret=%d  ICS amp=x%d",
+		    shell_gain_piezo, shell_gain_electret, (int)shell_ics_amplify);
+	return 0;
+}
+
+static int cmd_reset(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc); ARG_UNUSED(argv);
+	shell_print(sh, "[RESET] Dans 1s...");
+	k_msleep(1000);
+	sys_reboot(SYS_REBOOT_COLD);
+	return 0;
+}
+
+static int cmd_ble_logs_on(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc); ARG_UNUSED(argv);
+	bm20_ble_uart_logs_set_enabled(true);
+	shell_print(sh, "BLE UART logs enabled (25s window)");
+	return 0;
+}
+
+static int cmd_ble_logs_off(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc); ARG_UNUSED(argv);
+	bm20_ble_uart_logs_set_enabled(false);
+	shell_print(sh, "BLE UART logs disabled");
+	return 0;
+}
+
+static int cmd_ble_logs_status(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc); ARG_UNUSED(argv);
+	shell_print(sh, "BLE UART logs %s",
+		    bm20_ble_uart_logs_enabled() ? "enabled" : "disabled");
+	return 0;
+}
+
+SHELL_STATIC_SUBCMD_SET_CREATE(ble_logs_subcmds,
+	SHELL_CMD(on,     NULL, "Enable BLE UART logs (25s window)",  cmd_ble_logs_on),
+	SHELL_CMD(off,    NULL, "Disable BLE UART logs",              cmd_ble_logs_off),
+	SHELL_CMD(status, NULL, "Show BLE UART log state",            cmd_ble_logs_status),
+	SHELL_SUBCMD_SET_END
+);
+
+SHELL_STATIC_SUBCMD_SET_CREATE(ble_subcmds,
+	SHELL_CMD(logs, &ble_logs_subcmds, "BLE UART logs control", NULL),
+	SHELL_SUBCMD_SET_END
+);
+
+SHELL_CMD_REGISTER(ble,       &ble_subcmds, "BLE subcommands",            NULL);
+SHELL_CMD_REGISTER(capz,      NULL, "Scope piezo AIN6/P1.04 25s",          cmd_capz);
+SHELL_CMD_REGISTER(capl,      NULL, "Scope electret AIN2/P1.30 25s",       cmd_capl);
+SHELL_CMD_REGISTER(cap,       NULL, "Scope Kaima ADC. cap <10|14>",        cmd_cap);
+SHELL_CMD_REGISTER(capd,      NULL, "Scope ICS43434 TDM 25s",              cmd_capd);
+SHELL_CMD_REGISTER(gcap,      NULL, "Set sensor gain. gcap <1|2|3> <g>",   cmd_gcap);
+SHELL_CMD_REGISTER(adc,       NULL, "Read ADC channels (instant)",         cmd_adc_read);
+SHELL_CMD_REGISTER(gpio,         NULL, "Force GPIO. gpio <idx> <0|1>",        cmd_gpio_set);
+SHELL_CMD_REGISTER(gpio_test,    NULL, "Sweep all Kaima GPIOs",               cmd_gpio_test);
+SHELL_CMD_REGISTER(gpio_restore, NULL, "Hand LEDs back to state-machine",     cmd_gpio_restore);
+SHELL_CMD_REGISTER(status,    NULL, "BM20_C runtime status",               cmd_status);
+SHELL_CMD_REGISTER(reset,     NULL, "Cold reboot the MCU",                 cmd_reset);
+
+#endif /* KAIMA_DEBUG_CARD */
 
 #endif /* NRF_BENCH_MODE */

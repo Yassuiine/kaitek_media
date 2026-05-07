@@ -83,6 +83,11 @@
  *   3. Wrap the entire PORT 1 block above in a comment.
 */
 / {
+	chosen {
+		zephyr,console = &uart20;
+		zephyr,shell-uart = &uart20;
+	};
+
 	aliases {
 		led = &led0;
 		spis = &spi00;
